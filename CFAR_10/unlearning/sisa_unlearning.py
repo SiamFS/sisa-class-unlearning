@@ -316,12 +316,11 @@ class SISAUnlearning:
         if unlearned_class_idx not in unlearned_classes:
             unlearned_classes.append(unlearned_class_idx)
         
-        # Save updated list
+        # Save updated list to JSON file
         with open(unlearned_classes_file, 'w') as f:
             json.dump(unlearned_classes, f)
         
-        # CRITICAL FIX: Invalidate cache and update metadata after adding new unlearned class
-        self._invalidate_unlearned_classes_cache()
+        # IMPORTANT: Also update main metadata to keep consistency
         self._update_metadata_with_unlearned_classes(unlearned_classes)
         
         print(f"   - Updated unlearned classes list: {[self.class_names[i] for i in unlearned_classes]}")
@@ -674,10 +673,8 @@ class SISAUnlearning:
         all_true_labels = []
 
         batch_size = config.BATCH_SIZE
-        # CRITICAL: Refresh cache to ensure evaluation uses latest unlearned classes
-        self._invalidate_unlearned_classes_cache()
+        # Get unlearned classes for post-processing filtering (O(1) cached lookup)
         unlearned_classes_set = self.get_unlearned_classes_set()
-        print(f"   - Using {len(unlearned_classes_set)} unlearned classes for filtering: {sorted(unlearned_classes_set)}")
         
         with torch.no_grad():
             for i in range(0, len(x_test), batch_size):
@@ -702,16 +699,34 @@ class SISAUnlearning:
         all_final_preds = np.array(all_final_preds)
         all_true_labels = np.array(all_true_labels)
 
-        # Handle unknown predictions (-1) by filtering them out
-        valid_mask = all_final_preds != -1
-        if not np.all(valid_mask):
-            unknown_count = np.sum(~valid_mask)
-            print(f"   Warning: {unknown_count} samples had unknown predictions (filtered out)")
-            all_final_preds = all_final_preds[valid_mask]
-            all_true_labels = all_true_labels[valid_mask]
+        # ENHANCED FILTERING: Remove ALL unlearned class samples from evaluation
+        # This includes both correctly detected (-1) and incorrectly predicted samples
+        # RATIONALE: Focus evaluation entirely on active classes performance
+        # - Step 1: Remove ground truth samples belonging to unlearned classes
+        # - Step 2: Remove any remaining -1 predictions (edge cases)
+        unlearned_classes = self.get_unlearned_classes()
+        
+        # Step 1: Remove samples that belong to unlearned classes (ground truth filtering)
+        active_class_mask = np.ones(len(all_true_labels), dtype=bool)
+        for unlearned_idx in unlearned_classes:
+            active_class_mask &= (all_true_labels != unlearned_idx)
+        
+        removed_unlearned_samples = np.sum(~active_class_mask)
+        if removed_unlearned_samples > 0:
+            print(f"   ✅ Removed {removed_unlearned_samples} unlearned class samples from evaluation")
+            all_final_preds = all_final_preds[active_class_mask]
+            all_true_labels = all_true_labels[active_class_mask]
+        
+        # Step 2: Remove any remaining -1 predictions (should be minimal after step 1)
+        valid_pred_mask = all_final_preds != -1
+        if not np.all(valid_pred_mask):
+            unknown_count = np.sum(~valid_pred_mask)
+            print(f"   ⚠️  Additional {unknown_count} samples had unknown predictions (filtered out)")
+            all_final_preds = all_final_preds[valid_pred_mask]
+            all_true_labels = all_true_labels[valid_pred_mask]
 
-        print("\n--- Standardized Unlearning Evaluation Results ---")
-        print(f"Total Test Samples: {len(all_final_preds)} (after filtering unknown predictions)")
+        print("\n--- Enhanced Unlearning Evaluation Results (Active Classes Only) ---")
+        print(f"Total Test Samples for Evaluation: {len(all_final_preds)} (unlearned class samples removed)")
         
         # Display total samples per class
         print("\nPer-Class Sample Distribution:")
@@ -744,16 +759,110 @@ class SISAUnlearning:
         print(f"SISA Gating Method Accuracy: {gating_accuracy:.4f}")
         print("-"*60)
         print(">>> Using True SISA Gating Method (specialist routing)!")
+
+        # ============================================================================
+        # NEW: EVALUATE DELETED CLASS PERFORMANCE (Raw predictions on deleted samples)
+        # ============================================================================
+        print("\n" + "="*80)
+        print("DELETED CLASS PERFORMANCE ANALYSIS (Raw Model Behavior)")
+        print("="*80)
+
+        # Re-run evaluation WITHOUT post-processing to see raw predictions on deleted classes
+        print("Evaluating raw model predictions on ALL test samples (including deleted classes)...")
+
+        all_raw_preds = []
+        all_true_labels_full = []
+
+        with torch.no_grad():
+            for i in range(0, len(x_test), batch_size):
+                batch_x = torch.from_numpy(x_test[i:i+batch_size]).float()
+                batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
+
+                # Get RAW predictions without post-processing
+                batch_raw_preds, _ = _run_sisa_batch(
+                    batch_x_normalized, shard_models, gating_model, class_names, threshold=None
+                )
+
+                all_raw_preds.extend(batch_raw_preds.cpu().numpy())
+                all_true_labels_full.extend(y_test[i:i+batch_size])
+
+        all_raw_preds = np.array(all_raw_preds)
+        all_true_labels_full = np.array(all_true_labels_full)
+
+        # Analyze deleted class performance
+        unlearned_classes = self.get_unlearned_classes()
+        deleted_class_results = {}
+
+        for deleted_class_idx in unlearned_classes:
+            deleted_class_name = class_names[deleted_class_idx]
+
+            # Find samples of this deleted class
+            deleted_mask = (all_true_labels_full == deleted_class_idx)
+            deleted_samples = np.sum(deleted_mask)
+
+            if deleted_samples > 0:
+                deleted_preds = all_raw_preds[deleted_mask]
+                deleted_true = all_true_labels_full[deleted_mask]
+
+                # Calculate performance metrics for deleted class
+                correct_predictions = np.sum(deleted_preds == deleted_true)
+                accuracy = correct_predictions / deleted_samples
+
+                # Most common wrong predictions
+                wrong_preds = deleted_preds[deleted_preds != deleted_true]
+                if len(wrong_preds) > 0:
+                    unique_wrong, counts_wrong = np.unique(wrong_preds, return_counts=True)
+                    most_common_wrong = unique_wrong[np.argmax(counts_wrong)]
+                    most_common_wrong_name = class_names[most_common_wrong] if most_common_wrong < len(class_names) else f"class_{most_common_wrong}"
+                else:
+                    most_common_wrong_name = "None"
+
+                deleted_class_results[deleted_class_name] = {
+                    'samples': deleted_samples,
+                    'accuracy': accuracy,
+                    'most_confused_with': most_common_wrong_name
+                }
+
+                print(f"\n📊 DELETED CLASS: '{deleted_class_name.upper()}'")
+                print(f"   Test Samples: {deleted_samples}")
+                print(f"   Raw Accuracy: {accuracy:.4f} ({correct_predictions}/{deleted_samples})")
+                print(f"   Most Confused With: {most_common_wrong_name}")
+
+                # Show prediction distribution
+                unique_preds, pred_counts = np.unique(deleted_preds, return_counts=True)
+                print(f"   Prediction Distribution:")
+                for pred_idx, count in zip(unique_preds, pred_counts):
+                    pred_name = class_names[pred_idx] if pred_idx < len(class_names) else f"class_{pred_idx}"
+                    percentage = (count / deleted_samples) * 100
+                    print(f"     {pred_name}: {count} samples ({percentage:.1f}%)")
+
+        # Overall analysis
+        total_deleted_samples = sum(result['samples'] for result in deleted_class_results.values())
+        avg_deleted_accuracy = np.mean([result['accuracy'] for result in deleted_class_results.values()])
+
+        print(f"\n🎯 OVERALL DELETED CLASS ANALYSIS:")
+        print(f"   Total Deleted Class Samples: {total_deleted_samples}")
+        print(f"   Average Raw Accuracy on Deleted Classes: {avg_deleted_accuracy:.4f}")
+        print(f"   Expected: Near 0.0 (random chance) for successful unlearning")
+
+        if avg_deleted_accuracy < 0.15:  # Less than 15% accuracy
+            print("   ✅ SUCCESS: Model shows strong unlearning effects!")
+        elif avg_deleted_accuracy < 0.30:  # Less than 30% accuracy
+            print("   ⚠️  MODERATE: Model shows some unlearning effects.")
+        else:
+            print("   ❌ WARNING: Model may not have properly unlearned deleted classes.")
+
+        # ============================================================================
+        # END: DELETED CLASS PERFORMANCE ANALYSIS
+        # ============================================================================
         
         # Generate ROC curves for unlearning evaluation (same as training)
         print("\n" + "=" * 50)
         print("CREATING OVERALL SISA SYSTEM ROC CURVES (AFTER UNLEARNING)")
         print("=" * 50)
         
-        # CRITICAL: Refresh cache to ensure plots get latest unlearned classes
-        self._invalidate_unlearned_classes_cache()
+        # Get unlearned classes from metadata
         unlearned_classes = self.get_unlearned_classes()
-        print(f"   - Current unlearned classes for plotting: {[class_names[i] for i in unlearned_classes]}")
         
         create_overall_sisa_roc_curve(
             shard_models,

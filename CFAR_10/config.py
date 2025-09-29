@@ -1,8 +1,8 @@
 # ================================================================================
 # SISA ARCHITECTURE PARAMETERS
 # ================================================================================
-NUM_SHARDS = 1  
-NUM_SLICES_PER_SHARD = 1
+NUM_SHARDS = 2  
+NUM_SLICES_PER_SHARD = 2
 
 # ================================================================================
 # CONFIDENCE THRESHOLDS (GATING METHOD ONLY)
@@ -17,7 +17,7 @@ MIN_PROB_EPSILON = 1e-8  # Numerical stability for probability computations
 # ================================================================================
 # TRAINING PARAMETERS
 # ================================================================================
-BATCH_SIZE = 128  # Keep same for consistency
+BATCH_SIZE = 64  # Keep same for consistency
 MAX_EPOCHS = 80  # Training epochs - DO NOT OVERRIDE
 LEARNING_RATE = 0.0008  # Reduced from 0.001 to reduce oscillations
 WEIGHT_DECAY = 0.0005  # L2 regularization to prevent overfitting
@@ -27,7 +27,7 @@ TRAINING_PATIENCE = 7  # Increased from 5 to allow more exploration
 TRAINING_MIN_DELTA = 0.0005  # Reduced from 0.001 for more sensitive stopping  
 
 # Replay Buffer Settings
-REPLAY_RATIO = 0.0  # Base replay ratio (will be dynamically adjusted)
+REPLAY_RATIO = 0.2  # Base replay ratio (will be dynamically adjusted)
 USE_SMART_REPLAY = True  # Set to True to enable smart replay buffer
 USE_ADAPTIVE_REPLAY_RATIO = False  # Enable dynamic replay ratio adjustment
 MIN_REPLAY_RATIO = 0.1  # Minimum allowed replay ratio
@@ -111,7 +111,7 @@ UNLEARNING_PATIENCE = 7  # Increased from 5 to match training
 UNLEARNING_MIN_DELTA = 0.0005  # Reduced to match training sensitivity
 # Unlearning Training Settings
 UNLEARNING_LEARNING_RATE = 0.0004  # Reduced from 0.0005 for better stability
-UNLEARNING_REPLAY_RATIO = 0.0
+UNLEARNING_REPLAY_RATIO = 0.2
 
 # Replay Buffer
 USE_REPLAY_BUFFER = True  
