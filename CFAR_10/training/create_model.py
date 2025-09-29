@@ -99,7 +99,7 @@ class PyTorchModelManager:
             save_dict['metadata'] = metadata
         torch.save(save_dict, filepath)
         model.to(self.device)
-        print(f" Model saved successfully: {filepath}")
+        print(f" Model saved: {filepath}")
         return filepath
     
     def load_model_complete(self, filepath, num_classes=10, device=None, num_shards=None):

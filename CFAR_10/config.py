@@ -17,7 +17,7 @@ MIN_PROB_EPSILON = 1e-8  # Numerical stability for probability computations
 # ================================================================================
 # TRAINING PARAMETERS
 # ================================================================================
-BATCH_SIZE = 64  # Keep same for consistency
+BATCH_SIZE = 128  # Keep same for consistency
 MAX_EPOCHS = 80  # Training epochs - DO NOT OVERRIDE
 LEARNING_RATE = 0.0008  # Reduced from 0.001 to reduce oscillations
 WEIGHT_DECAY = 0.0005  # L2 regularization to prevent overfitting
@@ -37,9 +37,9 @@ REPLAY_IMPORTANCE_WEIGHT = 0.7  # Weight for gradient-based importance
 REPLAY_TEMPORAL_WEIGHT = 0.3  # Weight for temporal decay
 MAX_REPLAY_SAMPLES_PER_CLASS = 1000  # Maximum samples per class in buffer  
 
-# Data Augmentation Parameters
-RANDOM_ERASING_PROB = 0.1  
-RANDOM_ERASING_SCALE = (0.02, 0.33)  
+# Data Augmentation Parameters (No Random Erasing)
+# RANDOM_ERASING_PROB = 0.1  # REMOVED: No random erasing 
+# RANDOM_ERASING_SCALE = (0.02, 0.33)  # REMOVED: No random erasing
 LABEL_SMOOTHING = 0.05  # Conservative label smoothing
 
 # Color Jitter Augmentation
@@ -64,14 +64,10 @@ GATING_CONV2_OUT = 64  # Increased from 32
 GATING_FC1_HIDDEN = 256  # Increased from 128
 GATING_FEATURE_SIZE = 64 * 4 * 4  # Updated for 3 conv layers
 
-# Dataset-specific normalization (will be calculated dynamically)
-# These are fallback values only - actual values should come from dataset analysis
-FALLBACK_DATASET_MEAN = [0.5, 0.5, 0.5]  # Neutral fallback for RGB
-FALLBACK_DATASET_STD = [0.5, 0.5, 0.5]   # Neutral fallback for RGB
-
+# Dataset-specific normalization (calculated from actual data)
 def get_dataset_normalization(metadata_path=None):
     """
-    Get dataset normalization values from metadata or return fallback values.
+    Get dataset normalization values from metadata.
     
     Args:
         metadata_path: Path to metadata.json file. If None, uses default path from config.
@@ -91,10 +87,10 @@ def get_dataset_normalization(metadata_path=None):
         
         if 'normalization_mean' in metadata and 'normalization_std' in metadata:
             return metadata['normalization_mean'], metadata['normalization_std']
-    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
-        pass
-    
-    return FALLBACK_DATASET_MEAN, FALLBACK_DATASET_STD
+        else:
+            raise KeyError("Normalization values not found in metadata")
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as e:
+        raise Exception(f"Could not load dataset normalization from {metadata_path}: {e}") from e
 
 # Confidence Decision Parameters
 CONFIDENCE_BOOST_THRESHOLD = 0.15  # Increased to reduce wrong overrides
@@ -147,28 +143,18 @@ def get_augmentation_config(level='default', is_unlearning=False):
     Get augmentation configuration based on balance level and training context.
     
     Args:
-        level: 'default', 'minimal', 'light', or 'moderate'
+        level: 'minimal', 'light', or 'moderate' (no 'none' - use None instead)
         is_unlearning: If True, uses more conservative augmentation for unlearning
         
     Returns:
-        dict: Augmentation configuration
+        dict: Augmentation configuration (NO random erasing)
     """
     # Base multiplier for unlearning (more conservative)
     multiplier = 0.6 if is_unlearning else 1.0
     
     configs = {
-        'default': {
-            'random_horizontal_flip': 0.5 * multiplier,
-            'random_erasing_prob': 0.05 * multiplier,
-            'color_jitter_brightness': 0.1 * multiplier,
-            'color_jitter_contrast': 0.1 * multiplier,
-            'color_jitter_saturation': 0.05 * multiplier,
-            'color_jitter_hue': 0.02 * multiplier,
-            'reason': f'{"unlearning_" if is_unlearning else ""}default_fallback'
-        },
         'minimal': {
             'random_horizontal_flip': 0.3 * multiplier,
-            'random_erasing_prob': 0.02 * multiplier,
             'color_jitter_brightness': 0.05 * multiplier,
             'color_jitter_contrast': 0.05 * multiplier,
             'color_jitter_saturation': 0.02 * multiplier,
@@ -177,7 +163,6 @@ def get_augmentation_config(level='default', is_unlearning=False):
         },
         'light': {
             'random_horizontal_flip': 0.4 * multiplier,
-            'random_erasing_prob': 0.07 * multiplier,
             'color_jitter_brightness': 0.07 * multiplier,
             'color_jitter_contrast': 0.07 * multiplier,
             'color_jitter_saturation': 0.03 * multiplier,
@@ -186,7 +171,6 @@ def get_augmentation_config(level='default', is_unlearning=False):
         },
         'moderate': {
             'random_horizontal_flip': 0.6 * multiplier,
-            'random_erasing_prob': 0.1 * multiplier,
             'color_jitter_brightness': 0.1 * multiplier,
             'color_jitter_contrast': 0.1 * multiplier,
             'color_jitter_saturation': 0.05 * multiplier,
@@ -195,4 +179,6 @@ def get_augmentation_config(level='default', is_unlearning=False):
         }
     }
     
-    return configs.get(level, configs['default'])
+    if level not in configs:
+        raise ValueError(f"Unknown augmentation level: {level}. Valid levels: {list(configs.keys())}")
+    return configs[level]

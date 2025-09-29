@@ -22,7 +22,6 @@ from plots import (
     _normalize_probabilities_tensor,
     _apply_temperature_tensor, 
     _apply_temperature_numpy,
-    # _combine_specialist_predictions removed - functionality moved to _run_sisa_batch
     _run_sisa_batch
 )
 
@@ -52,51 +51,40 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     Trains a SISA model with specialized validation and an optional replay mechanism.
     """
     if dataset_mean is None or dataset_std is None:
-        print("Warning: Normalization stats not provided. Using fallback.")
+        print("Warning: Normalization stats not provided. Using default RGB values.")
         dataset_mean = [0.5, 0.5, 0.5]
         dataset_std = [0.5, 0.5, 0.5]
 
-    # Determine augmentation settings based on balance analysis
-    if augmentation_config is None:
-        # Default conservative augmentation
-        augmentation_config = {
-            'random_horizontal_flip': 0.3,
-            'random_erasing_prob': 0.05,
-            'color_jitter_brightness': 0.1,
-            'color_jitter_contrast': 0.1,
-            'color_jitter_saturation': 0.05,
-            'color_jitter_hue': 0.02
-        }
-    
     # Build augmentation transforms based on configuration
     augmentations = []
     
-    # Horizontal flip
-    if augmentation_config.get('random_horizontal_flip', 0) > 0:
-        augmentations.append(T.RandomHorizontalFlip(p=augmentation_config['random_horizontal_flip']))
-    
-    # Color jitter (only if any parameter > 0)
-    color_params = [
-        augmentation_config.get('color_jitter_brightness', 0),
-        augmentation_config.get('color_jitter_contrast', 0),
-        augmentation_config.get('color_jitter_saturation', 0),
-        augmentation_config.get('color_jitter_hue', 0)
-    ]
-    if any(p > 0 for p in color_params):
-        augmentations.append(T.ColorJitter(
-            brightness=color_params[0],
-            contrast=color_params[1],
-            saturation=color_params[2],
-            hue=color_params[3]
-        ))
-    
-    # Random erasing
-    if augmentation_config.get('random_erasing_prob', 0) > 0:
-        augmentations.append(T.RandomErasing(
-            p=augmentation_config['random_erasing_prob'],
-            scale=config.RANDOM_ERASING_SCALE,
-            ratio=(0.3, 3.3)
-        ))
+    if augmentation_config is None:
+        # NO AUGMENTATION - Classes are balanced
+        print("   - No augmentation applied (balanced classes)")
+    else:
+        # Apply augmentation for imbalanced classes
+        print(f"   - Using augmentation: {augmentation_config.get('reason', 'custom')}")
+        
+        # Horizontal flip
+        if augmentation_config.get('random_horizontal_flip', 0) > 0:
+            augmentations.append(T.RandomHorizontalFlip(p=augmentation_config['random_horizontal_flip']))
+            print(f"   - Horizontal flip: {augmentation_config.get('random_horizontal_flip', 0):.1f}")
+        
+        # Color jitter (only if any parameter > 0)
+        color_params = [
+            augmentation_config.get('color_jitter_brightness', 0),
+            augmentation_config.get('color_jitter_contrast', 0),
+            augmentation_config.get('color_jitter_saturation', 0),
+            augmentation_config.get('color_jitter_hue', 0)
+        ]
+        if any(p > 0 for p in color_params):
+            augmentations.append(T.ColorJitter(
+                brightness=color_params[0],
+                contrast=color_params[1],
+                saturation=color_params[2],
+                hue=color_params[3]
+            ))
+            print(f"   - Color jitter: brightness={color_params[0]:.2f}, contrast={color_params[1]:.2f}")
     
     # Always add normalization at the end
     augmentations.append(T.Normalize(dataset_mean, dataset_std))
@@ -105,11 +93,6 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     val_transforms = T.Compose([
         T.Normalize(dataset_mean, dataset_std)
     ])
-    
-    print(f"   - Using augmentation: {augmentation_config.get('reason', 'custom')}")
-    print(f"   - Horizontal flip: {augmentation_config.get('random_horizontal_flip', 0):.1f}")
-    print(f"   - Random erasing: {augmentation_config.get('random_erasing_prob', 0):.2f}")
-    print(f"   - Color jitter: brightness={augmentation_config.get('color_jitter_brightness', 0):.2f}, contrast={augmentation_config.get('color_jitter_contrast', 0):.2f}")
     
     if validation_data:
         x_val_full, y_val_full = validation_data

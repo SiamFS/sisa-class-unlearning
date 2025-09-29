@@ -85,10 +85,7 @@ if 'normalization_mean' in metadata and 'normalization_std' in metadata:
     DATASET_STD = metadata['normalization_std']
     print("Loaded dynamic normalization stats from metadata.")
 else:
-    print("Warning: Normalization stats not found in metadata. Using default fallback.")
-    # Fallback to commonly used values (not dataset-specific)
-    DATASET_MEAN = config.FALLBACK_DATASET_MEAN  # Use config fallback
-    DATASET_STD = config.FALLBACK_DATASET_STD   # Use config fallback
+    raise Exception("Normalization stats not found in metadata. Please run data processing first to compute normalization values.")
 
 eval_transforms = T.Compose([T.Normalize(DATASET_MEAN, DATASET_STD)])
 
@@ -194,7 +191,7 @@ def get_gating_routed_validation_data(gating_model, x_val, y_val, target_shard_i
         Intelligently routed validation samples for the target shard
     """
     if gating_model is None:
-        # Fallback to standard class filtering if gating network unavailable
+        # Use standard class filtering if gating network unavailable
         val_mask = np.isin(y_val, cumulative_classes)
         x_val_filtered = x_val[val_mask]
         y_val_filtered = y_val[val_mask]
@@ -322,7 +319,7 @@ def evaluate_slice_incrementally(model, shard_idx, slice_idx, shard_metadatas, t
         correct = np.sum(all_preds == y_test_filtered)
         total = len(y_test_filtered)
     else:
-        # Fallback to direct model evaluation
+        # Use direct model evaluation
         model.eval()
         correct = 0
         total = len(x_test_filtered)
@@ -418,7 +415,7 @@ def check_class_balance_and_augmentation(shard_idx, class_names):
     
     if not all_labels:
         print("   No data found for balance analysis")
-        return config.get_augmentation_config('default')
+        return None
     
     # Calculate class distribution
     from collections import Counter
@@ -453,17 +450,21 @@ def check_class_balance_and_augmentation(shard_idx, class_names):
     
     # Determine augmentation strategy based on balance
     # Conservative thresholds: only augment if significantly unbalanced
-    BALANCE_THRESHOLD = 0.85  # Classes within 85% of each other
-    STD_THRESHOLD = 2.0       # Standard deviation threshold
+    PERFECT_BALANCE_THRESHOLD = 0.95  # Classes within 95% of each other = perfectly balanced
+    BALANCE_THRESHOLD = 0.85  # Classes within 85% of each other = well balanced
+    STD_THRESHOLD = 1.5       # Standard deviation threshold for perfect balance
     
-    if balance_ratio >= BALANCE_THRESHOLD and std_dev <= STD_THRESHOLD:
-        print("   ✓ Classes are well balanced - using minimal augmentation")
+    if balance_ratio >= PERFECT_BALANCE_THRESHOLD and std_dev <= STD_THRESHOLD:
+        print("   Classes are perfectly balanced - NO AUGMENTATION")
+        return None
+    elif balance_ratio >= BALANCE_THRESHOLD and std_dev <= 2.5:
+        print("   Classes are well balanced - using minimal augmentation")
         return config.get_augmentation_config('minimal')
     elif balance_ratio >= 0.75 and std_dev <= 4.0:
-        print("   ⚠ Classes moderately unbalanced - using light augmentation")
+        print("   Classes moderately unbalanced - using light augmentation")
         return config.get_augmentation_config('light')
     else:
-        print("   ✗ Classes significantly unbalanced - using moderate augmentation")
+        print("   Classes significantly unbalanced - using moderate augmentation")
         return config.get_augmentation_config('moderate')
 
 def update_shard_metadata_with_balance(shard_idx, balance_info):
@@ -494,6 +495,10 @@ if __name__ == "__main__":
     print("="*70)
     
     overall_start_time = time.time()
+    gating_training_start_time = 0
+    gating_training_end_time = 0
+    base_model_training_start_time = 0
+    base_model_training_end_time = 0
     all_shard_final_models = []
     all_shard_histories = []
 
@@ -507,6 +512,7 @@ if __name__ == "__main__":
     print("TRAINING GATING NETWORK FIRST FOR INTELLIGENT VALIDATION ROUTING")
     print("="*60)
     
+    gating_training_start_time = time.time()
     gating_model_path = train_gating(
         num_shards=num_shards,
         base_dir=base_dir,
@@ -514,17 +520,23 @@ if __name__ == "__main__":
         dataset_mean=DATASET_MEAN,
         dataset_std=DATASET_STD
     )
+    gating_training_end_time = time.time()
+    gating_training_time = gating_training_end_time - gating_training_start_time
+    print(f"Gating Network Training Time: {gating_training_time:.2f} seconds")
     
     if gating_model_path is None:
-        print("ERROR: Gating network training failed! Falling back to standard validation.")
+        print("Error: Gating network training failed. Falling back to standard validation.")
         gating_model = None
     else:
-        print("Gating Network trained successfully! Loading for validation routing...")
+        print("Gating Network trained. Loading for validation routing...")
         gating_model, _ = load_model_pytorch(gating_model_path, num_shards=num_shards)
         gating_model.eval()
     
     print("="*60)
 
+    # Start timing base model training
+    base_model_training_start_time = time.time()
+    
     for i in range(num_shards):
         print("\n" + "="*20 + f" Training Shard {i+1}/{num_shards} " + "="*20)
         shard_dir = os.path.join(models_dir, f"shard_{i+1}")
@@ -549,10 +561,10 @@ if __name__ == "__main__":
         if config.USE_SMART_REPLAY:
             from training.smart_replay import create_smart_replay_buffer
             replay_buffer = create_smart_replay_buffer(config)
-            print(f"   - Using smart replay buffer with importance + temporal sampling")
+            print("   - Using smart replay buffer with importance + temporal sampling")
         else:
             replay_buffer = {}
-            print(f"   - Using traditional random replay buffer")
+            print("   - Using traditional random replay buffer")
             
         # Initialize adaptive replay manager if enabled
         adaptive_replay_manager = None
@@ -594,7 +606,7 @@ if __name__ == "__main__":
                 )
                 
                 # Calculate dynamic replay ratio if adaptive manager is available
-                current_replay_ratio = config.REPLAY_RATIO  # Default fallback
+                current_replay_ratio = config.REPLAY_RATIO
                 if adaptive_replay_manager and hasattr(replay_buffer, 'buffer'):
                     # Get buffer info for smart buffer
                     buffer_size = sum(len(data['y']) for data in replay_buffer.buffer.values())
@@ -774,12 +786,19 @@ if __name__ == "__main__":
         'final_evaluation'
     )
 
+    # End timing for base model training
+    base_model_training_end_time = time.time()
+    base_model_training_time = base_model_training_end_time - base_model_training_start_time
+    
     total_time = time.time() - overall_start_time
     print("\n" + "=" * 70)
-    print("ENHANCED SISA TRAINING COMPLETED SUCCESSFULLY")
+    print("Enhanced SISA Training Completed")
     print("=" * 70)
+    print("\nTIMING BREAKDOWN:")
+    print(f"Gating Network Training Time: {gating_training_time:.2f} seconds")
+    print(f"Base Model Training Time: {base_model_training_time:.2f} seconds") 
     print(f"Total Training Time: {total_time:.2f} seconds")
-    print(f"Final SISA System Accuracy: {classified_accuracy:.4f}")
+    print(f"\nFinal SISA System Accuracy: {classified_accuracy:.4f}")
     print("Confidence Threshold Used: disabled for final evaluation")
     print(f"Models and reports saved to: {base_dir}")
     print("Training log saved to: training.txt")

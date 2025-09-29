@@ -68,9 +68,7 @@ data_info_dir = f"{base_dir}/data_info"
 os.makedirs(base_dir, exist_ok=True)
 os.makedirs(data_info_dir, exist_ok=True)
 
-print("SISA CONFIGURATION:")
-print("   - Sharding Strategy: CLASS ISOLATION (Each shard gets a distinct set of classes)")
-print("   - Slicing Strategy: CLASS-SEQUENTIAL (Slices are filled with one class at a time)")
+
 print(f"   - Number of Shards: {num_shards}")
 print(f"   - Number of Slices per Shard: {num_slices}")
 
@@ -225,19 +223,34 @@ os.makedirs(sisa_data_dir, exist_ok=True)
 shards_data_dir = f'{sisa_data_dir}/shards'
 os.makedirs(shards_data_dir, exist_ok=True)
 
-# Save main metadata
+# Save main metadata with routing optimization info
 metadata = {
     'num_shards': num_shards,
     'num_slices': num_slices,
     'class_names': class_names,
     'split_info': split_info,
-    'sharding_strategy': 'class_isolation',
+    'sharding_strategy': split_info.get('sharding_strategy', 'class_isolation'),
     'slicing_strategy': 'class_sequential',
     'processing_timestamp': datetime.now().isoformat(),
-    # --- NEW: Add the calculated normalization stats to the metadata ---
+    # --- Normalization stats for consistent preprocessing ---
     'normalization_mean': train_mean,
-    'normalization_std': train_std
-    # --- END OF NEW ---
+    'normalization_std': train_std,
+    # --- NEW: Routing optimization metadata ---
+    'routing_optimization': {
+        'cache_enabled': True,
+        'routing_strategy': 'adaptive_gating_with_cache',
+        'balance_parameters': split_info.get('balance_parameters', {}),
+        'shard_assignment_strategy': split_info.get('assignment_strategy', 'greedy_balancing'),
+        'unlearned_classes': [],  # Will be updated during unlearning
+        'routing_cache_version': '1.0'
+    },
+    # --- Shard load balancing info ---
+    'shard_info': {
+        f'shard_{i+1}': {
+            'expected_samples': sum(len(slice_data) for slice_data in shard_slices_list[i]) if i < len(shard_slices_list) else 0,
+            'classes_assigned': [class_names[cls] for cls in set().union(*[np.unique(slice_y) for slice_y in y_slices_list[i]])] if i < len(y_slices_list) and y_slices_list[i] else []
+        } for i in range(num_shards)
+    }
 }
 with open(f'{sisa_data_dir}/metadata.json', 'w') as f:
     json.dump(metadata, f, indent=2)
@@ -269,7 +282,20 @@ for shard_idx in range(num_shards):
         'shard_index': shard_idx + 1,
         'total_samples': len(all_shard_labels),
         'class_indices_present': [int(c) for c in unique_classes_in_shard],
-        'class_names_present': class_names_in_shard
+        'class_names_present': class_names_in_shard,
+        # --- NEW: Routing and load balancing metadata ---
+        'routing_metadata': {
+            'shard_specialization': class_names_in_shard,  # Classes this shard specializes in
+            'load_balance_score': len(all_shard_labels) / (len(x_train) / num_shards),  # Relative load vs ideal
+            'training_priority': 'normal',  # Can be 'high', 'normal', 'low' based on imbalance
+            'routing_cache_initialized': False,  # Will be set to True after first training
+            'unlearned_classes': []  # Track what classes have been unlearned from this shard
+        },
+        'performance_metadata': {
+            'expected_training_time_ratio': len(all_shard_labels) / (len(x_train) / num_shards),
+            'memory_usage_ratio': len(all_shard_labels) / (len(x_train) / num_shards),
+            'optimal_batch_size': min(64, max(16, len(all_shard_labels) // 100))  # Adaptive batch size
+        }
     }
     with open(f'{shard_dir}/metadata.json', 'w') as f:
         json.dump(shard_metadata, f, indent=2)
@@ -287,7 +313,7 @@ save_time = time.time() - save_start_time
 create_data_visualizations()
 
 print("\n" + "=" * 60)
-print("DATA PROCESSING COMPLETED SUCCESSFULLY")
+print("Data Processing Completed")
 print("=" * 60)
 print(f"Project directory: {base_dir}")
 print(f"Reports and visualizations saved to: {data_info_dir}")

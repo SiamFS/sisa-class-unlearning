@@ -2,7 +2,6 @@ import sys
 import os
 import json
 import argparse
-import pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -265,11 +264,11 @@ class SISASearchTool:
         
         if class_name == 'cat':  # Special analysis for deleted class
             if accuracy < config.UNLEARNING_SUCCESS_THRESHOLD and unknown_rate > 0.5:
-                print(">>> SUCCESS: Model appears to have successfully unlearned this class!")
+                print("Model appears to have successfully unlearned this class")
             elif unknown_rate > 0.3:
-                print(">>> PARTIAL: Model shows some unlearning effects.")
+                print("Model shows some unlearning effects")
             else:
-                print(">>> WARNING: Model may not have properly unlearned this class.")
+                print("Warning: Model may not have properly unlearned this class")
         
         # Create visualization
         self._create_prediction_visualization(selected_samples, selected_labels, predictions, confidences, class_name, threshold)
@@ -437,7 +436,7 @@ def main():
         search_tool = SISASearchTool(project_name=args.project, model_name=args.model)
         search_tool.search_class_predictions(args.class_name, args.samples, args.threshold)
         
-        print(f"\nAnalysis completed successfully!")
+        print("\nAnalysis completed")
         print(f"Check the generated visualization in: ../projects/{args.project}/data_info/")
         
     except Exception as e:

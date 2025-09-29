@@ -42,7 +42,7 @@ class AdaptiveReplayManager:
     def _compute_dynamic_thresholds(self):
         """Compute dynamic thresholds based on dataset characteristics."""
         if self.dataset_size is None:
-            # Fallback to default thresholds for unknown dataset size
+            # Use default thresholds for unknown dataset size
             self.small_buffer_threshold = 1000
             self.large_buffer_threshold = 10000
         else:
@@ -312,4 +312,4 @@ if __name__ == "__main__":
     print("Buffer thresholds scale with dataset size")
     print("Position factors adapt to slice/shard counts") 
     print("Ratios adjust to actual buffer vs new data ratios")
-    print("No hardcoded assumptions about architecture")
+    print("Using flexible architecture-agnostic replay strategy")

@@ -55,8 +55,7 @@ def _apply_temperature_tensor(probs: torch.Tensor, temperature: float) -> torch.
     return torch.softmax(log_probs / temperature, dim=-1)
 
 
-# NOTE: _combine_specialist_predictions function removed - functionality moved to _run_sisa_batch
-# for TRUE gating network routing efficiency (each sample → chosen shard only)
+
 
 
 def _run_sisa_batch(
@@ -781,7 +780,7 @@ AUC Interpretation:
 • 0.8-0.9: Good
 • 0.7-0.8: Fair
 • 0.6-0.7: Poor
-• 0.5-0.6: Fail
+• 0.5-0.6: Low
 """
 	plt.text(
 		0.1,
@@ -1548,7 +1547,7 @@ def create_accuracy_comparison_chart(training_accuracy, unlearning_accuracy, unl
     
     categories = ['Before Unlearning\n(Training)', f'After Unlearning\n(Removed: {unlearned_class})']
     accuracies = [training_accuracy, unlearning_accuracy]
-    colors = ['#2E86AB', '#A23B72']  # Blue for training, pink for unlearning
+    colors = ['#2E86AB', '#2E86AB']  # Same blue color for both bars
     
     bars = ax.bar(categories, accuracies, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
     
@@ -1583,37 +1582,46 @@ def create_accuracy_comparison_chart(training_accuracy, unlearning_accuracy, unl
     return save_path
 
 
-def create_time_comparison_chart(training_time, unlearning_total_time, unlearning_retrain_time, save_dir):
+def create_time_comparison_chart(gating_training_time, base_model_time, unlearning_total_time, retraining_time, save_dir):
     """
-    Create bar chart comparing training time vs unlearning times.
+    Create bar chart showing actual raw timing breakdown (NO plotting time included).
     
     Args:
-        training_time: Original training time in seconds
-        unlearning_total_time: Total unlearning time in seconds
-        unlearning_retrain_time: Just the retraining time in seconds
+        gating_training_time: Gating network training time in seconds
+        base_model_time: Base model training time + evaluation in seconds
+        unlearning_total_time: Total unlearning time (find/remove + retrain + evaluation) in seconds
+        retraining_time: Just the model retraining time + evaluation in seconds
         save_dir: Directory to save the chart
     """
-    print("   Creating time comparison chart...")
+    print("   Creating time comparison chart with real timing data...")
     
-    # Debug: Print the values to see what's causing the issue
-    print(f"   Debug: training_time={training_time}, unlearning_total_time={unlearning_total_time}, unlearning_retrain_time={unlearning_retrain_time}")
+    # Debug: Print the actual values
+    print(f"   Gating network training: {gating_training_time:.2f}s")
+    print(f"   Base model training+eval: {base_model_time:.2f}s")
+    print(f"   Unlearning total: {unlearning_total_time:.2f}s")
+    print(f"   Retraining+eval only: {retraining_time:.2f}s")
     
-    # Validate input values to prevent matplotlib errors
-    times = [training_time, unlearning_total_time, unlearning_retrain_time]
+    # Validate input values
+    times = [gating_training_time, base_model_time, unlearning_total_time, retraining_time]
     
     # Check for invalid values
     for i, time_val in enumerate(times):
-        if not isinstance(time_val, (int, float)) or time_val < 0 or time_val > 10000:  # Reasonable upper limit
-            print(f"   Warning: Invalid time value at index {i}: {time_val}. Using fallback.")
-            times[i] = 100.0  # Fallback value
+        if not isinstance(time_val, (int, float)) or time_val < 0:
+            print(f"   Warning: Invalid time value at index {i}: {time_val}. Using 0.0.")
+            times[i] = 0.0
     
     # Use validated times
-    training_time, unlearning_total_time, unlearning_retrain_time = times
+    gating_training_time, base_model_time, unlearning_total_time, retraining_time = times
     
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 8))
     
-    categories = ['Initial Training', 'Unlearning\n(Total)', 'Unlearning\n(Retraining Only)']
-    colors = ['#2E86AB', '#A23B72', '#F18F01']  # Blue, pink, orange
+    categories = [
+        'Gating Network\nTraining',
+        'Base Model\nTraining+Eval',
+        'Unlearning\n(Total)',
+        'Retraining\n+Eval Only'
+    ]
+    colors = ['#2E86AB', '#2E86AB', '#2E86AB', '#2E86AB']  # All same blue color
     
     bars = ax.bar(categories, times, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
     
@@ -1624,18 +1632,19 @@ def create_time_comparison_chart(training_time, unlearning_total_time, unlearnin
                 f'{time_val:.1f}s', ha='center', va='bottom', fontsize=12, fontweight='bold')
     
     ax.set_ylabel('Time (seconds)', fontsize=12)
-    ax.set_title('SISA System Time Comparison: Training vs Unlearning', fontsize=14, fontweight='bold')
+    ax.set_title('SISA System Real Time Breakdown (No Plotting Time)', fontsize=14, fontweight='bold')
     ax.set_ylim(0, max(times) * 1.15)
     ax.grid(True, alpha=0.3, axis='y')
     
-    # Add time savings annotation
-    time_savings = training_time - unlearning_retrain_time
-    savings_percent = (time_savings / training_time) * 100 if training_time > 0 else 0
-    ax.annotate(f'Retraining Savings: {time_savings:.1f}s ({savings_percent:.1f}%)', 
+    # Add time efficiency annotation comparing base model vs retraining
+    total_training_time = gating_training_time + base_model_time
+    time_savings = total_training_time - retraining_time
+    savings_percent = (time_savings / total_training_time) * 100 if total_training_time > 0 else 0
+    ax.annotate(f'Retraining Efficiency: {time_savings:.1f}s saved ({savings_percent:.1f}%)', 
                 xy=(0.5, max(times) * 0.8), 
                 xycoords='axes fraction',
                 ha='center', va='center',
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgreen", alpha=0.8),
+                bbox={'boxstyle': "round,pad=0.3", 'facecolor': "lightgreen", 'alpha': 0.8},
                 fontsize=11)
     
     # Remove tight_layout() that was causing issues
