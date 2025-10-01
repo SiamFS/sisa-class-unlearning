@@ -223,7 +223,7 @@ os.makedirs(sisa_data_dir, exist_ok=True)
 shards_data_dir = f'{sisa_data_dir}/shards'
 os.makedirs(shards_data_dir, exist_ok=True)
 
-# Save main metadata with routing optimization info
+# Save main metadata
 metadata = {
     'num_shards': num_shards,
     'num_slices': num_slices,
@@ -235,15 +235,6 @@ metadata = {
     # --- Normalization stats for consistent preprocessing ---
     'normalization_mean': train_mean,
     'normalization_std': train_std,
-    # --- NEW: Routing optimization metadata ---
-    'routing_optimization': {
-        'cache_enabled': True,
-        'routing_strategy': 'adaptive_gating_with_cache',
-        'balance_parameters': split_info.get('balance_parameters', {}),
-        'shard_assignment_strategy': split_info.get('assignment_strategy', 'greedy_balancing'),
-        'unlearned_classes': [],  # Will be updated during unlearning
-        'routing_cache_version': '1.0'
-    },
     # --- Shard load balancing info ---
     'shard_info': {
         f'shard_{i+1}': {
@@ -283,14 +274,9 @@ for shard_idx in range(num_shards):
         'total_samples': len(all_shard_labels),
         'class_indices_present': [int(c) for c in unique_classes_in_shard],
         'class_names_present': class_names_in_shard,
-        # --- NEW: Routing and load balancing metadata ---
-        'routing_metadata': {
-            'shard_specialization': class_names_in_shard,  # Classes this shard specializes in
-            'load_balance_score': len(all_shard_labels) / (len(x_train) / num_shards),  # Relative load vs ideal
-            'training_priority': 'normal',  # Can be 'high', 'normal', 'low' based on imbalance
-            'routing_cache_initialized': False,  # Will be set to True after first training
-            'unlearned_classes': []  # Track what classes have been unlearned from this shard
-        },
+        # --- Load balancing metadata ---
+        'load_balance_score': len(all_shard_labels) / (len(x_train) / num_shards),  # Relative load vs ideal
+        'unlearned_classes': [],  # Track what classes have been unlearned from this shard
         'performance_metadata': {
             'expected_training_time_ratio': len(all_shard_labels) / (len(x_train) / num_shards),
             'memory_usage_ratio': len(all_shard_labels) / (len(x_train) / num_shards),

@@ -1059,7 +1059,10 @@ def create_shard_confusion_matrix(model, x_test, y_test, class_names, shard_idx,
 
 
 def create_gating_routing_barplots(gating_model, x_data, y_data, class_names, save_dir, training_type='training'):
-    """Visualize average gating probabilities per class for each shard."""
+    """
+    Visualize gating network routing probabilities per shard.
+    PRIVACY-PRESERVING: Shows only shard routing decisions, NOT class information.
+    """
 
     if gating_model is None:
         print("   - Skipping gating routing barplots (gating model unavailable)")
@@ -1071,10 +1074,9 @@ def create_gating_routing_barplots(gating_model, x_data, y_data, class_names, sa
     gating_model.eval()
 
     batch_size = config.BATCH_SIZE
-    num_classes = len(class_names)
-    class_counts = np.zeros(num_classes, dtype=np.float64)
-    shard_prob_sums = None
+    all_shard_probs = []
 
+    # Collect gating network predictions for all samples
     with torch.no_grad():
         for i in range(0, len(x_data), batch_size):
             batch_x = torch.from_numpy(x_data[i:i+batch_size]).float()
@@ -1082,63 +1084,72 @@ def create_gating_routing_barplots(gating_model, x_data, y_data, class_names, sa
                 continue
 
             batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
-            batch_y = y_data[i:i+batch_size]
-
             logits = gating_model(batch_x_normalized)
             probs = torch.softmax(logits, dim=1).cpu().numpy()
+            all_shard_probs.append(probs)
 
-            if shard_prob_sums is None:
-                num_shards = probs.shape[1]
-                shard_prob_sums = np.zeros((num_shards, num_classes), dtype=np.float64)
-
-            for idx, cls in enumerate(batch_y):
-                if cls < 0 or cls >= num_classes:
-                    continue
-                shard_prob_sums[:, cls] += probs[idx]
-                class_counts[cls] += 1.0
-
-    if shard_prob_sums is None or class_counts.sum() == 0:
+    if not all_shard_probs:
         print("   - Skipping gating routing barplots (no data available)")
         return None
 
-    class_counts_safe = np.where(class_counts > 0, class_counts, 1.0)
-    avg_probs = shard_prob_sums / class_counts_safe
-    avg_probs[:, class_counts == 0] = 0.0
-
-    num_shards = avg_probs.shape[0]
-    cols = min(3, num_shards)
-    rows = int(np.ceil(num_shards / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows), squeeze=False)
-
-    for shard_idx in range(num_shards):
-        row = shard_idx // cols
-        col = shard_idx % cols
-        ax = axes[row][col]
-
-        ax.bar(range(num_classes), avg_probs[shard_idx], color='#1f4e79')  # Single deep blue color
-        ax.set_xticks(range(num_classes))
-        ax.set_xticklabels(class_names, rotation=45, ha='right')
-        ax.set_ylim(0, 1)
-        ax.set_ylabel('Avg Softmax Probability')
-        ax.set_title(f'Shard {shard_idx + 1} Gating Probabilities')
-        ax.grid(axis='y', alpha=0.2)
-
-        for x_pos, value in enumerate(avg_probs[shard_idx]):
-            ax.text(x_pos, value + 0.01, f"{value:.2f}", ha='center', va='bottom', fontsize=8, fontweight='bold')
-
-    # Hide unused subplots, if any
-    for shard_idx in range(num_shards, rows * cols):
-        row = shard_idx // cols
-        col = shard_idx % cols
-        axes[row][col].axis('off')
-
+    # Concatenate all probabilities
+    all_shard_probs = np.vstack(all_shard_probs)
+    num_shards = all_shard_probs.shape[1]
+    
+    # Calculate average routing probabilities for each shard
+    avg_shard_probs = np.mean(all_shard_probs, axis=0)
+    
+    # Count how many samples are routed to each shard (highest probability)
+    shard_assignments = np.argmax(all_shard_probs, axis=1)
+    shard_counts = np.bincount(shard_assignments, minlength=num_shards)
+    shard_percentages = (shard_counts / len(all_shard_probs)) * 100
+    
+    # Create visualization
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Plot 1: Average softmax probability per shard
+    colors = plt.cm.Set3(np.arange(num_shards))
+    shard_labels = [f'Shard {i+1}' for i in range(num_shards)]
+    
+    bars1 = ax1.bar(range(num_shards), avg_shard_probs, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+    ax1.set_xticks(range(num_shards))
+    ax1.set_xticklabels(shard_labels, fontsize=11, fontweight='bold')
+    ax1.set_ylim(0, 1.0)
+    ax1.set_ylabel('Average Softmax Probability', fontsize=12, fontweight='bold')
+    ax1.set_title('Gating Network: Average Routing Probability per Shard', fontsize=14, fontweight='bold', pad=15)
+    ax1.grid(axis='y', alpha=0.3)
+    ax1.set_axisbelow(True)
+    
+    # Add value labels on bars
+    for bar, value in zip(bars1, avg_shard_probs):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height + 0.02,
+                f'{value:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
+    # Plot 2: Sample distribution across shards
+    bars2 = ax2.bar(range(num_shards), shard_percentages, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+    ax2.set_xticks(range(num_shards))
+    ax2.set_xticklabels(shard_labels, fontsize=11, fontweight='bold')
+    ax2.set_ylim(0, 100)
+    ax2.set_ylabel('Percentage of Samples (%)', fontsize=12, fontweight='bold')
+    ax2.set_title('Gating Network: Sample Routing Distribution', fontsize=14, fontweight='bold', pad=15)
+    ax2.grid(axis='y', alpha=0.3)
+    ax2.set_axisbelow(True)
+    
+    # Add value labels on bars
+    for bar, count, pct in zip(bars2, shard_counts, shard_percentages):
+        height = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width()/2., height + 1,
+                f'{pct:.1f}%\n({count})', ha='center', va='bottom', fontsize=10, fontweight='bold')
+    
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
-    output_path = os.path.join(save_dir, f'gating_shard_routing_probabilities_{training_type}.png')
+    output_path = os.path.join(save_dir, f'sisa_pure_routing_analysis_{training_type}.png')
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
-    print(f"   - Gating routing probabilities saved to: {os.path.basename(output_path)}")
+    print("   - Created privacy-preserving gating routing visualization (shard-level only)")
+    print(f"   - Saved to: {os.path.basename(output_path)}")
     return output_path
 
 
@@ -1599,7 +1610,7 @@ def create_time_comparison_chart(gating_training_time, base_model_time, unlearni
     print(f"   Gating network training: {gating_training_time:.2f}s")
     print(f"   Base model training+eval: {base_model_time:.2f}s")
     print(f"   Unlearning total: {unlearning_total_time:.2f}s")
-    print(f"   Retraining+eval only: {retraining_time:.2f}s")
+    print(f"   Retraining+eval : {retraining_time:.2f}s")
     
     # Validate input values
     times = [gating_training_time, base_model_time, unlearning_total_time, retraining_time]
@@ -1632,7 +1643,7 @@ def create_time_comparison_chart(gating_training_time, base_model_time, unlearni
                 f'{time_val:.1f}s', ha='center', va='bottom', fontsize=12, fontweight='bold')
     
     ax.set_ylabel('Time (seconds)', fontsize=12)
-    ax.set_title('SISA System Real Time Breakdown (No Plotting Time)', fontsize=14, fontweight='bold')
+    ax.set_title('SISA System Real Time Breakdown', fontsize=14, fontweight='bold')
     ax.set_ylim(0, max(times) * 1.15)
     ax.grid(True, alpha=0.3, axis='y')
     
@@ -1658,6 +1669,99 @@ def create_time_comparison_chart(gating_training_time, base_model_time, unlearni
     plt.close()
     
     print(f"   - Time comparison chart saved: {os.path.basename(save_path)}")
+    return save_path
+
+
+def create_pure_training_time_chart(gating_training_time, base_model_training_time, find_delete_time, retraining_time_only, save_dir):
+    """
+    Create bar chart showing ONLY raw training times (NO evaluation time included).
+    This shows pure model training operations:
+    1) Gating Network Training (model training only)
+    2) Base Model Training (all shards, model training only, no incremental evaluations)
+    3) Unlearning Operations (Find + Delete + Retraining combined as ONE bar)
+    
+    Args:
+        gating_training_time: Pure gating network training time in seconds (no eval)
+        base_model_training_time: Pure base model training time in seconds (no eval)
+        find_delete_time: Time to find and delete samples from shards in seconds
+        retraining_time_only: Pure retraining time in seconds (no eval)
+        save_dir: Directory to save the chart
+    """
+    print("   Creating PURE training time comparison chart (no evaluation time)...")
+    
+    # Combine Find+Delete+Retrain into single "Unlearning Operations" value
+    unlearning_operations_time = find_delete_time + retraining_time_only
+    
+    # Debug: Print the actual values
+    print(f"   Gating network training: {gating_training_time:.2f}s")
+    print(f"   Base model training : {base_model_training_time:.2f}s")
+    print(f"   Unlearning Operations (Find+Delete+Retrain): {unlearning_operations_time:.2f}s")
+    print(f"     - Find + Delete: {find_delete_time:.2f}s")
+    print(f"     - Retraining: {retraining_time_only:.2f}s")
+    
+    # Use 4 categories exactly like the old chart: Gating, Base Training, Unlearning Total, Retraining Only
+    # But show pure times instead of with-eval times
+    times = [gating_training_time, base_model_training_time, unlearning_operations_time, retraining_time_only]
+    
+    # Check for invalid values
+    for i, time_val in enumerate(times):
+        if not isinstance(time_val, (int, float)) or time_val < 0:
+            print(f"   Warning: Invalid time value at index {i}: {time_val}. Using 0.0.")
+            times[i] = 0.0
+    
+    # Create figure with explicit size matching the old chart style exactly
+    fig = plt.figure(figsize=(14, 8))
+    ax = fig.add_subplot(111)
+    
+    categories = [
+        'Gating Network\nTraining',
+        'Base Model\nTraining', 
+        'Unlearning\n(Total)',
+        'Retraining\n'
+    ]
+    colors = ['#2E86AB', '#2E86AB', '#2E86AB', '#2E86AB']  # Use same blue color as old chart
+    
+    bars = ax.bar(categories, times, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
+    
+    # Calculate max time for scaling
+    max_time = max(times) if max(times) > 0 else 1.0
+    
+    # Add time values on top of bars (same style as old chart)
+    for i, (bar, time_val) in enumerate(zip(bars, times)):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height + max_time * 0.02,
+                f'{time_val:.1f}s', ha='center', va='bottom', fontsize=11, fontweight='bold')
+    
+    ax.set_ylabel('Time (seconds)', fontsize=12)
+    ax.set_title('SISA System Time Breakdown', 
+                 fontsize=14, fontweight='bold')
+    ax.set_ylim(0, max_time * 1.15)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add time efficiency annotation like old chart
+    total_training_time = gating_training_time + base_model_training_time
+    time_savings = total_training_time - retraining_time_only
+    savings_percent = (time_savings / total_training_time) * 100 if total_training_time > 0 else 0
+    ax.annotate(f'Retraining Efficiency: {time_savings:.1f}s saved ({savings_percent:.1f}%)', 
+                xy=(0.5, max_time * 0.8), 
+                xycoords='axes fraction',
+                ha='center', va='center',
+                bbox={'boxstyle': "round,pad=0.3", 'facecolor': "lightgreen", 'alpha': 0.8},
+                fontsize=11)
+    
+    # Remove tight_layout() that was causing issues
+    # plt.tight_layout()
+    
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, "pure_training_time_breakdown.png")
+    
+    # Use lower DPI and remove bbox_inches to prevent large image sizes
+    plt.savefig(save_path, dpi=100, facecolor='white')
+    plt.close()
+    
+    print(f"   - Pure training time chart saved: {os.path.basename(save_path)}")
+    
+    print(f"   - Pure training time chart saved: {os.path.basename(save_path)}")
     return save_path
 
 
@@ -1929,6 +2033,7 @@ __all__ = [
 	"create_overall_sisa_confusion_matrix",
 	"create_accuracy_comparison_chart",
 	"create_time_comparison_chart",
+	"create_pure_training_time_chart",
 	"create_classification_metrics_comparison_chart",
 	"create_efficiency_metrics_chart",
 ]

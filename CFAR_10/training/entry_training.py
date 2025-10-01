@@ -499,6 +499,7 @@ if __name__ == "__main__":
     gating_training_end_time = 0
     base_model_training_start_time = 0
     base_model_training_end_time = 0
+    pure_training_time = 0  # NEW: Track pure model training time (excludes evaluations)
     all_shard_final_models = []
     all_shard_histories = []
 
@@ -513,7 +514,7 @@ if __name__ == "__main__":
     print("="*60)
     
     gating_training_start_time = time.time()
-    gating_model_path = train_gating(
+    gating_model_path, pure_gating_training_time = train_gating(
         num_shards=num_shards,
         base_dir=base_dir,
         num_slices=num_slices,
@@ -522,7 +523,8 @@ if __name__ == "__main__":
     )
     gating_training_end_time = time.time()
     gating_training_time = gating_training_end_time - gating_training_start_time
-    print(f"Gating Network Training Time: {gating_training_time:.2f} seconds")
+    print(f"Gating Network Training Time (with I/O): {gating_training_time:.2f} seconds")
+    print(f"Gating Network Training Time (pure): {pure_gating_training_time:.2f} seconds")
     
     if gating_model_path is None:
         print("Error: Gating network training failed. Falling back to standard validation.")
@@ -565,16 +567,6 @@ if __name__ == "__main__":
         else:
             replay_buffer = {}
             print("   - Using traditional random replay buffer")
-            
-        # Initialize adaptive replay manager if enabled
-        adaptive_replay_manager = None
-        if getattr(config, 'USE_ADAPTIVE_REPLAY_RATIO', False):
-            from training.adaptive_replay import create_adaptive_replay_manager
-            # Calculate total dataset size for this shard
-            shard_dataset_size = sum(len(load_slice(i, j)[0]) for j in range(num_slices) 
-                                   if load_slice(i, j)[0] is not None)
-            adaptive_replay_manager = create_adaptive_replay_manager(config, shard_dataset_size)
-            print(f"   - Using adaptive replay ratio management (dataset size: {shard_dataset_size:,})")
         
         final_model_path = os.path.join(shard_dir, f"final_model_shard{i+1}_{MODEL_NAME}.pth")
         
@@ -605,32 +597,12 @@ if __name__ == "__main__":
                     validation_data=validation_data
                 )
                 
-                # Calculate dynamic replay ratio if adaptive manager is available
+                # Use static replay ratio from config
                 current_replay_ratio = config.REPLAY_RATIO
-                if adaptive_replay_manager and hasattr(replay_buffer, 'buffer'):
-                    # Get buffer info for smart buffer
-                    buffer_size = sum(len(data['y']) for data in replay_buffer.buffer.values())
-                    class_dist = {cls: len(data['y']) for cls, data in replay_buffer.buffer.items()}
-                elif adaptive_replay_manager and isinstance(replay_buffer, dict):
-                    # Get buffer info for traditional buffer  
-                    buffer_size = sum(len(data['y']) for data in replay_buffer.values())
-                    class_dist = {cls: len(data['y']) for cls, data in replay_buffer.items()}
-                else:
-                    buffer_size = 0
-                    class_dist = {}
+                print(f"   - Using replay ratio: {current_replay_ratio}")
                 
-                if adaptive_replay_manager:
-                    current_replay_ratio = adaptive_replay_manager.compute_adaptive_replay_ratio(
-                        current_slice=j,
-                        total_slices=num_slices,
-                        replay_buffer_size=buffer_size,
-                        new_data_size=len(x_slice),
-                        training_type='incremental' if current_model is not None else 'fresh',
-                        class_distribution=class_dist,
-                        current_shard=i,
-                        total_shards=num_shards
-                    )
-                    print(f"   - Dynamic replay ratio: {current_replay_ratio:.3f} (vs static {config.REPLAY_RATIO})")
+                # START: Track pure training time (before train_model call)
+                slice_train_start = time.time()
                 
                 # Enhanced training parameters for better accuracy
                 current_model, history = train_model(
@@ -649,6 +621,11 @@ if __name__ == "__main__":
                     use_smart_replay=config.USE_SMART_REPLAY,
                     device=DEVICE
                 )
+                
+                # END: Track pure training time (after train_model call)
+                slice_train_end = time.time()
+                pure_training_time += (slice_train_end - slice_train_start)
+                
                 shard_histories.append(history)
                 
                 slice_checkpoint_path = os.path.join(shard_dir, f"slice_{j}_model_{MODEL_NAME}.pth")
@@ -726,6 +703,10 @@ if __name__ == "__main__":
         print("Gating network not available for final evaluation")
         classified_accuracy, overall_accuracy = 0.0, 0.0
 
+    # End timing for base model training (AFTER final evaluation, BEFORE visualizations)
+    base_model_training_end_time = time.time()
+    base_model_training_time = base_model_training_end_time - base_model_training_start_time
+
     # Create overall SISA system confusion matrix
     print("\n" + "=" * 50)
     print("CREATING OVERALL SISA SYSTEM CONFUSION MATRIX")
@@ -786,17 +767,15 @@ if __name__ == "__main__":
         'final_evaluation'
     )
 
-    # End timing for base model training
-    base_model_training_end_time = time.time()
-    base_model_training_time = base_model_training_end_time - base_model_training_start_time
-    
     total_time = time.time() - overall_start_time
     print("\n" + "=" * 70)
     print("Enhanced SISA Training Completed")
     print("=" * 70)
     print("\nTIMING BREAKDOWN:")
-    print(f"Gating Network Training Time: {gating_training_time:.2f} seconds")
-    print(f"Base Model Training Time: {base_model_training_time:.2f} seconds") 
+    print(f"Gating Network Training Time (with I/O): {gating_training_time:.2f} seconds")
+    print(f"Gating Network Training Time (pure): {pure_gating_training_time:.2f} seconds")
+    print(f"Base Model Training Time (with eval): {base_model_training_time:.2f} seconds")
+    print(f"Base Model Training Time (pure): {pure_training_time:.2f} seconds") 
     print(f"Total Training Time: {total_time:.2f} seconds")
     print(f"\nFinal SISA System Accuracy: {classified_accuracy:.4f}")
     print("Confidence Threshold Used: disabled for final evaluation")

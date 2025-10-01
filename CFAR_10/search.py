@@ -160,7 +160,6 @@ class SISASearchTool:
         print(f"\n" + "="*70)
         print(f"SEARCHING FOR CLASS: '{class_name.upper()}' PREDICTIONS")
         print("="*70)
-        print(f"Using confidence threshold: {threshold}")
         print("Searching in current SISA test dataset...")
         
         # Load models
@@ -374,7 +373,7 @@ class SISASearchTool:
         """Create a 4x4 grid visualization similar to unlearning verification"""
         
         fig, axes = plt.subplots(4, 4, figsize=(12, 12))
-        fig.suptitle(f"Class Search Analysis: '{class_name.upper()}' (Threshold={threshold})", fontsize=16, fontweight='bold')
+        fig.suptitle(f"Class Search Analysis: '{class_name.upper()}' ", fontsize=16, fontweight='bold')
         
         for i, ax in enumerate(axes.flat):
             if i >= len(samples):

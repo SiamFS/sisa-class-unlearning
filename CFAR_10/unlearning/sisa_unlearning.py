@@ -29,6 +29,7 @@ from plots import (
     create_gating_routing_barplots,
     create_accuracy_comparison_chart,
     create_time_comparison_chart,
+    create_pure_training_time_chart,
     create_classification_metrics_comparison_chart,
     _run_sisa_batch,
     _normalize_probabilities_tensor,
@@ -80,10 +81,6 @@ class SISAUnlearning:
         self.data_dir = os.path.join(self.base_dir, "sisa_data")
         self.reports_dir = os.path.join(self.base_dir, "data_info")
         self.test_data_dir = os.path.join(self.data_dir, "test_data")
-        
-        # Initialize routing cache for optimization
-        from training.routing_cache import RoutingCache
-        self.routing_cache = RoutingCache(project_name)
         
         self.metadata = self._load_metadata()
         self.class_names = self.metadata.get('class_names', [])
@@ -284,10 +281,11 @@ class SISAUnlearning:
         print("\n" + "=" * 60)
         print("TRAINING BASELINE METRICS (Before Unlearning)")
         print("=" * 60)
-        training_accuracy, gating_training_time, base_model_time, training_report = self._get_training_metrics()
+        training_accuracy, gating_training_time, base_model_time, pure_training_time, training_report = self._get_training_metrics()
         print(f"Training Accuracy: {training_accuracy:.4f}")
         print(f"Gating Network Training Time: {gating_training_time:.2f} seconds")
-        print(f"Base Model Training Time: {base_model_time:.2f} seconds")
+        print(f"Base Model Training Time (with eval): {base_model_time:.2f} seconds")
+        print(f"Base Model Training Time (pure): {pure_training_time:.2f} seconds")
         print(f"Total Training Time: {(gating_training_time + base_model_time):.2f} seconds")
         print("=" * 60)
         
@@ -344,15 +342,19 @@ class SISAUnlearning:
             return
 
         total_retrain_time = 0.0
+        total_pure_retrain_time = 0.0  # NEW: Track pure training time
         print("\nStep 2: Retraining affected shards incrementally...")
         retraining_start = time.time()
         for shard_idx, info in affected_shards.items():
-            retrain_time = self._retrain_shard_incrementally(shard_idx, info['first_affected_slice'])
+            retrain_time, pure_retrain_time = self._retrain_shard_incrementally(shard_idx, info['first_affected_slice'])
             total_retrain_time += retrain_time
+            total_pure_retrain_time += pure_retrain_time  # NEW: Accumulate pure training time
         
-        # Capture retraining time
+        # Capture both retraining times
         self.retraining_time = time.time() - retraining_start
-        print(f"Retraining Time: {self.retraining_time:.2f} seconds")
+        self.pure_retraining_time = total_pure_retrain_time  # NEW: Store pure training time
+        print(f"Retraining Time (with eval): {self.retraining_time:.2f} seconds")
+        print(f"Retraining Time (pure): {self.pure_retraining_time:.2f} seconds")
         
         # Step 3: Track unlearned class (without retraining gating network)
         self._track_unlearned_class(class_idx)
@@ -410,6 +412,7 @@ class SISAUnlearning:
 
     def _retrain_shard_incrementally(self, shard_idx: int, first_affected_slice: int):
         retrain_start_time = time.time()
+        pure_retrain_time = 0  # NEW: Track pure training time (excludes evaluation/plotting)
         print("\n" + "="*20 + f" Incremental Retraining for Shard {shard_idx+1} " + "="*20)
         
         # Check class balance and determine augmentation strategy for unlearning
@@ -426,18 +429,6 @@ class SISAUnlearning:
                 os.remove(stale_model_path)
 
         base_model_slice_idx = first_affected_slice - 1
-        # Initialize adaptive replay manager if enabled
-        adaptive_replay_manager = None
-        if getattr(config, 'USE_ADAPTIVE_REPLAY_RATIO', False):
-            from training.adaptive_replay import create_adaptive_replay_manager
-            # Calculate total dataset size for this shard during unlearning
-            shard_dataset_size = 0
-            for slice_idx in range(self.num_slices):
-                x_s, y_s = self._load_slice_data(shard_idx, slice_idx)
-                if x_s is not None:
-                    shard_dataset_size += len(x_s)
-            adaptive_replay_manager = create_adaptive_replay_manager(config, shard_dataset_size)
-            print(f"   - Using adaptive replay ratio for unlearning (dataset size: {shard_dataset_size:,})")
         
         current_model = None
         if base_model_slice_idx >= 0:
@@ -507,33 +498,13 @@ class SISAUnlearning:
             x_slice, y_slice = self._load_slice_data(shard_idx, slice_idx)
             if x_slice is None: continue
 
-            # Calculate dynamic replay ratio for unlearning if adaptive manager available
+            # Use static replay ratio for unlearning
             current_replay_ratio = config.UNLEARNING_REPLAY_RATIO
-            if adaptive_replay_manager and hasattr(replay_buffer, 'buffer'):
-                # Smart buffer case
-                buffer_size = sum(len(data['y']) for data in replay_buffer.buffer.values())
-                class_dist = {cls: len(data['y']) for cls, data in replay_buffer.buffer.items()}
-            elif adaptive_replay_manager and isinstance(replay_buffer, dict):
-                # Traditional buffer case
-                buffer_size = sum(len(data['y']) for data in replay_buffer.values())
-                class_dist = {cls: len(data['y']) for cls, data in replay_buffer.items()}
-            else:
-                buffer_size = 0
-                class_dist = {}
-            
-            if adaptive_replay_manager:
-                current_replay_ratio = adaptive_replay_manager.compute_adaptive_replay_ratio(
-                    current_slice=slice_idx,
-                    total_slices=self.num_slices,
-                    replay_buffer_size=buffer_size,
-                    new_data_size=len(x_slice),
-                    training_type='unlearning',
-                    class_distribution=class_dist,
-                    current_shard=shard_idx,
-                    total_shards=self.num_shards
-                )
-                print(f"   - Dynamic unlearning replay ratio: {current_replay_ratio:.3f} (vs static {config.UNLEARNING_REPLAY_RATIO})")
+            print(f"   - Using replay ratio: {current_replay_ratio}")
 
+            # START: Track pure training time (before train_model call)
+            slice_train_start = time.time()
+            
             # Enhanced retraining parameters for better accuracy after unlearning
             current_model, history = train_model(
                 x_slice, y_slice, model=current_model,
@@ -551,6 +522,10 @@ class SISAUnlearning:
                 use_smart_replay=config.USE_SMART_REPLAY,
                 device=DEVICE
             )
+            
+            # END: Track pure training time (after train_model call)
+            slice_train_end = time.time()
+            pure_retrain_time += (slice_train_end - slice_train_start)
             
             # Store history for overall training curves
             if history is not None:
@@ -607,7 +582,9 @@ class SISAUnlearning:
         # Store shard histories for overall visualization
         self.unlearning_histories.append(shard_histories)
         
-        return time.time() - retrain_start_time
+        # Return both total time (with eval) and pure training time (without eval)
+        total_retrain_time = time.time() - retrain_start_time
+        return total_retrain_time, pure_retrain_time
 
 
     def final_evaluation_with_gating(self):
@@ -645,16 +622,7 @@ class SISAUnlearning:
         gating_model.eval()
         for model in shard_models: model.eval()
 
-        # Get or compute cached routing decisions for test data
-        routing_decisions = self.routing_cache.get_or_compute_routing(
-            dataset_name="test_evaluation",
-            x_data=x_test,
-            gating_model=gating_model,
-            eval_transforms=self.eval_transforms,
-            batch_size=config.BATCH_SIZE
-        )
-
-        # Use cached routing for evaluation (much faster!)
+        # Real-time gating network routing (no caching - proper for new samples)
         all_final_preds = []
         all_true_labels = []
         batch_size = config.BATCH_SIZE
@@ -662,18 +630,14 @@ class SISAUnlearning:
         # Get unlearned classes for post-processing filtering (O(1) cached lookup)
         unlearned_classes_set = self.get_unlearned_classes_set()
         
-        # Import cached batch runner from training module
-        from training.routing_cache import create_cached_sisa_batch_runner
-        cached_batch_runner = create_cached_sisa_batch_runner(self.routing_cache)
-        
         with torch.no_grad():
             for i in range(0, len(x_test), batch_size):
                 batch_x = torch.from_numpy(x_test[i:i+batch_size]).float()
                 batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
                 
-                # Use CACHED routing decisions (no gating network computation!)
-                batch_final_preds, _ = cached_batch_runner(
-                    batch_x_normalized, shard_models, routing_decisions, i, class_names, threshold
+                # Use REAL-TIME gating network routing
+                batch_final_preds, _ = _run_sisa_batch(
+                    batch_x_normalized, shard_models, gating_model, class_names, threshold
                 )
                 
                 # Post-processing: Filter unlearned class predictions to -1 (OPTIMIZED O(1) lookup)
@@ -906,15 +870,13 @@ class SISAUnlearning:
         all_preds = []
         all_confidences = []
         
-        try:
-            with torch.no_grad():
-                for sample in x_forgotten:
-                    batch_x = torch.from_numpy(sample).unsqueeze(0).float()
-                    batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
-                    
-                    # Get gating prediction
-                    gating_logits = gating_model(batch_x_normalized)
-
+        with torch.no_grad():
+            for sample in x_forgotten:
+                batch_x = torch.from_numpy(sample).unsqueeze(0).float()
+                batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
+                
+                # Get gating prediction
+                gating_logits = gating_model(batch_x_normalized)
                 shard_pred = gating_logits.argmax(dim=1).item()
                 
                 # Get specialist predictions
@@ -1106,13 +1068,17 @@ class SISAUnlearning:
         training_accuracy = float(accuracy_match.group(1))
         
         # Extract REAL timing information from training.txt
-        # 1. Gating network training time (parse actual value)
-        gating_match = re.search(r'Gating Network Training Time:\s*([\d.]+)\s*seconds', content)
+        # 1. Gating network training time - use PURE time for accuracy
+        gating_match = re.search(r'Gating Network Training Time \(pure\):\s*([\d.]+)\s*seconds', content)
         gating_training_time = float(gating_match.group(1)) if gating_match else 20.0
         
-        # 2. Base model training time (parse actual value)
-        base_match = re.search(r'Base Model Training Time:\s*([\d.]+)\s*seconds', content)
+        # 2. Base model training time with eval (parse actual value)
+        base_match = re.search(r'Base Model Training Time \(with eval\):\s*([\d.]+)\s*seconds', content)
         base_model_time = float(base_match.group(1)) if base_match else 50.0
+        
+        # 3. NEW: Base model training time pure (parse actual value)
+        pure_match = re.search(r'Base Model Training Time \(pure\):\s*([\d.]+)\s*seconds', content)
+        pure_training_time = float(pure_match.group(1)) if pure_match else base_model_time
         
         # 3. Total training time (for validation)
         time_match = re.search(r'Total Training Time:\s*([\d.]+)\s*seconds', content)
@@ -1121,7 +1087,7 @@ class SISAUnlearning:
         # Extract real training classification report from training.txt
         training_report = self._parse_classification_report_from_training_log(content)
         
-        return training_accuracy, gating_training_time, base_model_time, training_report
+        return training_accuracy, gating_training_time, base_model_time, pure_training_time, training_report
 
     def _parse_classification_report_from_training_log(self, content: str) -> dict:
         """Parse the real classification report from training.txt content."""
@@ -1207,20 +1173,27 @@ class SISAUnlearning:
         print("=" * 50)
         
         # Get training metrics
-        training_accuracy, gating_training_time, base_model_time, _ = self._get_training_metrics()
+        training_accuracy, gating_training_time, base_model_time, pure_training_time, _ = self._get_training_metrics()
         
         # Create accuracy comparison
         create_accuracy_comparison_chart(
             training_accuracy, unlearning_accuracy, unlearned_class, self.reports_dir
         )
         
-        # Create time comparison with real timing data
+        # Create time comparison with real timing data (includes evaluation time)
         # Use the actual measured timing values from the unlearning process
         unlearning_total_time = total_time  # This is the real total unlearning time
         # Use the actual measured retraining time instead of cumulative retrain_time
         actual_retraining_time = getattr(self, 'retraining_time', retrain_time)
         create_time_comparison_chart(
             gating_training_time, base_model_time, unlearning_total_time, actual_retraining_time, self.reports_dir
+        )
+        
+        # Create pure training time breakdown chart (excludes evaluation/plotting time)
+        # Shows: Gating Training, Base Training, Find+Delete, Retraining (pure times only)
+        pure_retraining_time = getattr(self, 'pure_retraining_time', actual_retraining_time)
+        create_pure_training_time_chart(
+            gating_training_time, pure_training_time, self.data_removal_time, pure_retraining_time, self.reports_dir
         )
         
         # Create classification metrics comparison if reports are provided
@@ -1423,17 +1396,18 @@ class SISAUnlearning:
         return correct_predictions / len(filtered_preds)
     
     def _create_deleted_class_bar_chart(self, deleted_class_name, pre_acc, post_deleted_acc, post_remaining_acc):
-        """Create bar chart showing pre/post unlearning accuracy comparison."""
-        _, ax = plt.subplots(figsize=(12, 8))
+        """Create bar chart showing pre/post unlearning accuracy comparison for DELETED class only."""
+        _, ax = plt.subplots(figsize=(10, 7))
         
+        # Only show Pre-unlearning and Post-unlearning for the deleted class
+        # Removed "Post-unlearning Remaining Classes" as requested
         categories = [
             f"Pre-unlearning\n'{deleted_class_name}'",
-            f"Post-unlearning\n'{deleted_class_name}'", 
-            "Post-unlearning\nRemaining Classes"
+            f"Post-unlearning\n'{deleted_class_name}'"
         ]
         
-        accuracies = [pre_acc, post_deleted_acc, post_remaining_acc]
-        colors = ['#2E8B57', '#DC143C', '#4169E1']  # Green, Red, Blue
+        accuracies = [pre_acc, post_deleted_acc]
+        colors = ['#2E8B57', '#DC143C']  # Green (before), Red (after - should be near 0)
         
         bars = ax.bar(categories, accuracies, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
         
@@ -1441,20 +1415,18 @@ class SISAUnlearning:
         for bar, acc in zip(bars, accuracies):
             height = bar.get_height()
             ax.text(bar.get_x() + bar.get_width()/2., height + 0.01,
-                   f'{acc:.3f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+                   f'{acc:.3f}', ha='center', va='bottom', fontsize=13, fontweight='bold')
         
         ax.set_ylim(0, 1.1)
         ax.set_ylabel('Accuracy', fontsize=14, fontweight='bold')
-        ax.set_title(f'Deleted Class Unlearning Evaluation: "{deleted_class_name.title()}"', 
+        ax.set_title(f'Deleted Class Unlearning Verification: "{deleted_class_name.title()}"', 
                     fontsize=16, fontweight='bold', pad=20)
         
         # Add grid and styling
         ax.grid(True, alpha=0.3, axis='y')
         ax.set_axisbelow(True)
-        plt.xticks(rotation=0, fontsize=11)
+        plt.xticks(rotation=0, fontsize=12)
         plt.yticks(fontsize=11)
-        
-
         
         plt.tight_layout()
         

@@ -2,8 +2,7 @@
 # SISA ARCHITECTURE PARAMETERS
 # ================================================================================
 NUM_SHARDS = 2  
-NUM_SLICES_PER_SHARD = 2
-
+NUM_SLICES_PER_SHARD = 5
 # ================================================================================
 # CONFIDENCE THRESHOLDS (GATING METHOD ONLY)
 # ================================================================================
@@ -17,7 +16,7 @@ MIN_PROB_EPSILON = 1e-8  # Numerical stability for probability computations
 # ================================================================================
 # TRAINING PARAMETERS
 # ================================================================================
-BATCH_SIZE = 128  # Keep same for consistency
+BATCH_SIZE = 64  # Keep same for consistency
 MAX_EPOCHS = 80  # Training epochs - DO NOT OVERRIDE
 LEARNING_RATE = 0.0008  # Reduced from 0.001 to reduce oscillations
 WEIGHT_DECAY = 0.0005  # L2 regularization to prevent overfitting
@@ -27,11 +26,8 @@ TRAINING_PATIENCE = 7  # Increased from 5 to allow more exploration
 TRAINING_MIN_DELTA = 0.0005  # Reduced from 0.001 for more sensitive stopping  
 
 # Replay Buffer Settings
-REPLAY_RATIO = 0.2  # Base replay ratio (will be dynamically adjusted)
+REPLAY_RATIO = 0.3# Static replay ratio
 USE_SMART_REPLAY = True  # Set to True to enable smart replay buffer
-USE_ADAPTIVE_REPLAY_RATIO = False  # Enable dynamic replay ratio adjustment
-MIN_REPLAY_RATIO = 0.1  # Minimum allowed replay ratio
-MAX_REPLAY_RATIO = 0.6  # Maximum allowed replay ratio
 REPLAY_DECAY_RATE = 0.95  # Temporal decay for older samples
 REPLAY_IMPORTANCE_WEIGHT = 0.7  # Weight for gradient-based importance  
 REPLAY_TEMPORAL_WEIGHT = 0.3  # Weight for temporal decay
@@ -58,11 +54,11 @@ FC_LAYER_1_INPUT = 2048  # 128 * 4 * 4 (conv output flattened)
 FC_LAYER_1_HIDDEN = 256  # Hidden layer size for classifier
 FC_LAYER_DROPOUT = 0.5   # Dropout rate for FC layers  
 
-# Gating Network Architecture - Enhanced for better routing
-GATING_CONV1_OUT = 32  # Increased from 16
-GATING_CONV2_OUT = 64  # Increased from 32  
-GATING_FC1_HIDDEN = 256  # Increased from 128
-GATING_FEATURE_SIZE = 64 * 4 * 4  # Updated for 3 conv layers
+# Gating Network Architecture - Simplified lightweight routing network
+# Note: Architecture is now hardcoded in create_model.py for simplicity
+#   2 conv layers: 3→32→64 channels
+#   2 FC layers: (64*8*8)→128→num_shards
+# These config params are kept only for dropout rate reference
 
 # Dataset-specific normalization (calculated from actual data)
 def get_dataset_normalization(metadata_path=None):
@@ -97,7 +93,9 @@ CONFIDENCE_BOOST_THRESHOLD = 0.15  # Increased to reduce wrong overrides
 
 # Gating Network Training - Enhanced for better routing accuracy
 GATING_MAX_EPOCHS = 25  # Increased from 10 for better convergence
-GATING_LEARNING_RATE = 0.0008  # Slightly reduced for stable training 
+GATING_LEARNING_RATE = 0.0008  # Slightly reduced for stable training
+GATING_EARLY_STOPPING_PATIENCE = 4  # Early stopping patience for gating network training
+GATING_BATCH_SIZE = 128  # Larger batch size for gating network (more stable gradients) 
 
 # ================================================================================
 # UNLEARNING PARAMETERS
@@ -107,7 +105,7 @@ UNLEARNING_PATIENCE = 7  # Increased from 5 to match training
 UNLEARNING_MIN_DELTA = 0.0005  # Reduced to match training sensitivity
 # Unlearning Training Settings
 UNLEARNING_LEARNING_RATE = 0.0004  # Reduced from 0.0005 for better stability
-UNLEARNING_REPLAY_RATIO = 0.2
+UNLEARNING_REPLAY_RATIO = 0.3
 
 # Replay Buffer
 USE_REPLAY_BUFFER = True  

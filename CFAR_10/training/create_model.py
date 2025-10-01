@@ -50,35 +50,33 @@ class SISACIFAR10Net(nn.Module):
         return x
 
 class GatingNetwork(nn.Module):
+    """
+    Lightweight gating network for SISA shard routing.
+    Simplified architecture: 2 conv layers + 2 FC layers
+    Purpose: Route samples to appropriate shards (NOT classify into classes)
+    """
     def __init__(self, num_shards):
         super(GatingNetwork, self).__init__()
-        # Enhanced architecture for better routing accuracy
-        self.conv1 = nn.Conv2d(3, config.GATING_CONV1_OUT, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(config.GATING_CONV1_OUT)
+        # Lightweight conv layers - only 2 layers for routing
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.conv2 = nn.Conv2d(config.GATING_CONV1_OUT, config.GATING_CONV2_OUT, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(config.GATING_CONV2_OUT)
-        # Add third conv layer for better feature extraction
-        self.conv3 = nn.Conv2d(config.GATING_CONV2_OUT, 64, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(64)
-        # Larger FC layers for better classification
-        self.fc1 = nn.Linear(64 * 4 * 4, 256)  # Updated for 3 conv layers
-        self.dropout1 = nn.Dropout(config.GATING_DROPOUT_RATE)
-        self.fc2 = nn.Linear(256, 128)  # Additional hidden layer
-        self.dropout2 = nn.Dropout(config.GATING_DROPOUT_RATE)
-        self.fc3 = nn.Linear(128, num_shards)  # Final output layer
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        
+        # Simplified FC layers - only 2 layers for routing decision
+        self.fc1 = nn.Linear(64 * 8 * 8, 128)  # After 2 pooling: 32->16->8
+        self.dropout = nn.Dropout(config.GATING_DROPOUT_RATE)
+        self.fc2 = nn.Linear(128, num_shards)  # Direct output to shards
 
     def forward(self, x):
-        # Enhanced forward pass with batch normalization and dropout
+        # Lightweight forward pass for routing
         x = self.pool(F.relu(self.bn1(self.conv1(x))))  # 32x32 -> 16x16
         x = self.pool(F.relu(self.bn2(self.conv2(x))))  # 16x16 -> 8x8  
-        x = self.pool(F.relu(self.bn3(self.conv3(x))))  # 8x8 -> 4x4
-        x = x.reshape(-1, 64 * 4 * 4)  # Flatten
+        x = x.reshape(-1, 64 * 8 * 8)  # Flatten
         x = F.relu(self.fc1(x))
-        x = self.dropout1(x)
-        x = F.relu(self.fc2(x))
-        x = self.dropout2(x)
-        x = self.fc3(x)  # Final output
+        x = self.dropout(x)
+        x = self.fc2(x)  # Output: shard probabilities
         return x
 
 class PyTorchModelManager:
