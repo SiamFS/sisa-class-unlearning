@@ -58,7 +58,6 @@ def _run_sisa_batch(
     gating_model: torch.nn.Module,
     class_names: List[str],
     threshold: Optional[float] = None,
-    unlearned_classes_set: set = None,
 ):
     """Execute SISA inference for a batch using TRUE gating routing (efficiency optimized)."""
     gating_logits = gating_model(batch_x_normalized)
@@ -88,14 +87,6 @@ def _run_sisa_batch(
         
         # Apply temperature scaling
         chosen_probs = _apply_temperature_tensor(specialist_probs.unsqueeze(0), config.PRIMARY_SPECIALIST_TEMPERATURE)[0]
-
-        # ZERO-OUT UNLEARNED CLASSES (True Unlearning)
-        if unlearned_classes_set:
-            unlearned_indices = torch.tensor(list(unlearned_classes_set), dtype=torch.long, device=DEVICE)
-            chosen_probs[unlearned_indices] = 0
-            # Re-normalize probabilities
-            chosen_probs = _normalize_probabilities_tensor(chosen_probs)
-            
         final_pred = torch.argmax(chosen_probs).item()
 
         # Apply confidence thresholding if specified

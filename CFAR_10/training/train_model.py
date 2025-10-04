@@ -143,7 +143,10 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     )
 
     # Simple loss and optimization - Adam handles adaptive learning rates
-    criterion = nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTHING)  # From global config
+    # CRITICAL: Use 0.0 label smoothing during unlearning to allow deleted class neurons to die
+    label_smoothing_value = config.UNLEARNING_LABEL_SMOOTHING if training_type == 'unlearning' else config.LABEL_SMOOTHING
+    print(f"   - Using label smoothing: {label_smoothing_value:.3f} ({'unlearning mode' if training_type == 'unlearning' else 'normal training'})")
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing_value)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=config.WEIGHT_DECAY)  # Simple Adam optimizer
 
     if replay_buffer:

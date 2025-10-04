@@ -246,6 +246,57 @@ class SISAUnlearning:
         """Invalidate cache when unlearned classes change"""
         self._unlearned_classes_cache = None
         self._unlearned_classes_set_cache = None
+    
+    def _filter_replay_buffer_for_unlearning(self, replay_buffer, deleted_classes: set):
+        """
+        CRITICAL: Remove ALL samples of deleted classes from replay buffer.
+        This ensures deleted class data NEVER re-enters training.
+        
+        Args:
+            replay_buffer: Either dict (traditional) or SmartReplayBuffer
+            deleted_classes: Set of class indices to remove
+        
+        Returns:
+            Cleaned replay buffer
+        """
+        if not replay_buffer:
+            return replay_buffer
+        
+        print(f"\n   🔍 FILTERING REPLAY BUFFER: Removing deleted classes {deleted_classes}")
+        
+        # Handle SmartReplayBuffer
+        if hasattr(replay_buffer, 'buffer'):
+            original_classes = set(replay_buffer.buffer.keys())
+            classes_to_remove = original_classes & deleted_classes
+            
+            if classes_to_remove:
+                for class_idx in classes_to_remove:
+                    sample_count = replay_buffer.buffer[class_idx]['sample_count']
+                    del replay_buffer.buffer[class_idx]
+                    print(f"   ✓ Removed {sample_count} samples of deleted class {self.class_names[class_idx]} from smart replay buffer")
+                
+                remaining_classes = set(replay_buffer.buffer.keys())
+                print(f"   ✓ Replay buffer cleaned: {len(remaining_classes)} classes remain")
+            else:
+                print(f"   ✓ Replay buffer already clean (no deleted classes found)")
+        
+        # Handle traditional dict replay buffer
+        else:
+            original_classes = set(replay_buffer.keys())
+            classes_to_remove = original_classes & deleted_classes
+            
+            if classes_to_remove:
+                for class_idx in classes_to_remove:
+                    sample_count = len(replay_buffer[class_idx]['y'])
+                    del replay_buffer[class_idx]
+                    print(f"   ✓ Removed {sample_count} samples of deleted class {self.class_names[class_idx]} from replay buffer")
+                
+                remaining_classes = set(replay_buffer.keys())
+                print(f"   ✓ Replay buffer cleaned: {len(remaining_classes)} classes remain")
+            else:
+                print(f"   ✓ Replay buffer already clean (no deleted classes found)")
+        
+        return replay_buffer
 
     def _load_shard_metadatas(self) -> List[Dict]:
         """Load metadata for all shards"""
@@ -739,6 +790,13 @@ class SISAUnlearning:
                 print(f"   - Shard {shard_idx+1}, Slice {slice_idx+1}: Removed {removed_count} samples (slice now EMPTY - will be deleted)")
             else:
                 print(f"   - Shard {shard_idx+1}, Slice {slice_idx+1}: Removed {removed_count} samples ({remaining_count} remain)")
+                # VERIFICATION: Log remaining classes after deletion
+                unique_remaining = np.unique(y_new)
+                remaining_class_names = [self.class_names[c] for c in unique_remaining]
+                print(f"      ✓ Remaining classes in slice: {remaining_class_names}")
+                # Assert deleted class is NOT in remaining data
+                if class_to_remove in unique_remaining:
+                    raise ValueError(f"CRITICAL ERROR: Deleted class {self.class_names[class_to_remove]} still present in slice after removal!")
             # Save the modified data (even if empty, for consistency)
             self._save_slice_data(shard_idx, slice_idx, x_new, y_new)
         
@@ -828,6 +886,10 @@ class SISAUnlearning:
         reports_dir = os.path.join(self.base_dir, "reports")
         os.makedirs(reports_dir, exist_ok=True)
         
+        # Get deleted classes for replay buffer filtering
+        deleted_classes_set = self.get_unlearned_classes_set()
+        print(f"\n   🚫 UNLEARNING MODE: Will filter deleted classes {deleted_classes_set} from replay buffer")
+        
         # Initialize replay buffer from previous available slices (skipping empty/deleted ones)
         if config.USE_SMART_REPLAY:
             from training.smart_replay import create_smart_replay_buffer
@@ -875,6 +937,23 @@ class SISAUnlearning:
                         else:
                             replay_buffer[label] = {'X': class_x_data, 'y': class_y_data}
                     print(f"   - Added Slice {slice_idx+1} data to replay buffer")
+        
+        # CRITICAL: Filter out ALL deleted classes from replay buffer
+        replay_buffer = self._filter_replay_buffer_for_unlearning(replay_buffer, deleted_classes_set)
+        
+        # VERIFICATION: Assert replay buffer is clean
+        if replay_buffer:
+            if hasattr(replay_buffer, 'buffer'):
+                buffer_classes = set(replay_buffer.buffer.keys())
+            else:
+                buffer_classes = set(replay_buffer.keys())
+            
+            contamination = buffer_classes & deleted_classes_set
+            if contamination:
+                contaminated_names = [self.class_names[c] for c in contamination]
+                raise ValueError(f"CRITICAL ERROR: Replay buffer still contains deleted classes {contaminated_names}!")
+            else:
+                print(f"   ✓ VERIFIED: Replay buffer is clean (contains {len(buffer_classes)} classes, no deleted classes)")
 
         # Load shard metadata (for potential future use)
         with open(os.path.join(self.data_dir, f"shards/shard_{shard_idx+1}/metadata.json"), 'r') as f:
@@ -961,21 +1040,34 @@ class SISAUnlearning:
                     )
             
             # Update replay buffer with retrained slice data
+            # CRITICAL: Only add classes that are NOT deleted
             if len(x_slice) > 0:
-                if config.USE_SMART_REPLAY and hasattr(replay_buffer, 'add_samples'):
-                    # Smart replay buffer - add with importance scoring
-                    replay_buffer.add_samples(x_slice, y_slice, current_model, DEVICE)
+                # First, filter out deleted classes from current slice
+                mask_keep = np.array([label not in deleted_classes_set for label in y_slice])
+                x_slice_filtered = x_slice[mask_keep]
+                y_slice_filtered = y_slice[mask_keep]
+                
+                if len(y_slice_filtered) > 0:
+                    if config.USE_SMART_REPLAY and hasattr(replay_buffer, 'add_samples'):
+                        # Smart replay buffer - add with importance scoring
+                        replay_buffer.add_samples(x_slice_filtered, y_slice_filtered, current_model, DEVICE)
+                        print(f"      ✓ Updated smart replay buffer (filtered out deleted classes)")
+                    else:
+                        # Traditional replay buffer - simple class-wise storage
+                        unique_labels_in_slice = np.unique(y_slice_filtered)
+                        for label in unique_labels_in_slice:
+                            if label in deleted_classes_set:
+                                continue  # Extra safety: skip deleted classes
+                            mask = (y_slice_filtered == label)
+                            class_x_data, class_y_data = x_slice_filtered[mask], y_slice_filtered[mask]
+                            if label in replay_buffer:
+                                replay_buffer[label]['X'] = np.vstack([replay_buffer[label]['X'], class_x_data])
+                                replay_buffer[label]['y'] = np.concatenate([replay_buffer[label]['y'], class_y_data])
+                            else:
+                                replay_buffer[label] = {'X': class_x_data, 'y': class_y_data}
+                        print(f"      ✓ Updated replay buffer (filtered out deleted classes)")
                 else:
-                    # Traditional replay buffer - simple class-wise storage
-                    unique_labels_in_slice = np.unique(y_slice)
-                    for label in unique_labels_in_slice:
-                        mask = (y_slice == label)
-                        class_x_data, class_y_data = x_slice[mask], y_slice[mask]
-                        if label in replay_buffer:
-                            replay_buffer[label]['X'] = np.vstack([replay_buffer[label]['X'], class_x_data])
-                            replay_buffer[label]['y'] = np.concatenate([replay_buffer[label]['y'], class_y_data])
-                        else:
-                            replay_buffer[label] = {'X': class_x_data, 'y': class_y_data}
+                    print(f"      ⚠️  No samples to add to replay buffer after filtering deleted classes")
 
                 if current_model is not None and len(x_val_filtered) > 0:
                     create_shard_confusion_matrix(
@@ -1973,18 +2065,28 @@ class SISAUnlearning:
         )
         
         # Logical evaluation with threshold
-        success_threshold_deleted = 0.80  # 80% successful forgetting
+        # GDPR Compliance: Model should perform at random chance (no evidence of training on deleted data)
+        random_chance = 1.0 / len(self.class_names)  # For CIFAR-10: 1/10 = 0.10
+        success_threshold_lower = random_chance - 0.05  # 0.05 (5%) - below random is acceptable
+        success_threshold_upper = random_chance + 0.05  # 0.15 (15%) - above random is still acceptable
         
-        print(f"\nThreshold Evaluation (Threshold={success_threshold_deleted:.2f}):")
-        if post_unlearning_deleted_accuracy >= success_threshold_deleted:
-            print(f"Deleted class '{deleted_class_name}' well forgotten with {post_unlearning_deleted_accuracy:.4f} accuracy ({post_unlearning_deleted_accuracy*100:.1f}% unknown predictions)")
+        print(f"\nGDPR Exact Unlearning Evaluation (Target: Random Chance ~{random_chance:.2f}):")
+        if success_threshold_lower <= post_unlearning_deleted_accuracy <= success_threshold_upper:
+            print(f"✓ GDPR COMPLIANT: Deleted class '{deleted_class_name}' shows random performance at {post_unlearning_deleted_accuracy:.4f}")
+            print(f"   Acceptable range: {success_threshold_lower:.2f} - {success_threshold_upper:.2f} (near random chance)")
+            print(f"   Model shows NO evidence of training on deleted data ✓")
+        elif post_unlearning_deleted_accuracy > success_threshold_upper:
+            print(f"✗ GDPR CONCERN: Deleted class '{deleted_class_name}' accuracy too HIGH at {post_unlearning_deleted_accuracy:.4f}")
+            print(f"   Model still shows memory of deleted data (expected: ≤{success_threshold_upper:.2f})")
         else:
-            print(f"Deleted class '{deleted_class_name}' still remembered with {post_unlearning_deleted_accuracy:.4f} accuracy (threshold: ≥{success_threshold_deleted:.2f})")
+            print(f"⚠️  WARNING: Deleted class '{deleted_class_name}' accuracy too LOW at {post_unlearning_deleted_accuracy:.4f}")
+            print(f"   Below-random performance may indicate systematic bias (expected: ≥{success_threshold_lower:.2f})")
+            print(f"   This could be evidence of training influence (GDPR concern)")
             
         if post_unlearning_remaining_accuracy >= (training_accuracy_for_deleted_class * 0.85):
-            print(f"Remaining classes maintain {post_unlearning_remaining_accuracy:.4f} accuracy")
+            print(f"✓ Remaining classes maintain {post_unlearning_remaining_accuracy:.4f} accuracy")
         else:
-            print(f"Warning: Remaining classes dropped to {post_unlearning_remaining_accuracy:.4f} accuracy")
+            print(f"✗ WARNING: Remaining classes dropped to {post_unlearning_remaining_accuracy:.4f} accuracy")
         
         print("=" * 80)
 
