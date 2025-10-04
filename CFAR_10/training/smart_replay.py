@@ -1,8 +1,3 @@
-"""
-Smart Replay Buffer for SISA Framework
-Implements gradient-based importance sampling with temporal decay
-"""
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -10,23 +5,10 @@ from typing import Dict, List, Tuple, Optional
 import json
 
 
-class SmartReplayBuffer:
-    """
-    Smart replay buffer that maintains importance scores and temporal information
-    for more intelligent sample selection during incremental learning.
-    """
-    
+class SmartReplayBuffer:    
     def __init__(self, decay_rate: float = 0.95, importance_weight: float = 0.7, 
                  temporal_weight: float = 0.3, max_samples_per_class: int = 1000):
-        """
-        Initialize smart replay buffer.
-        
-        Args:
-            decay_rate: Exponential decay rate for temporal importance
-            importance_weight: Weight for gradient-based importance (0-1)
-            temporal_weight: Weight for temporal decay (0-1)
-            max_samples_per_class: Maximum samples to store per class
-        """
+
         self.buffer: Dict[int, Dict] = {}
         self.decay_rate = decay_rate
         self.importance_weight = importance_weight
@@ -41,15 +23,7 @@ class SmartReplayBuffer:
     
     def add_samples(self, x_data: np.ndarray, y_data: np.ndarray, 
                    model: torch.nn.Module, device: torch.device):
-        """
-        Add new samples to replay buffer with importance scores.
-        
-        Args:
-            x_data: Feature data [N, C, H, W]
-            y_data: Labels [N]
-            model: Current model for computing importance
-            device: Computing device
-        """
+  
         self.current_slice += 1
         
         # Compute importance scores for new samples

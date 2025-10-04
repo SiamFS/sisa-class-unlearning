@@ -136,28 +136,38 @@ class SISAUnlearning:
         np.save(os.path.join(shard_path, f"slice_{slice_idx}_y.npy"), y)
 
     def _save_forgotten_class_samples(self, class_to_unlearn: int, num_samples=16):
-        self.forgotten_samples_x, self.forgotten_samples_y = [], []
+        # Initialize if first call (single unlearn), otherwise append (batch unlearn)
+        if not hasattr(self, 'forgotten_samples_x') or self.forgotten_samples_x is None:
+            self.forgotten_samples_x, self.forgotten_samples_y = [], []
+        
         print(f"\nStep 0: Saving {num_samples} samples of '{self.class_names[class_to_unlearn]}' for final verification...")
+        
+        samples_x_temp = []
+        samples_y_temp = []
         
         for shard_idx in range(self.num_shards):
             for slice_idx in range(self.num_slices):
-                if len(self.forgotten_samples_y) >= num_samples: break
+                if len(samples_y_temp) >= num_samples: break
                 X, y = self._load_slice_data(shard_idx, slice_idx)
                 if X is None: continue
                 
                 mask = (y == class_to_unlearn)
                 x_class, y_class = X[mask], y[mask]
                 
-                samples_to_take = min(len(x_class), num_samples - len(self.forgotten_samples_y))
+                samples_to_take = min(len(x_class), num_samples - len(samples_y_temp))
                 if samples_to_take > 0:
-                    self.forgotten_samples_x.append(x_class[:samples_to_take])
-                    self.forgotten_samples_y.extend(y_class[:samples_to_take])
-            if len(self.forgotten_samples_y) >= num_samples: break
+                    samples_x_temp.append(x_class[:samples_to_take])
+                    samples_y_temp.extend(y_class[:samples_to_take])
+            if len(samples_y_temp) >= num_samples: break
         
-        if self.forgotten_samples_x:
-            self.forgotten_samples_x = np.concatenate(self.forgotten_samples_x)
-            self.forgotten_samples_y = np.array(self.forgotten_samples_y)
-            print(f"   - Saved {len(self.forgotten_samples_x)} samples for verification.")
+        # Append to existing samples (for batch unlearning)
+        if samples_x_temp:
+            if isinstance(self.forgotten_samples_x, np.ndarray):
+                # Convert back to list if already concatenated from previous class
+                self.forgotten_samples_x = [self.forgotten_samples_x]
+            self.forgotten_samples_x.append(np.concatenate(samples_x_temp))
+            self.forgotten_samples_y.extend(samples_y_temp)
+            print(f"   - Saved {len(samples_y_temp)} samples for verification. Total samples: {len(self.forgotten_samples_y)}")
 
     def _update_shard_metadata(self, shard_idx: int):
         all_y = []
@@ -293,20 +303,87 @@ class SISAUnlearning:
         # Start timing data removal
         data_removal_start = time.time()
         affected_shards = {}
+        
+        # Track slice states and affected slices per shard
         for shard_idx in range(self.num_shards):
+            slice_states = {}  # Track state of each slice: 'empty', 'has_data', 'deleted'
+            affected_slices = []  # List of all slices that were affected
             first_affected_slice = -1
+            total_removed = 0
+            completely_deleted_slices = 0
+            
             for slice_idx in range(self.num_slices):
-                removed_count, _ = self._remove_data_from_slice(shard_idx, slice_idx, class_idx)
-                if removed_count > 0 and first_affected_slice == -1:
-                    first_affected_slice = slice_idx
+                removed_count, remaining_count = self._remove_data_from_slice(shard_idx, slice_idx, class_idx)
+                
+                if removed_count > 0:
+                    total_removed += removed_count
+                    affected_slices.append(slice_idx)
+                    
+                    if first_affected_slice == -1:
+                        first_affected_slice = slice_idx
+                    
+                    # Check if slice is now completely empty
+                    if remaining_count == 0:
+                        slice_states[slice_idx] = 'deleted'
+                        completely_deleted_slices += 1
+                        # Delete empty slice data and model files
+                        self._delete_empty_slice_files(shard_idx, slice_idx)
+                    else:
+                        slice_states[slice_idx] = 'has_data'
+                else:
+                    # Slice was not affected - check if it has data
+                    X, y = self._load_slice_data(shard_idx, slice_idx)
+                    if X is None or len(X) == 0:
+                        slice_states[slice_idx] = 'empty'
+                    else:
+                        slice_states[slice_idx] = 'has_data'
             
             if first_affected_slice != -1:
-                affected_shards[shard_idx] = {'first_affected_slice': first_affected_slice}
+                affected_shards[shard_idx] = {
+                    'first_affected_slice': first_affected_slice,
+                    'affected_slices': affected_slices,
+                    'slice_states': slice_states,
+                    'total_removed': total_removed,
+                    'deleted_slices': completely_deleted_slices
+                }
+                
+                print(f"\n   Summary for Shard {shard_idx+1}:")
+                print(f"   - Total samples removed: {total_removed}")
+                print(f"   - Slices affected: {[s+1 for s in affected_slices]}")
+                print(f"   - Slices completely deleted (empty): {completely_deleted_slices}")
+                
                 self._update_shard_metadata(shard_idx)
 
         # Capture data removal time
         self.data_removal_time = time.time() - data_removal_start
         print(f"Data Removal Time: {self.data_removal_time:.2f} seconds")
+        
+        # CRITICAL CHECK: Ensure at least one shard still has training data
+        if affected_shards:
+            has_active_shard = False
+            for shard_idx, shard_info in affected_shards.items():
+                # Check if this shard has at least one slice with data
+                has_data_in_shard = any(
+                    state == 'has_data' 
+                    for state in shard_info['slice_states'].values()
+                )
+                if has_data_in_shard:
+                    has_active_shard = True
+                    break
+            
+            if not has_active_shard:
+                raise ValueError(
+                    f"\n{'='*60}\n"
+                    f"CRITICAL ERROR: Cannot delete class '{class_name}'\n"
+                    f"{'='*60}\n"
+                    f"This operation would delete ALL training data from the system.\n"
+                    f"At least one shard must contain training data for SISA to function.\n\n"
+                    f"Current state after deletion:\n"
+                    f"  - All {self.num_shards} shard(s) would have 0 training slices\n"
+                    f"  - Total slices deleted: {sum(info['deleted_slices'] for info in affected_shards.values())}\n\n"
+                    f"Recommendation: This class cannot be unlearned without breaking the system.\n"
+                    f"{'='*60}"
+                )
         
         if not affected_shards:
             print(f"No data found for class '{class_name}' in training data.")
@@ -346,7 +423,11 @@ class SISAUnlearning:
         print("\nStep 2: Retraining affected shards incrementally...")
         retraining_start = time.time()
         for shard_idx, info in affected_shards.items():
-            retrain_time, pure_retrain_time = self._retrain_shard_incrementally(shard_idx, info['first_affected_slice'])
+            retrain_time, pure_retrain_time = self._retrain_shard_incrementally(
+                shard_idx, 
+                info['first_affected_slice'],
+                info['slice_states']  # Pass slice states for proper gap handling
+            )
             total_retrain_time += retrain_time
             total_pure_retrain_time += pure_retrain_time  # NEW: Accumulate pure training time
         
@@ -398,21 +479,302 @@ class SISAUnlearning:
         
         print("   - Test set preserved: Original test samples maintained for evaluation purposes.")
 
+    def batch_unlearn_by_classes(self, class_names: List[str]):
+  
+        print("\n" + "="*80)
+        print(f"BATCH UNLEARNING: {len(class_names)} CLASSES")
+        print("="*80)
+        print(f"Classes to unlearn: {class_names}")
+        print("="*80)
+        
+        # Validate all class names first
+        class_indices = []
+        for class_name in class_names:
+            if class_name not in self.class_names:
+                raise ValueError(f"Class '{class_name}' not found in dataset")
+            class_indices.append(self.class_names.index(class_name))
+        
+        print(f"Class indices to unlearn: {class_indices}")
+        
+        overall_start_time = time.time()
+        
+        # Initialize timing tracking
+        self.data_removal_time = 0
+        self.retraining_time = 0
+        self.gating_update_time = 0
+        
+        # Initialize forgotten samples storage for batch unlearning
+        self.forgotten_samples_x = []
+        self.forgotten_samples_y = []
+        self.gating_update_time = 0
+        
+        # Backup test set before any modifications
+        self._backup_test_set_if_needed()
+        
+        # Save forgotten samples for all classes
+        print("\n" + "="*60)
+        print("Step 0: Saving sample images from classes to be forgotten...")
+        print("="*60)
+        for class_idx, class_name in zip(class_indices, class_names):
+            self._save_forgotten_class_samples(class_idx, num_samples=16)  # Save 16 samples per class for verification grid
+        
+        # Display training baseline metrics
+        print("\n" + "=" * 60)
+        print("TRAINING BASELINE METRICS (Before Unlearning)")
+        print("=" * 60)
+        training_accuracy, gating_training_time, base_model_time, pure_training_time, training_report = self._get_training_metrics()
+        print(f"Training Accuracy: {training_accuracy:.4f}")
+        print(f"Gating Network Training Time: {gating_training_time:.2f} seconds")
+        print(f"Base Model Training Time (with eval): {base_model_time:.2f} seconds")
+        print(f"Base Model Training Time (pure): {pure_training_time:.2f} seconds")
+        print(f"Total Training Time: {(gating_training_time + base_model_time):.2f} seconds")
+        print("=" * 60)
+        
+        # Step 1: Remove data for ALL classes
+        print("\n" + "="*60)
+        print(f"Step 1: Removing data for {len(class_names)} classes...")
+        print("="*60)
+        
+        data_removal_start = time.time()
+        affected_shards = {}  # {shard_idx: {'first_affected_slice': int, 'slice_states': dict, ...}}
+        
+        # Process each shard
+        for shard_idx in range(self.num_shards):
+            print(f"\n--- Processing Shard {shard_idx+1} ---")
+            slice_states = {}  # {slice_idx: 'empty'|'has_data'|'deleted'}
+            affected_slices = set()  # Track which slices were affected
+            first_affected_slice = None
+            total_removed = 0
+            completely_deleted_slices = 0
+            
+            # Initialize slice states by checking each slice
+            for slice_idx in range(self.num_slices):
+                X, y = self._load_slice_data(shard_idx, slice_idx)
+                if X is None or len(X) == 0:
+                    slice_states[slice_idx] = 'empty'
+                else:
+                    slice_states[slice_idx] = 'has_data'
+            
+            # Remove ALL target classes from ALL slices
+            for slice_idx in range(self.num_slices):
+                slice_removed_count = 0
+                remaining_count = 0
+                
+                # Remove all target classes from this slice
+                for class_idx in class_indices:
+                    removed, remaining = self._remove_data_from_slice(shard_idx, slice_idx, class_idx)
+                    slice_removed_count += removed
+                    remaining_count = remaining  # Last remaining count
+                
+                if slice_removed_count > 0:
+                    total_removed += slice_removed_count
+                    affected_slices.add(slice_idx)
+                    
+                    # Track first affected slice
+                    if first_affected_slice is None:
+                        first_affected_slice = slice_idx
+                    
+                    # Check if slice is now completely empty after removing all classes
+                    if remaining_count == 0:
+                        slice_states[slice_idx] = 'deleted'
+                        completely_deleted_slices += 1
+                        # Delete empty slice files
+                        self._delete_empty_slice_files(shard_idx, slice_idx)
+                        print(f"   Slice {slice_idx+1}: Completely deleted (empty)")
+                    else:
+                        slice_states[slice_idx] = 'has_data'
+                        print(f"   Slice {slice_idx+1}: Removed {slice_removed_count} samples, {remaining_count} remaining")
+            
+            # If this shard was affected, store its information
+            if first_affected_slice is not None:
+                affected_shards[shard_idx] = {
+                    'first_affected_slice': first_affected_slice,
+                    'affected_slices': sorted(list(affected_slices)),
+                    'slice_states': slice_states,
+                    'total_removed': total_removed,
+                    'deleted_slices': completely_deleted_slices
+                }
+                
+                print(f"\n   Summary for Shard {shard_idx+1}:")
+                print(f"   - Total samples removed: {total_removed}")
+                print(f"   - Slices affected: {[s+1 for s in sorted(affected_slices)]}")
+                print(f"   - Slices completely deleted: {completely_deleted_slices}")
+                print(f"   - First affected slice: {first_affected_slice+1}")
+                
+                # Show slice state summary
+                print(f"   - Slice states:")
+                for s_idx in range(self.num_slices):
+                    state = slice_states.get(s_idx, 'unknown')
+                    print(f"      Slice {s_idx+1}: {state}")
+                
+                self._update_shard_metadata(shard_idx)
+        
+        self.data_removal_time = time.time() - data_removal_start
+        print(f"\nTotal Data Removal Time: {self.data_removal_time:.2f} seconds")
+        
+        # Validate that at least one shard has training data
+        if affected_shards:
+            has_active_shard = False
+            for shard_idx, shard_info in affected_shards.items():
+                has_data_in_shard = any(
+                    state == 'has_data' 
+                    for state in shard_info['slice_states'].values()
+                )
+                if has_data_in_shard:
+                    has_active_shard = True
+                    break
+            
+            if not has_active_shard:
+                raise ValueError(
+                    f"\n{'='*60}\n"
+                    f"CRITICAL ERROR: Cannot delete classes {class_names}\n"
+                    f"{'='*60}\n"
+                    f"This operation would delete ALL training data from the system.\n"
+                    f"At least one shard must contain training data for SISA to function.\n"
+                    f"{'='*60}"
+                )
+        
+        if not affected_shards:
+            print(f"No data found for classes {class_names} in training data.")
+            print("Unlearning completed (no retraining needed).")
+            return
+        
+        # Step 2: Retrain affected shards
+        print("\n" + "="*60)
+        print("Step 2: Retraining affected shards incrementally...")
+        print("="*60)
+        
+        retraining_start = time.time()
+        total_retrain_time = 0.0
+        total_pure_retrain_time = 0.0
+        
+        for shard_idx, info in affected_shards.items():
+            print(f"\n{'='*70}")
+            print(f"RETRAINING SHARD {shard_idx+1}")
+            print(f"{'='*70}")
+            print(f"First affected slice: {info['first_affected_slice']+1}")
+            print(f"Slice states: {info['slice_states']}")
+            
+            retrain_time, pure_retrain_time = self._retrain_shard_incrementally(
+                shard_idx, 
+                info['first_affected_slice'],
+                info['slice_states']  # Pass slice states for proper gap handling
+            )
+            total_retrain_time += retrain_time
+            total_pure_retrain_time += pure_retrain_time
+        
+        self.retraining_time = time.time() - retraining_start
+        self.pure_retraining_time = total_pure_retrain_time
+        print(f"\nTotal Retraining Time (with eval): {self.retraining_time:.2f} seconds")
+        print(f"Total Retraining Time (pure): {self.pure_retraining_time:.2f} seconds")
+        
+        # Step 3: Track all unlearned classes
+        print("\n" + "="*60)
+        print("Step 3: Updating metadata with unlearned classes...")
+        print("="*60)
+        for class_idx in class_indices:
+            self._track_unlearned_class(class_idx)
+        
+        # Calculate pure unlearning time
+        pure_unlearning_time = self.data_removal_time + self.retraining_time
+        
+        # Step 4: Final evaluation
+        print("\n" + "="*60)
+        print("Step 4: Final evaluation with gating network...")
+        print("="*60)
+        evaluation_start_time = time.time()
+        shard_models, classified_accuracy, overall_accuracy, unlearning_report = self.final_evaluation_with_gating()
+        evaluation_time = time.time() - evaluation_start_time
+        
+        total_time = time.time() - overall_start_time
+        
+        # Create comparison visualizations (use first class name for charts)
+        self._create_comparison_visualizations(
+            overall_accuracy, pure_unlearning_time, total_retrain_time, 
+            f"batch_{len(class_names)}_classes",
+            training_report=training_report, 
+            unlearning_report=unlearning_report
+        )
+        
+        # Evaluate forgotten samples
+        if shard_models:
+            self._evaluate_on_forgotten_samples(shard_models)
+            # Evaluate each deleted class
+            for class_idx, class_name in zip(class_indices, class_names):
+                self._evaluate_deleted_class_accuracy(shard_models, class_name, class_idx)
+        
+        # Final summary
+        print("\n" + "=" * 80)
+        print("BATCH UNLEARNING COMPLETED")
+        print("=" * 80)
+        print(f"Unlearned Classes: {class_names}")
+        print(f"Total Classes Unlearned: {len(class_names)}")
+        print("\nTIMING BREAKDOWN:")
+        print(f"  - Data Removal Time: {self.data_removal_time:.2f} seconds")
+        print(f"  - Retraining Time Only: {self.retraining_time:.2f} seconds")
+        print(f"  - Pure Unlearning Time: {pure_unlearning_time:.2f} seconds (removal + retraining)")
+        print(f"  - Evaluation & Overhead: {total_time - pure_unlearning_time:.2f} seconds")
+        print(f"  - Total Process Time: {total_time:.2f} seconds")
+        print("\nACCURACY RESULTS:")
+        print(f"  - Final Accuracy on Classified Samples: {classified_accuracy:.4f}")
+        print(f"  - Overall Model Accuracy on All Test Samples: {overall_accuracy:.4f}")
+        print(f"\nAffected Shards: {list(affected_shards.keys())}")
+        print(f"Output saved to: {self.base_dir}")
+        print("=" * 80)
+
     def _remove_data_from_slice(self, shard_idx: int, slice_idx: int, class_to_remove: int) -> Tuple[int, int]:
+        """Remove class data from a slice and return (removed_count, remaining_count)"""
         X, y = self._load_slice_data(shard_idx, slice_idx)
-        if X is None: return 0, 0
+        if X is None: 
+            return 0, 0
+        
         original_size = len(y)
         keep_mask = (y != class_to_remove)
         x_new, y_new = X[keep_mask], y[keep_mask]
-        self._save_slice_data(shard_idx, slice_idx, x_new, y_new)
-        removed_count = original_size - len(y_new)
+        remaining_count = len(y_new)
+        removed_count = original_size - remaining_count
+        
         if removed_count > 0:
-            print(f"   - Shard {shard_idx+1}, Slice {slice_idx+1}: Removed {removed_count} samples.")
-        return removed_count, len(y_new)
+            if remaining_count == 0:
+                print(f"   - Shard {shard_idx+1}, Slice {slice_idx+1}: Removed {removed_count} samples (slice now EMPTY - will be deleted)")
+            else:
+                print(f"   - Shard {shard_idx+1}, Slice {slice_idx+1}: Removed {removed_count} samples ({remaining_count} remain)")
+            # Save the modified data (even if empty, for consistency)
+            self._save_slice_data(shard_idx, slice_idx, x_new, y_new)
+        
+        return removed_count, remaining_count
+    
+    def _delete_empty_slice_files(self, shard_idx: int, slice_idx: int):
+        """Delete data and model files for an empty slice"""
+        shard_path = os.path.join(self.data_dir, f"shards/shard_{shard_idx+1}")
+        model_path = os.path.join(self.models_dir, f"shard_{shard_idx+1}")
+        
+        # Delete slice data files
+        x_path = os.path.join(shard_path, f"slice_{slice_idx}_x.npy")
+        y_path = os.path.join(shard_path, f"slice_{slice_idx}_y.npy")
+        
+        for path in [x_path, y_path]:
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"      - Deleted empty slice data: {os.path.basename(path)}")
+        
+        # Delete slice model file
+        model_file = os.path.join(model_path, f"slice_{slice_idx}_model_{self.model_name}.pth")
+        if os.path.exists(model_file):
+            os.remove(model_file)
+            print(f"      - Deleted model weights: slice_{slice_idx}_model_{self.model_name}.pth")
 
-    def _retrain_shard_incrementally(self, shard_idx: int, first_affected_slice: int):
+    def _retrain_shard_incrementally(self, shard_idx: int, first_affected_slice: int, slice_states: Dict = None):
+        """
+        Retrain shard incrementally, handling empty/deleted slices properly.
+        
+        Args:
+            shard_idx: Index of shard to retrain
+            first_affected_slice: First slice that was affected by unlearning
+            slice_states: Dictionary mapping slice_idx -> state ('empty', 'has_data', 'deleted')
+        """
         retrain_start_time = time.time()
-        pure_retrain_time = 0  # NEW: Track pure training time (excludes evaluation/plotting)
+        pure_retrain_time = 0  # Track pure training time (excludes evaluation/plotting)
         print("\n" + "="*20 + f" Incremental Retraining for Shard {shard_idx+1} " + "="*20)
         
         # Check class balance and determine augmentation strategy for unlearning
@@ -423,45 +785,84 @@ class SISAUnlearning:
         
         shard_model_dir = os.path.join(self.models_dir, f"shard_{shard_idx+1}")
         
+        # If no slice_states provided, create a default one
+        if slice_states is None:
+            slice_states = {}
+            for slice_idx in range(self.num_slices):
+                X, _ = self._load_slice_data(shard_idx, slice_idx)
+                if X is None or len(X) == 0:
+                    slice_states[slice_idx] = 'empty'
+                else:
+                    slice_states[slice_idx] = 'has_data'
+        
+        # Delete stale model files for affected slices (from first_affected_slice onwards)
         for slice_idx in range(first_affected_slice, self.num_slices):
             stale_model_path = os.path.join(shard_model_dir, f"slice_{slice_idx}_model_{self.model_name}.pth")
             if os.path.exists(stale_model_path):
                 os.remove(stale_model_path)
-
-        base_model_slice_idx = first_affected_slice - 1
+                print(f"   - Deleted stale model: slice_{slice_idx}_model_{self.model_name}.pth")
         
+        # Find the previous available model and replay buffer (handling gaps from deleted slices)
         current_model = None
-        if base_model_slice_idx >= 0:
-            model_path = os.path.join(shard_model_dir, f"slice_{base_model_slice_idx}_model_{self.model_name}.pth")
-            if os.path.exists(model_path):
-                current_model, _ = load_model_pytorch(model_path)
+        previous_available_slice = None
+        
+        # Search backwards from first_affected_slice-1 to find last available model
+        for slice_idx in range(first_affected_slice - 1, -1, -1):
+            if slice_states.get(slice_idx, 'empty') == 'has_data':
+                model_path = os.path.join(shard_model_dir, f"slice_{slice_idx}_model_{self.model_name}.pth")
+                if os.path.exists(model_path):
+                    try:
+                        current_model, _ = load_model_pytorch(model_path)
+                        previous_available_slice = slice_idx
+                        print(f"   - Loaded base model from previous available Slice {slice_idx+1}")
+                        break
+                    except Exception as e:
+                        print(f"   ⚠️  Warning: Failed to load model from Slice {slice_idx+1}: {e}")
+                        print(f"   - Will try previous slice or create new model")
+                        continue  # Try the next previous slice
+        
+        if current_model is None:
+            print("   - No previous model found or all models corrupted, training from scratch")
         
         # Define reports_dir for use throughout the method
         reports_dir = os.path.join(self.base_dir, "reports")
         os.makedirs(reports_dir, exist_ok=True)
         
-        # Initialize replay buffer based on configuration
+        # Initialize replay buffer from previous available slices (skipping empty/deleted ones)
         if config.USE_SMART_REPLAY:
             from training.smart_replay import create_smart_replay_buffer
             replay_buffer = create_smart_replay_buffer(config)
             print("   - Using smart replay buffer for unlearning")
             
-            # Add unaffected slices to smart buffer
+            # Add data from all previous AVAILABLE slices (skip empty/deleted ones)
             for slice_idx in range(first_affected_slice):
+                # Only process slices that have data
+                if slice_states.get(slice_idx, 'empty') != 'has_data':
+                    continue
+                
                 x_s, y_s = self._load_slice_data(shard_idx, slice_idx)
                 if x_s is not None and len(x_s) > 0:
                     # Need to load a model to compute importance scores
                     base_model_path = os.path.join(shard_model_dir, f"slice_{slice_idx}_model_{self.model_name}.pth")
                     if os.path.exists(base_model_path):
-                        temp_model, _ = load_model_pytorch(base_model_path)
-                        replay_buffer.add_samples(x_s, y_s, temp_model, DEVICE)
+                        try:
+                            temp_model, _ = load_model_pytorch(base_model_path)
+                            replay_buffer.add_samples(x_s, y_s, temp_model, DEVICE)
+                        except Exception as e:
+                            print(f"   ⚠️  Warning: Failed to load model for replay buffer from Slice {slice_idx+1}: {e}")
+                            print(f"   - Skipping this slice in replay buffer")
+                            continue
+                        print(f"   - Added Slice {slice_idx+1} data to smart replay buffer")
                     else:
-                        # No model available for this slice
-                        print(f"   Warning: No model found for slice {slice_idx}, using random importance")
+                        print(f"   - Warning: Slice {slice_idx+1} has data but no model found")
         else:
             replay_buffer = {}
-            # Traditional replay buffer logic
+            # Traditional replay buffer logic - only from available slices
             for slice_idx in range(first_affected_slice):
+                # Only process slices that have data
+                if slice_states.get(slice_idx, 'empty') != 'has_data':
+                    continue
+                    
                 x_s, y_s = self._load_slice_data(shard_idx, slice_idx)
                 if x_s is not None and len(x_s) > 0:
                     unique_labels_in_slice = np.unique(y_s)
@@ -473,18 +874,29 @@ class SISAUnlearning:
                             replay_buffer[label]['y'] = np.concatenate([replay_buffer[label]['y'], class_y_data])
                         else:
                             replay_buffer[label] = {'X': class_x_data, 'y': class_y_data}
+                    print(f"   - Added Slice {slice_idx+1} data to replay buffer")
 
         # Load shard metadata (for potential future use)
         with open(os.path.join(self.data_dir, f"shards/shard_{shard_idx+1}/metadata.json"), 'r') as f:
             json.load(f)  # Load but don't use currently
 
+        # Train from first_affected_slice to last slice, handling gaps from deleted slices
         for slice_idx in range(first_affected_slice, self.num_slices):
+            # Skip empty or deleted slices
+            slice_state = slice_states.get(slice_idx, 'empty')
+            if slice_state in ['empty', 'deleted']:
+                print(f"   - Slice {slice_idx+1} is {slice_state}, skipping...")
+                continue
+            
+            # Double-check that slice actually has data
             x_slice, y_slice = self._load_slice_data(shard_idx, slice_idx)
             if x_slice is None or len(x_slice) == 0: 
                 print(f"   - Slice {slice_idx+1} is empty after unlearning, skipping...")
                 continue
 
             print(f"\n   --- Retraining Slice {slice_idx+1} (Incremental Logic) ---")
+            print(f"   - Current model state: {'Available' if current_model is not None else 'Training from scratch'}")
+            print(f"   - Replay buffer status: {len(replay_buffer.buffer) if hasattr(replay_buffer, 'buffer') else len(replay_buffer)} classes available")
             
             # Get cumulative classes up to this slice (excluding unlearned classes)
             cumulative_classes = self._get_cumulative_classes_up_to_slice_unlearning(shard_idx, slice_idx)
@@ -615,7 +1027,7 @@ class SISAUnlearning:
         return shard_models, classified_accuracy, overall_accuracy, unlearning_report
 
     def evaluate_with_gating_network(self, shard_models, gating_model, class_names, threshold=config.CONFIDENCE_THRESHOLD):
-        print("\n" + "="*20 + f" Enhanced Unlearning Evaluation with Unseen Class (Threshold={threshold:.2f}) " + "="*20)
+        print("\n" + "="*20 + f" Production Evaluation with Confidence Threshold={threshold:.2f} " + "="*20)
         x_test = np.load(os.path.join(self.test_data_dir, "x_test.npy"))
         y_test = np.load(os.path.join(self.test_data_dir, "y_test.npy"))
 
@@ -627,7 +1039,7 @@ class SISAUnlearning:
         all_true_labels = []
         batch_size = config.BATCH_SIZE
         
-        # Get unlearned classes for post-processing filtering (O(1) cached lookup)
+        # Get unlearned classes for analysis
         unlearned_classes_set = self.get_unlearned_classes_set()
         
         with torch.no_grad():
@@ -635,16 +1047,15 @@ class SISAUnlearning:
                 batch_x = torch.from_numpy(x_test[i:i+batch_size]).float()
                 batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
                 
-                # Use REAL-TIME gating network routing
+                # Use REAL-TIME gating network routing WITH threshold (production mode)
+                # Threshold helps detect uncertain predictions on deleted/unknown classes
                 batch_final_preds, _ = _run_sisa_batch(
                     batch_x_normalized, shard_models, gating_model, class_names, threshold
                 )
                 
-                # Post-processing: Filter unlearned class predictions to -1 (OPTIMIZED O(1) lookup)
+                # Keep predictions including -1 (uncertain/unknown samples)
+                # This shows production behavior: reject low-confidence predictions
                 batch_final_preds_np = batch_final_preds.cpu().numpy()
-                for j, pred in enumerate(batch_final_preds_np):
-                    if pred in unlearned_classes_set:  # O(1) set lookup instead of O(n) list lookup
-                        batch_final_preds_np[j] = -1  # Filter unlearned predictions
                 
                 all_final_preds.extend(batch_final_preds_np)
                 all_true_labels.extend(y_test[i:i+batch_size])
@@ -653,24 +1064,27 @@ class SISAUnlearning:
         all_true_labels = np.array(all_true_labels)
 
         # ============================================================================
-        # COMPREHENSIVE EVALUATION: Include ALL samples (including deleted classes)
-        # This shows the complete model behavior including unlearning effectiveness
+        # PRODUCTION EVALUATION: Includes confidence-based rejection
+        # Predictions with low confidence are marked as -1 (unknown/rejected)
+        # This demonstrates real-world deployment where uncertain predictions are rejected
         # ============================================================================
         
-        # Store complete predictions for comprehensive analysis
-        all_final_preds_complete = all_final_preds.copy()
-        all_true_labels_complete = all_true_labels.copy()
+        # Count rejected predictions (marked as -1 due to low confidence)
+        rejected_count = np.sum(all_final_preds == -1)
+        rejected_percentage = (rejected_count / len(all_final_preds)) * 100
         
-        # Only remove -1 predictions (unknown/low confidence) but keep deleted class samples
-        valid_pred_mask = all_final_preds_complete != -1
-        if not np.all(valid_pred_mask):
-            unknown_count = np.sum(~valid_pred_mask)
-            print(f"   Warning: {unknown_count} samples had unknown predictions (filtered out)")
-            all_final_preds_complete = all_final_preds_complete[valid_pred_mask]
-            all_true_labels_complete = all_true_labels_complete[valid_pred_mask]
+        print("\n--- PRODUCTION EVALUATION WITH CONFIDENCE THRESHOLDING ---")
+        print(f"Total Test Samples: {len(all_final_preds)}")
+        print(f"Rejected Predictions (low confidence): {rejected_count} ({rejected_percentage:.2f}%)")
+        print(f"Accepted Predictions: {len(all_final_preds) - rejected_count} ({100 - rejected_percentage:.2f}%)")
+        
+        # Filter out rejected predictions for accuracy calculation
+        valid_mask = all_final_preds != -1
+        all_final_preds_complete = all_final_preds[valid_mask]
+        all_true_labels_complete = all_true_labels[valid_mask]
 
-        print("\n--- COMPREHENSIVE UNLEARNING EVALUATION (All Classes Including Deleted) ---")
-        print(f"Total Test Samples for Evaluation: {len(all_final_preds_complete)} (all classes included)")
+        print("\n--- COMPREHENSIVE UNLEARNING EVALUATION (On Accepted Predictions) ---")
+        print(f"Evaluating on {len(all_final_preds_complete)} accepted predictions")
         
         # Display total samples per class (including deleted classes)
         print("\nPer-Class Sample Distribution:")
@@ -800,14 +1214,200 @@ class SISAUnlearning:
         # ============================================================================
         # END: DELETED CLASS PERFORMANCE ANALYSIS
         # ============================================================================
+
+        # ============================================================================
+        # NEW: ACTIVE CLASSES ONLY EVALUATION (Excluding Deleted Classes)
+        # This shows clean performance on classes the model should still know
+        # NO CONFIDENCE MASKING - evaluate on ALL test samples for active classes
+        # ============================================================================
+        print("\n" + "="*80)
+        print("ACTIVE CLASSES EVALUATION (Excluding Deleted Classes - NO Confidence Masking)")
+        print("="*80)
+        print("Evaluating model performance on remaining/active classes only...")
+        print("Note: Using ALL test samples (no confidence thresholding) for active class evaluation")
         
-        # Generate ROC curves for unlearning evaluation (same as training)
+        # Get unlearned class indices (unlearned_classes is List[int] from metadata)
+        unlearned_class_indices = set(unlearned_classes)  # Already indices!
+        
+        # Get deleted class names for display
+        deleted_class_names = [class_names[idx] for idx in unlearned_class_indices if idx < len(class_names)]
+        
+        # Re-run predictions WITHOUT confidence threshold for active classes
+        print("\nRe-evaluating with NO confidence threshold for clean active class metrics...")
+        all_active_preds = []
+        all_active_labels = []
+        
+        with torch.no_grad():
+            for i in range(0, len(x_test), batch_size):
+                batch_x = torch.from_numpy(x_test[i:i+batch_size]).float()
+                batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
+                batch_y = y_test[i:i+batch_size]
+                
+                # NO threshold - get predictions on all samples
+                batch_preds, _ = _run_sisa_batch(
+                    batch_x_normalized, shard_models, gating_model, class_names, threshold=None
+                )
+                
+                all_active_preds.extend(batch_preds.cpu().numpy())
+                all_active_labels.extend(batch_y)
+        
+        all_active_preds = np.array(all_active_preds)
+        all_active_labels = np.array(all_active_labels)
+        
+        # Filter to keep only active class samples (samples whose TRUE label is NOT deleted)
+        active_mask = np.array([label not in unlearned_class_indices for label in all_active_labels])
+        active_preds = all_active_preds[active_mask]
+        active_labels = all_active_labels[active_mask]
+        
+        # Get active class names and indices
+        active_class_indices = sorted([i for i in range(len(class_names)) if i not in unlearned_class_indices])
+        active_class_names = [class_names[i] for i in active_class_indices]
+        
+        print(f"\nActive Classes: {active_class_names}")
+        print(f"Deleted Classes (indices): {sorted(list(unlearned_class_indices))}")
+        print(f"Deleted Classes (names): {deleted_class_names}")
+        print(f"Total Active Class Samples (true labels only): {len(active_preds)}")
+        
+        # Additional filter: Remove samples where prediction is a deleted class
+        # (model wrongly predicts deleted class - count as error but exclude from per-class stats)
+        active_pred_mask = np.array([pred not in unlearned_class_indices for pred in active_preds])
+        num_deleted_class_predictions = np.sum(~active_pred_mask)
+        
+        if num_deleted_class_predictions > 0:
+            print(f"\nNote: {num_deleted_class_predictions} predictions were for deleted classes (counted as errors, excluded from per-class report)")
+        
+        # Apply filter to remove predictions of deleted classes
+        active_preds_filtered = active_preds[active_pred_mask]
+        active_labels_filtered = active_labels[active_pred_mask]
+        
+        print(f"Samples for classification report (after filtering deleted class predictions): {len(active_preds_filtered)}")
+        
+        # Display per-class distribution for active classes
+        print("\nPer-Class Sample Distribution (Active Classes Only - True Labels):")
+        unique_active_labels, active_counts = np.unique(active_labels_filtered, return_counts=True)
+        for label_idx, count in zip(unique_active_labels, active_counts):
+            class_name = class_names[label_idx]
+            print(f"  {class_name}: {count} samples")
+        
+        # Calculate accuracy on active classes only (using all samples, including wrong deleted class predictions)
+        active_accuracy = np.mean(active_preds == active_labels)
+        
+        # Classification report for active classes only (using filtered samples)
+        print("\n" + "-"*60)
+        print("Classification Report (Active Classes Only):")
+        print("-"*60)
+        active_report_str = classification_report(
+            active_labels_filtered, 
+            active_preds_filtered,
+            target_names=active_class_names,
+            labels=active_class_indices,
+            zero_division=0
+        )
+        active_report_dict = classification_report(
+            active_labels_filtered,
+            active_preds_filtered,
+            target_names=active_class_names,
+            labels=active_class_indices,
+            zero_division=0,
+            output_dict=True
+        )
+        print(active_report_str)
+        print(f"Active Classes Overall Accuracy: {active_accuracy:.4f}")
+        print("-"*60)
+        
+        # Store active class metrics for comparison charts
+        self.active_classes_accuracy = active_accuracy
+        self.active_classes_report = active_report_dict
+        
+        # ============================================================================
+        # END: ACTIVE CLASSES ONLY EVALUATION
+        # ============================================================================
+
+        # ============================================================================
+        # GENERATE PLOTS FOR ACTIVE CLASSES ONLY
+        # ============================================================================
         print("\n" + "=" * 50)
-        print("CREATING OVERALL SISA SYSTEM ROC CURVES (AFTER UNLEARNING)")
+        print("CREATING ACTIVE CLASSES ONLY VISUALIZATIONS")
+        print("=" * 50)
+        
+        # ROC Curves for active classes
+        print("   Creating ROC curves for active classes only...")
+        create_overall_sisa_roc_curve(
+            shard_models,
+            gating_model,
+            x_test,
+            y_test,
+            class_names,
+            self.reports_dir,
+            'active_classes_only',
+            unlearned_classes=unlearned_classes
+        )
+        
+        # Confusion Matrix for active classes
+        print("   Creating confusion matrix for active classes only...")
+        create_overall_sisa_confusion_matrix(
+            shard_models,
+            gating_model,
+            x_test,
+            y_test,
+            class_names,
+            self.reports_dir,
+            'active_classes_only',
+            unlearned_classes=unlearned_classes
+        )
+        
+        # Training curves for active classes (if available)
+        print("   Creating training curves for active classes...")
+        if hasattr(self, 'unlearning_histories') and self.unlearning_histories:
+            create_overall_sisa_training_curves(
+                self.unlearning_histories,
+                self.reports_dir,
+                'active_classes_only'
+            )
+        
+        # ============================================================================
+        # GENERATE PLOTS FOR ALL CLASSES (INCLUDING DELETED - Shows Unlearning Effect)
+        # ============================================================================
+        print("\n" + "=" * 50)
+        print("CREATING VISUALIZATIONS WITH ALL CLASSES (INCLUDING DELETED)")
+        print(f"These plots show ALL {len(class_names)} classes to demonstrate unlearning effectiveness")
         print("=" * 50)
         
         # Get unlearned classes from metadata
         unlearned_classes = self.get_unlearned_classes()
+        
+        # ROC curves - ALL classes including deleted (to show they have poor performance)
+        print("   Creating ROC curves with ALL classes (including deleted)...")
+        create_overall_sisa_roc_curve(
+            shard_models,
+            gating_model,
+            x_test,
+            y_test,
+            class_names,
+            self.reports_dir,
+            'with_deleted_classes',
+            unlearned_classes=None  # Don't filter - show ALL classes
+        )
+        
+        # Confusion matrix - ALL classes including deleted
+        print("   Creating confusion matrix with ALL classes (including deleted)...")
+        create_overall_sisa_confusion_matrix(
+            shard_models,
+            gating_model,
+            x_test,
+            y_test,
+            class_names,
+            self.reports_dir,
+            'with_deleted_classes',
+            unlearned_classes=None  # Don't filter - show ALL classes
+        )
+        
+        # ============================================================================
+        # GENERATE PLOTS FOR ACTIVE CLASSES ONLY (Clean Performance Metrics)
+        # ============================================================================
+        print("\n" + "=" * 50)
+        print("CREATING VISUALIZATIONS FOR UNLEARNING EVALUATION (ACTIVE CLASSES)")
+        print("=" * 50)
         
         create_overall_sisa_roc_curve(
             shard_models,
@@ -817,7 +1417,7 @@ class SISAUnlearning:
             class_names,
             self.reports_dir,
             'unlearning_evaluation',
-            unlearned_classes=unlearned_classes  # Pass unlearned classes to exclude them
+            unlearned_classes=unlearned_classes  # Exclude deleted classes
         )
         
         # Create overall confusion matrix showing only active classes
@@ -855,11 +1455,24 @@ class SISAUnlearning:
     def _evaluate_on_forgotten_samples(self, shard_models):
         if self.forgotten_samples_x is None or len(self.forgotten_samples_x) == 0:
             return
+        
+        # Consolidate samples if needed (for batch unlearning)
+        if isinstance(self.forgotten_samples_x, list):
+            self.forgotten_samples_x = np.concatenate(self.forgotten_samples_x)
+            self.forgotten_samples_y = np.array(self.forgotten_samples_y)
 
-        print("\n" + "="*20 + " Verification on Forgotten Samples (using gating network) " + "="*20)
         x_forgotten = self.forgotten_samples_x
         y_forgotten = self.forgotten_samples_y
-        class_name = self.class_names[y_forgotten[0]]
+        
+        # Get unique classes in forgotten samples
+        unique_forgotten_classes = np.unique(y_forgotten)
+        class_names_str = ', '.join([self.class_names[c] for c in unique_forgotten_classes])
+        
+        print("\n" + "="*20 + f" Verification on Forgotten Samples ({class_names_str}) " + "="*20)
+        print(f"Total forgotten samples: {len(y_forgotten)}")
+        for class_idx in unique_forgotten_classes:
+            count = np.sum(y_forgotten == class_idx)
+            print(f"  - {self.class_names[class_idx]}: {count} samples")
 
         # Load gating model for proper SISA prediction
         gating_model_path = os.path.join(self.models_dir, "gating_model.pth")
@@ -900,34 +1513,77 @@ class SISAUnlearning:
         all_preds = np.array(all_preds)
         all_confidences = np.array(all_confidences)
         
+        # Calculate overall accuracy
         num_correct = np.sum(all_preds == y_forgotten)
         total_samples = len(y_forgotten)
         accuracy = num_correct / total_samples
 
-        print(f"Accuracy on the forgotten class ('{class_name}'): {num_correct}/{total_samples} = {accuracy:.2%}")
+        print(f"\nOverall Accuracy on forgotten samples: {num_correct}/{total_samples} = {accuracy:.2%}")
+        
+        # Show per-class accuracy
+        for class_idx in unique_forgotten_classes:
+            class_mask = (y_forgotten == class_idx)
+            class_correct = np.sum(all_preds[class_mask] == y_forgotten[class_mask])
+            class_total = np.sum(class_mask)
+            class_acc = class_correct / class_total if class_total > 0 else 0
+            print(f"  - {self.class_names[class_idx]}: {class_correct}/{class_total} = {class_acc:.2%}")
         
         if accuracy < config.UNLEARNING_SUCCESS_THRESHOLD:
-            print("Unlearning completed: Model performs near random chance on the forgotten class")
+            print("Unlearning completed: Model performs near random chance on forgotten samples")
         else:
-            print("Unlearning may be incomplete: Model still shows significant accuracy on the forgotten class")
+            print("Unlearning may be incomplete: Model still shows significant accuracy on forgotten samples")
 
-        fig, axes = plt.subplots(4, 4, figsize=(12, 12))
-        fig.suptitle(f"Model Predictions for Forgotten Class: '{class_name}' (Gating Network)", fontsize=16)
-        for i, ax in enumerate(axes.flat):
-            if i >= total_samples: break
-            img = x_forgotten[i].transpose((1, 2, 0))
-            ax.imshow(img)
-            true_label = self.class_names[y_forgotten[i]]
-            pred_label = self.class_names[all_preds[i]] if all_preds[i] < len(self.class_names) else f"Class_{all_preds[i]}"
-            confidence = all_confidences[i]
-            color = "green" if true_label == pred_label else "red"
-            ax.set_title(f"True: {true_label}\nPred: {pred_label}\nConf: {confidence:.3f}", color=color, fontsize=8)
-            ax.axis('off')
-        plt.tight_layout(rect=config.PLOT_TIGHT_LAYOUT_RECT)
-        save_path = os.path.join(self.reports_dir, 'SISA_Unlearning_Verification.png')
-        plt.savefig(save_path)
-        plt.close()
-        print(f"   - Saved visualization to {os.path.basename(save_path)}")
+        # Create SEPARATE visualization for EACH forgotten class (16 samples each)
+        print(f"\nCreating individual verification plots for {len(unique_forgotten_classes)} forgotten class(es)...")
+        
+        for class_idx in unique_forgotten_classes:
+            class_name = self.class_names[class_idx]
+            
+            # Get samples for this specific class
+            class_mask = (y_forgotten == class_idx)
+            class_x = x_forgotten[class_mask]
+            class_y = y_forgotten[class_mask]
+            class_preds = all_preds[class_mask]
+            class_confidences = all_confidences[class_mask]
+            
+            class_total = len(class_y)
+            class_correct = np.sum(class_preds == class_y)
+            class_accuracy = class_correct / class_total if class_total > 0 else 0
+            
+            print(f"\n   Creating verification plot for class '{class_name}':")
+            print(f"     - Samples: {class_total}")
+            print(f"     - Accuracy: {class_accuracy:.2%} ({class_correct}/{class_total})")
+            
+            # Create 4x4 grid for this class (16 samples)
+            fig, axes = plt.subplots(4, 4, figsize=(12, 12))
+            fig.suptitle(f"Model Predictions for Forgotten Class: '{class_name}'\nAccuracy: {class_accuracy:.2%} ({class_correct}/{class_total})", 
+                        fontsize=16, fontweight='bold')
+            
+            # Show up to 16 samples for this class
+            for i, ax in enumerate(axes.flat):
+                if i >= min(16, class_total):  # Show up to 16 samples
+                    ax.axis('off')
+                    continue
+                    
+                if i < class_total:
+                    # Show actual sample
+                    img = class_x[i].transpose((1, 2, 0))
+                    ax.imshow(img)
+                    true_label = self.class_names[class_y[i]]
+                    pred_label = self.class_names[class_preds[i]] if class_preds[i] < len(self.class_names) else f"Class_{class_preds[i]}"
+                    confidence = class_confidences[i]
+                    color = "green" if true_label == pred_label else "red"
+                    ax.set_title(f"True: {true_label}\nPred: {pred_label}\nConf: {confidence:.3f}", color=color, fontsize=8)
+                ax.axis('off')
+            
+            plt.tight_layout(rect=config.PLOT_TIGHT_LAYOUT_RECT)
+            
+            # Save with class-specific filename
+            save_path = os.path.join(self.reports_dir, f'SISA_Unlearning_Verification_{class_name.lower()}.png')
+            plt.savefig(save_path)
+            plt.close()
+            
+            print(f"     - Saved: {os.path.basename(save_path)}")
 
     def _backup_test_set_if_needed(self):
         """Create backup of original test set if it doesn't exist"""
@@ -1201,6 +1857,22 @@ class SISAUnlearning:
             create_classification_metrics_comparison_chart(
                 training_report, unlearning_report, unlearned_class, self.reports_dir
             )
+        
+        # Create ACTIVE CLASSES ONLY versions of comparison charts
+        print("\n   Creating active classes only comparison charts...")
+        # Get active class accuracy from evaluation
+        active_classes_accuracy = getattr(self, 'active_classes_accuracy', unlearning_accuracy)
+        
+        # Create active classes only accuracy comparison
+        create_accuracy_comparison_chart(
+            training_accuracy, active_classes_accuracy, f"{unlearned_class} (Active Classes Only)", self.reports_dir
+        )
+        
+        # Create active classes only classification metrics comparison
+        if training_report is not None and hasattr(self, 'active_classes_report'):
+            create_classification_metrics_comparison_chart(
+                training_report, self.active_classes_report, f"{unlearned_class} (Active Classes Only)", self.reports_dir
+            )
 
     def _evaluate_deleted_class_accuracy(self, shard_models, deleted_class_name: str, deleted_class_idx: int):
         """
@@ -1360,40 +2032,22 @@ class SISAUnlearning:
                 batch_x = torch.from_numpy(x_data[i:i+batch_size]).float()
                 batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
                 
-                # Let model predict naturally without masking
+                # Let model predict naturally - keep raw predictions
                 batch_preds, _ = _run_sisa_batch(
                     batch_x_normalized, shard_models, gating_model, self.class_names, threshold=None
                 )
                 
-                # Post-processing: Filter unlearned class predictions to -1 (OPTIMIZED O(1) lookup)
+                # Keep RAW predictions to see true model behavior after unlearning
                 batch_preds_np = batch_preds.cpu().numpy()
-                for j, pred in enumerate(batch_preds_np):
-                    if pred in unlearned_classes_set:  # O(1) set lookup
-                        batch_preds_np[j] = -1  # Filter unlearned predictions
                 
                 all_preds.extend(batch_preds_np)
         
         all_preds = np.array(all_preds)
         
-        # Handle "unknown" predictions (-1) for unlearned class evaluation
-        # For unlearned class data: -1 predictions should be counted as correct (successful forgetting)
-        if len(unlearned_classes_set) > 0 and len(np.unique(y_data)) == 1:
-            # Check if this is purely unlearned class data
-            unique_class = np.unique(y_data)[0]
-            if unique_class in unlearned_classes_set:
-                # Count -1 predictions as correct (successful unlearning)
-                correct_predictions = np.sum(all_preds == -1)
-                return correct_predictions / len(y_data)
-        
-        # Standard accuracy calculation (filter out -1 predictions for normal evaluation)
-        valid_mask = all_preds != -1
-        if np.sum(valid_mask) == 0:
-            return 0.0  # All predictions were filtered out
-        
-        filtered_preds = all_preds[valid_mask]
-        filtered_labels = y_data[valid_mask]
-        correct_predictions = np.sum(filtered_preds == filtered_labels)
-        return correct_predictions / len(filtered_preds)
+        # Use RAW predictions for accuracy calculation
+        # This shows what the model actually predicts after unlearning
+        correct_predictions = np.sum(all_preds == y_data)
+        return correct_predictions / len(y_data)
     
     def _create_deleted_class_bar_chart(self, deleted_class_name, pre_acc, post_deleted_acc, post_remaining_acc):
         """Create bar chart showing pre/post unlearning accuracy comparison for DELETED class only."""
@@ -1448,8 +2102,24 @@ if __name__ == "__main__":
     sys.stdout = logger
     
     try:
-        parser = argparse.ArgumentParser(description="SISA Machine Unlearning")
-        parser.add_argument('--class-name', type=str, help='Name of the class to forget')
+        parser = argparse.ArgumentParser(
+            description="SISA Machine Unlearning",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+Examples:
+  # Single class unlearning
+  python unlearning/sisa_unlearning.py --class-name cat
+  
+  # Batch unlearning (multiple classes)
+  python unlearning/sisa_unlearning.py --class-name cat dog ship
+  python unlearning/sisa_unlearning.py --class-name cat dog
+  
+  # With custom project
+  python unlearning/sisa_unlearning.py --class-name cat dog --project-name my_project
+            """
+        )
+        parser.add_argument('--class-name', type=str, nargs='+', 
+                          help='Name(s) of the class(es) to forget. Use spaces to separate multiple classes.')
         parser.add_argument('--index', type=int, help='Index of specific sample to forget')  
         parser.add_argument('--project-name', type=str, default='cifar10_sisa_pytorch', help='Project name')
         parser.add_argument('--model-name', type=str, default='custom_cnn', help='Model architecture name')
@@ -1470,7 +2140,10 @@ if __name__ == "__main__":
         print(f"Project: {args.project_name}")
         print(f"Model: {args.model_name}")
         if args.class_name:
-            print(f"Target: Forget class '{args.class_name}'")
+            if len(args.class_name) == 1:
+                print(f"Target: Forget class '{args.class_name[0]}'")
+            else:
+                print(f"Target: Forget {len(args.class_name)} classes: {args.class_name}")
         else:
             print(f"Target: Forget sample at index {args.index}")
         print("="*80)
@@ -1479,14 +2152,18 @@ if __name__ == "__main__":
         unlearner = SISAUnlearning(args.project_name, args.model_name)
         
         if args.class_name:
-            # Unlearn by class
-            unlearner.unlearn_by_class(args.class_name)
+            if len(args.class_name) == 1:
+                # Single class unlearning
+                unlearner.unlearn_by_class(args.class_name[0])
+            else:
+                # Batch unlearning for multiple classes
+                unlearner.batch_unlearn_by_classes(args.class_name)
         else:
             # Unlearn by index (not implemented yet)
             print("Error: Unlearning by index is not implemented yet.")
             sys.exit(1)
             
-        print("\n Unlearning completed successfully!")
+        print("\n✅ Unlearning completed successfully!")
         
     except Exception as e:
         print(f"\n Error during unlearning: {str(e)}")

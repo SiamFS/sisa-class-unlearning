@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.'))
 import config
 
 from training.create_model import load_model_pytorch, DEVICE
+from plots import _run_sisa_batch  # Use TRUE SISA routing logic
 
 class SISASearchTool:
     def __init__(self, project_name: str, model_name: str):
@@ -189,8 +190,8 @@ class SISASearchTool:
         print(f"Found {len(class_samples)} total '{class_name}' samples in current test set")
         print(f"Analyzing first {samples_to_analyze} samples...")
         
-        # Make predictions
-        predictions, confidences, detailed_results = self._predict_with_gating(selected_samples, shard_models, gating_model, threshold)
+        # Make predictions using TRUE SISA routing (same as evaluation)
+        predictions, confidences = self._predict_with_true_sisa_batch(selected_samples, shard_models, gating_model, threshold)
         
         # Calculate accuracy
         correct_predictions = 0
@@ -204,7 +205,6 @@ class SISASearchTool:
             true_label = self.class_names[selected_labels[i]]
             pred_idx = predictions[i]
             confidence = confidences[i]
-            detail = detailed_results[i]
             
             if pred_idx == -1:  # Unknown prediction
                 pred_label = "UNKNOWN"
@@ -214,46 +214,10 @@ class SISASearchTool:
                 if pred_idx == selected_labels[i]:
                     correct_predictions += 1
             
-            status = "CORRECT" if pred_label == true_label else "WRONG"
-            print(f"Sample {i+1:2d}: True={true_label:10s} | Pred={pred_label:10s} | Conf={confidence:.3f} {status}")
+            status = "✓ CORRECT" if pred_idx == selected_labels[i] else ("? UNKNOWN" if pred_idx == -1 else "✗ WRONG")
+            print(f"Sample {i+1:2d}: True={true_label:10s} | Pred={pred_label:10s} | Conf={confidence:.3f} | {status}")
         
-        # Show detailed analysis for all samples
-        print("-"*50)
-        print("DETAILED ANALYSIS:")
-        print("-"*50)
-        
-        for i in range(samples_to_analyze):
-            detail = detailed_results[i]
-            true_label = self.class_names[selected_labels[i]]
-            pred_idx = predictions[i]
-            
-            status = "CORRECT" if pred_idx == selected_labels[i] else ("UNKNOWN" if pred_idx == -1 else "WRONG")
-            pred_label = self.class_names[pred_idx] if pred_idx != -1 else "UNKNOWN"
-            
-            print(f"\nSample {detail['sample_idx']}: {true_label} → {pred_label} {status}")
-            print(f"  Method used: {detail['final_method'].upper()}")
-            
-            if 'gating_confidence' in detail:
-                print(f"  Gating confidence: {detail['gating_confidence']:.3f}")
-            
-            # Dynamic gating weights display based on actual number of shards
-            gating_weights_str = ", ".join([f"Shard{i+1}={weight:.3f}" for i, weight in enumerate(detail['gating_weights'])])
-            print(f"  Gating weights: {gating_weights_str}")
-            print("  Individual shard predictions:")
-            
-            for shard_idx, (shard_pred, shard_conf) in enumerate(detail['shard_predictions']):
-                gating_marker = "→" if shard_idx == (detail['gating_selected_shard'] - 1) else " "
-                override_marker = "*" if detail.get('override_shard') == shard_idx + 1 else " "
-                marker = override_marker if override_marker != " " else gating_marker
-                print(f"    {marker} Shard {shard_idx+1}: {shard_pred} ({shard_conf})")
-                
-            if detail.get('override_shard'):
-                print(f"  Override: Used Shard {detail['override_shard']} instead of gating choice")
-                if detail.get('override_reason'):
-                    print(f"  Reason: {detail['override_reason']}")
-            
-            print(f"  Final confidence: {detail['final_confidence']:.3f}")
-        
+        # Remove old detailed analysis section - using TRUE SISA routing now
         accuracy = correct_predictions / samples_to_analyze
         unknown_rate = unknown_predictions / samples_to_analyze
         
@@ -261,19 +225,51 @@ class SISASearchTool:
         print(f"Accuracy on '{class_name}': {correct_predictions}/{samples_to_analyze} = {accuracy:.2%}")
         print(f"Unknown rate: {unknown_predictions}/{samples_to_analyze} = {unknown_rate:.2%}")
         
-        if class_name == 'cat':  # Special analysis for deleted class
+        if class_idx in self.unlearned_classes:  # Deleted class
             if accuracy < config.UNLEARNING_SUCCESS_THRESHOLD and unknown_rate > 0.5:
-                print("Model appears to have successfully unlearned this class")
+                print("✓ Model has successfully unlearned this class")
             elif unknown_rate > 0.3:
-                print("Model shows some unlearning effects")
+                print("⚠ Model shows some unlearning effects")
             else:
-                print("Warning: Model may not have properly unlearned this class")
+                print("✗ Warning: Model may not have properly unlearned this class")
         
         # Create visualization
-        self._create_prediction_visualization(selected_samples, selected_labels, predictions, confidences, class_name, threshold)
+        self._create_prediction_visualization(selected_samples, selected_labels, predictions, confidences, class_name)
         
         print(f"\nVisualization saved to: {os.path.join(self.reports_dir, f'Class_Search_{class_name}_Analysis.png')}")
         print("="*70)
+
+    def _predict_with_true_sisa_batch(self, samples, shard_models, gating_model, threshold):
+        """Use TRUE SISA routing (_run_sisa_batch) for consistency with evaluation"""
+        predictions = []
+        confidences = []
+        
+        with torch.no_grad():
+            for sample in samples:
+                # Convert single sample to batch format
+                batch_x = torch.from_numpy(sample).unsqueeze(0).float()
+                batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
+                
+                # Use TRUE SISA routing (same as evaluation)
+                batch_preds, batch_probs = _run_sisa_batch(
+                    batch_x_normalized, 
+                    shard_models, 
+                    gating_model, 
+                    self.class_names, 
+                    threshold
+                )
+                
+                pred = batch_preds[0].item()
+                # Get confidence for predicted class (or max prob if prediction is -1)
+                if pred == -1:
+                    conf = 0.0
+                else:
+                    conf = batch_probs[0, pred].item() if pred < batch_probs.size(1) else 0.0
+                
+                predictions.append(pred)
+                confidences.append(conf)
+        
+        return predictions, confidences
 
     def _predict_with_gating(self, samples, shard_models, gating_model, threshold):
         """Make predictions using an improved gating network approach with ensemble fallback"""
@@ -369,7 +365,7 @@ class SISASearchTool:
         
         return predictions, confidences, detailed_results
 
-    def _create_prediction_visualization(self, samples, true_labels, predictions, confidences, class_name, threshold):
+    def _create_prediction_visualization(self, samples, true_labels, predictions, confidences, class_name):
         """Create a 4x4 grid visualization similar to unlearning verification"""
         
         fig, axes = plt.subplots(4, 4, figsize=(12, 12))

@@ -143,19 +143,7 @@ def get_cumulative_classes_up_to_slice(shard_idx, slice_idx):
     return sorted(list(cumulative_classes))
 
 def get_incremental_validation_data(shard_idx, slice_idx, shard_metadatas, validation_data):
-    """
-    Filter validation data to only include classes seen up to current slice.
-    This ensures fair evaluation following incremental learning standards.
-    
-    Args:
-        shard_idx: 0-based shard index
-        slice_idx: 0-based slice index
-        shard_metadatas: loaded shard metadata (not used anymore)
-        validation_data: tuple of (x_val, y_val)
-    
-    Returns:
-        Filtered (x_val_filtered, y_val_filtered) containing only relevant classes
-    """
+
     x_val, y_val = validation_data
     
     # Get classes that should be known at this slice (cumulative)
@@ -175,21 +163,7 @@ def get_incremental_validation_data(shard_idx, slice_idx, shard_metadatas, valid
 def get_gating_routed_validation_data(gating_model, x_val, y_val, target_shard_idx, 
                                       cumulative_classes, dataset_mean, dataset_std, 
                                       confidence_threshold=0.6):
-    """
-    Use pre-trained gating network to intelligently route validation samples to appropriate shard.
-    This provides more targeted validation than simple class filtering.
-    
-    Args:
-        gating_model: Pre-trained gating network (set to None to fall back to standard method)
-        x_val, y_val: Full validation dataset
-        target_shard_idx: Which shard we want validation samples for
-        cumulative_classes: Classes that should be known up to current slice
-        dataset_mean, dataset_std: Normalization parameters
-        confidence_threshold: Minimum confidence for gating routing decision
-    
-    Returns:
-        Intelligently routed validation samples for the target shard
-    """
+
     if gating_model is None:
         # Use standard class filtering if gating network unavailable
         val_mask = np.isin(y_val, cumulative_classes)
@@ -233,9 +207,7 @@ def get_gating_routed_validation_data(gating_model, x_val, y_val, target_shard_i
     return x_val_final, y_val_final
 
 def get_true_label_validation_data(shard_idx, cumulative_classes, validation_data):
-    """
-    Filter validation data using true labels to route to the correct shard.
-    """
+
     x_val, y_val = validation_data
     
     # Load shard metadata to get which classes this shard handles
@@ -257,92 +229,6 @@ def get_true_label_validation_data(shard_idx, cumulative_classes, validation_dat
     print(f"   Validation: {len(valid_classes_for_shard)} classes, {len(x_val_filtered)} samples")
     
     return x_val_filtered, y_val_filtered
-
-def evaluate_slice_incrementally(model, shard_idx, slice_idx, shard_metadatas, test_data, class_names, gating_model=None, all_shard_models=None):
-    """
-    Evaluate a specific slice model against only the classes it should know.
-    Uses gating network if provided, otherwise direct model evaluation.
-    
-    Args:
-        model: trained model for this slice
-        shard_idx: 0-based shard index
-        slice_idx: 0-based slice index
-        shard_metadatas: loaded shard metadata
-        test_data: tuple of (x_test, y_test)
-        class_names: list of all class names
-        gating_model: optional gating model for SISA evaluation
-        all_shard_models: optional list of all shard models
-    
-    Returns:
-        Accuracy on known classes for this slice
-    """
-    x_test, y_test = test_data
-    
-    # Get classes that should be known at this slice
-    known_classes = get_cumulative_classes_up_to_slice(shard_idx, slice_idx)
-    
-    # Filter test data to only include known classes
-    test_mask = np.isin(y_test, known_classes)
-    x_test_filtered = x_test[test_mask]
-    y_test_filtered = y_test[test_mask]
-    
-    if len(x_test_filtered) == 0:
-        print(f"   No test samples for slice {slice_idx+1} classes")
-        return 0.0
-    
-    # Use gating network evaluation if available
-    if gating_model is not None and all_shard_models is not None:
-        # Use the provided shard models list
-        shard_models_for_eval = all_shard_models
-        
-        # Set models to eval mode
-        for m in shard_models_for_eval:
-            if m is not None:
-                m.eval()
-        gating_model.eval()
-        
-        all_preds = []
-        batch_size = config.BATCH_SIZE
-        with torch.no_grad():
-            for i in range(0, len(x_test_filtered), batch_size):
-                batch_x = torch.from_numpy(x_test_filtered[i:i+batch_size]).float()
-                batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
-                
-                # Use SISA gating evaluation
-                batch_preds, _ = _run_sisa_batch(
-                    batch_x_normalized, shard_models_for_eval, gating_model, class_names,
-                    threshold=None
-                )
-                all_preds.extend(batch_preds.cpu().numpy())
-        
-        all_preds = np.array(all_preds)
-        correct = np.sum(all_preds == y_test_filtered)
-        total = len(y_test_filtered)
-    else:
-        # Use direct model evaluation
-        model.eval()
-        correct = 0
-        total = len(x_test_filtered)
-        
-        batch_size = config.BATCH_SIZE
-        with torch.no_grad():
-            for i in range(0, total, batch_size):
-                batch_x = torch.from_numpy(x_test_filtered[i:i+batch_size]).float()
-                batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
-                batch_y = y_test_filtered[i:i+batch_size]
-                
-                outputs = model(batch_x_normalized)
-                _, predicted = torch.max(outputs, 1)
-                correct += (predicted.cpu().numpy() == batch_y).sum()
-    
-    accuracy = correct / total
-    known_class_names = [class_names[idx] for idx in known_classes]
-    
-    eval_method = "gating network" if gating_model is not None else "direct model"
-    print(f"   Slice {slice_idx + 1} incremental test accuracy ({eval_method}): {accuracy:.4f} "
-          f"({correct}/{total}) on classes {known_class_names}")
-    
-    return accuracy
 
 def evaluate_with_gating_network(shard_models, gating_model, class_names, threshold=None):
     print("\n" + "="*20 + " Final SISA System Evaluation " + "="*20)
@@ -393,17 +279,7 @@ def evaluate_with_gating_network(shard_models, gating_model, class_names, thresh
     return final_accuracy, final_accuracy
 
 def check_class_balance_and_augmentation(shard_idx, class_names):
-    """
-    Check class balance in a shard and determine if augmentation is needed.
-    Returns augmentation settings based on balance analysis.
-    
-    Args:
-        shard_idx: 0-based shard index
-        class_names: List of all class names
-        
-    Returns:
-        dict: Augmentation configuration with conservative settings
-    """
+
     print(f"\n--- Checking Class Balance for Shard {shard_idx+1} ---")
     
     # Load all slice data for this shard
@@ -638,16 +514,8 @@ if __name__ == "__main__":
                            np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy")))
                 # Prepare shard models for gating evaluation
                 shard_models_for_eval = [None] * config.NUM_SHARDS  # Initialize with None for all shards
-                # Copy available final models
-                for idx, model in enumerate(all_shard_final_models):
-                    if idx < config.NUM_SHARDS:
-                        shard_models_for_eval[idx] = model
-                # Set current model for this shard
-                shard_models_for_eval[i] = current_model
-                slice_test_accuracy = evaluate_slice_incrementally(
-                    current_model, i, j, shard_metadatas, test_data, class_names,
-                    gating_model=gating_model, all_shard_models=shard_models_for_eval
-                )
+                # REMOVED: slice-level evaluation violates SISA architecture
+                # Slices are internal data partitions - only final shard model should be evaluated
                 
                 # Generate visualizations for the last slice of each shard
                 if j == num_slices - 1:  # Last slice

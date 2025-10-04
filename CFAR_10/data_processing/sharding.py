@@ -2,10 +2,7 @@ import numpy as np
 from collections import Counter
 
 def create_shards_with_indices(X, y, part_number, class_names=None):
-    """
-    Divides a dataset into shards using a class isolation strategy to ensure
-    no single class is split across multiple shards.
-    """
+
     if part_number <= 0:
         raise ValueError("part_number must be positive")
     
@@ -16,10 +13,7 @@ def create_shards_with_indices(X, y, part_number, class_names=None):
     return _create_class_isolated_shards(X, y, train_indices, part_number, class_names)
 
 def _create_class_isolated_shards(X, y, indices, part_number, class_names):
-    """
-    Assigns whole classes to shards using adaptive threshold-based algorithm
-    to prevent extreme shard imbalances while maintaining class isolation.
-    """
+
     # Mathematical parameters from data_process.txt analysis
     ALPHA = 5.0  # Imbalance threshold multiplier
     BETA = 0.6   # Max shard fraction per class
@@ -52,10 +46,10 @@ def _create_class_isolated_shards(X, y, indices, part_number, class_names):
         
         # Apply adaptive threshold formula
         if class_fraction > BETA:  # Class is too large for single shard
-            print(f"   ⚠️  Class '{class_name}' has {class_fraction:.2%} of data (>{BETA:.0%}) - considering for splitting")
+            print(f"     Class '{class_name}' has {class_fraction:.2%} of data (>{BETA:.0%}) - considering for splitting")
             classes_to_split.append(class_idx)
         else:
-            print(f"   ✅ Class '{class_name}': {class_fraction:.2%} of data (acceptable)")
+            print(f"    Class '{class_name}': {class_fraction:.2%} of data (acceptable)")
     
     # 3. Smart class assignment with load balancing
     shards_content = [[] for _ in range(part_number)]
@@ -85,14 +79,14 @@ def _create_class_isolated_shards(X, y, indices, part_number, class_names):
         shards_content[target_shard_idx].append(class_idx)
         shard_sizes[target_shard_idx] += class_count
         
-        print(f"   ➡️  Assigned '{class_name}' ({class_count} samples) to Shard {target_shard_idx + 1}")
+        print(f"    Assigned '{class_name}' ({class_count} samples) to Shard {target_shard_idx + 1}")
         
         # Check balance after assignment
         if shard_sizes.max() / (shard_sizes[shard_sizes > 0].min() + 1e-6) > MAX_IMBALANCE_RATIO:
-            print(f"   ⚠️  Warning: Shard imbalance ratio is {shard_sizes.max() / shard_sizes[shard_sizes > 0].min():.2f}x")
+            print(f"    Warning: Shard imbalance ratio is {shard_sizes.max() / shard_sizes[shard_sizes > 0].min():.2f}x")
     
     # 4. Display final shard balance analysis
-    print(f"\n📊 Final Shard Balance Analysis:")
+    print(f"\n Final Shard Balance Analysis:")
     for i, size in enumerate(shard_sizes):
         if size > 0:
             print(f"   Shard {i + 1}: {size:,} samples ({size/total_samples:.1%})")
@@ -100,9 +94,9 @@ def _create_class_isolated_shards(X, y, indices, part_number, class_names):
     if shard_sizes.max() > 0 and shard_sizes[shard_sizes > 0].min() > 0:
         final_ratio = shard_sizes.max() / shard_sizes[shard_sizes > 0].min()
         if final_ratio <= MAX_IMBALANCE_RATIO:
-            print(f"   ✅ Balance ratio: {final_ratio:.2f}x (acceptable)")
+            print(f"    Balance ratio: {final_ratio:.2f}x (acceptable)")
         else:
-            print(f"   ⚠️  Balance ratio: {final_ratio:.2f}x (may cause training inefficiencies)")
+            print(f"    Balance ratio: {final_ratio:.2f}x (may cause training inefficiencies)")
 
     # 5. Build the final shards from the class assignments
     final_shards = []
@@ -142,7 +136,7 @@ def _create_class_isolated_shards(X, y, indices, part_number, class_names):
         }
     }
     
-    print("✅ Adaptive threshold-based sharding completed with load balancing.")
+    print(" Adaptive threshold-based sharding completed with load balancing.")
     return final_shards, final_y_shards, final_index_shards, class_distributions, split_info
 
 
@@ -180,38 +174,3 @@ def _apply_asymmetric_splitting(class_idx, class_data, shards_content, shard_siz
     # For now, we maintain full class isolation as per SISA principles
     
     return target_shard
-
-    # 3. Build the final shards from the class assignments
-    final_shards = []
-    final_y_shards = []
-    final_index_shards = []
-    class_distributions = []
-
-    for shard_idx in range(part_number):
-        classes_in_shard = shards_content[shard_idx]
-        
-        if not classes_in_shard: continue # Skip empty shards
-        
-        # Collect all data for the classes assigned to this shard
-        shard_X_parts = [class_data[c]['X'] for c in classes_in_shard]
-        shard_y_parts = [class_data[c]['y'] for c in classes_in_shard]
-        shard_indices_parts = [class_data[c]['indices'] for c in classes_in_shard]
-        
-        # Concatenate parts into a single shard
-        final_shards.append(np.vstack(shard_X_parts))
-        final_y_shards.append(np.concatenate(shard_y_parts))
-        final_index_shards.append(np.concatenate(shard_indices_parts))
-        
-        # Calculate final class distribution for this shard
-        class_counts = Counter(final_y_shards[-1])
-        class_dist = {class_names[k]: v for k, v in class_counts.items()}
-        class_distributions.append(class_dist)
-        
-    split_info = {
-        'sharding_strategy': 'class_isolation',
-        'assignment_strategy': 'greedy_balancing',
-        'data_structure': 'Sharded with class isolation'
-    }
-    
-    print("Class-isolated sharding completed.")
-    return final_shards, final_y_shards, final_index_shards, class_distributions, split_info

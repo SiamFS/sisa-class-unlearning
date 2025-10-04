@@ -14,23 +14,7 @@ import config
 from training.create_model import create_gating_model, save_model_pytorch, DEVICE
 
 def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, excluded_classes=None):
-    """
-    Trains the Gating Network to predict which shard should handle a given image.
-    
-    PRIVACY DESIGN: The gating network is a shard router that only knows about shard indices (0, 1, 2, ...),
-    NOT about class labels. This ensures that:
-    1. Even if someone obtains the gating model, they cannot determine which classes exist
-    2. The gating model cannot leak information about specific classes
-    3. Only the shard indices are exposed, maintaining SISA isolation principles
-    
-    Args:
-        num_shards: Number of shards in SISA framework
-        base_dir: Base directory of the project
-        num_slices: Number of slices per shard
-        dataset_mean: Mean for normalization
-        dataset_std: Std deviation for normalization
-        excluded_classes: List of class indices that have been unlearned (to exclude from training)
-    """
+
     # Basic augmentation to prevent overfitting
     train_transforms = T.Compose([
         T.RandomHorizontalFlip(p=0.5),  # Only horizontal flip

@@ -33,10 +33,9 @@ REPLAY_IMPORTANCE_WEIGHT = 0.7  # Weight for gradient-based importance
 REPLAY_TEMPORAL_WEIGHT = 0.3  # Weight for temporal decay
 MAX_REPLAY_SAMPLES_PER_CLASS = 1000  # Maximum samples per class in buffer  
 
-# Data Augmentation Parameters (No Random Erasing)
-# RANDOM_ERASING_PROB = 0.1  # REMOVED: No random erasing 
-# RANDOM_ERASING_SCALE = (0.02, 0.33)  # REMOVED: No random erasing
-LABEL_SMOOTHING = 0.05  # Conservative label smoothing
+
+
+LABEL_SMOOTHING = 0.15 # Increased from 0.05 to 0.15 - reduces suppression of unseen neurons for better unlearning AUC
 
 # Color Jitter Augmentation
 COLOR_JITTER_BRIGHTNESS = 0.2  

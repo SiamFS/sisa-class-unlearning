@@ -1,9 +1,3 @@
-"""Centralized plotting utilities for the SISA framework.
-
-This module houses visualization helpers that were previously scattered across
-the data-processing entrypoint. Keeping them here avoids circular imports and
-makes it easier to reuse visualizations from different stages of the pipeline.
-"""
 
 from __future__ import annotations
 
@@ -64,6 +58,7 @@ def _run_sisa_batch(
     gating_model: torch.nn.Module,
     class_names: List[str],
     threshold: Optional[float] = None,
+    unlearned_classes_set: set = None,
 ):
     """Execute SISA inference for a batch using TRUE gating routing (efficiency optimized)."""
     gating_logits = gating_model(batch_x_normalized)
@@ -93,6 +88,14 @@ def _run_sisa_batch(
         
         # Apply temperature scaling
         chosen_probs = _apply_temperature_tensor(specialist_probs.unsqueeze(0), config.PRIMARY_SPECIALIST_TEMPERATURE)[0]
+
+        # ZERO-OUT UNLEARNED CLASSES (True Unlearning)
+        if unlearned_classes_set:
+            unlearned_indices = torch.tensor(list(unlearned_classes_set), dtype=torch.long, device=DEVICE)
+            chosen_probs[unlearned_indices] = 0
+            # Re-normalize probabilities
+            chosen_probs = _normalize_probabilities_tensor(chosen_probs)
+            
         final_pred = torch.argmax(chosen_probs).item()
 
         # Apply confidence thresholding if specified
@@ -207,18 +210,35 @@ def create_shard_distribution_visualization(
 			class_counts[cls] = count
 		shard_class_counts.append(class_counts)
 
-	fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+	# Calculate layout based on number of shards
+	# First row: always needs 2 plots for overview (stacked bar + samples per shard)
+	# Subsequent rows: individual shard plots (arrange dynamically)
+	overview_cols = 2  # Always need 2 columns for overview plots
+	shard_cols = min(3, max(1, num_shards))  # Max 3 columns for shard plots, min 1
+	cols = max(overview_cols, shard_cols)  # Use the larger of the two
+	rows = 1 + ((num_shards - 1) // shard_cols + 1)  # 1 row for overview, then shard rows
+	
+	fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
+	
+	# Ensure axes is always 2D for consistent indexing
+	if rows == 1 and cols == 1:
+		axes = axes.reshape(1, 1)
+	elif rows == 1:
+		axes = axes.reshape(1, -1)
+	elif cols == 1:
+		axes = axes.reshape(-1, 1)
 
+	# First overview plot: stacked bar chart
 	ax1 = axes[0, 0]
 	x_pos = np.arange(len(class_names))
-	width = 0.35
+	width = 0.6
+	colors = plt.cm.Set3(np.linspace(0, 1, num_shards))
 
+	bottom = np.zeros(len(class_names))
 	for shard_idx in range(num_shards):
-		if shard_idx == 0:
-			ax1.bar(x_pos, shard_class_counts[shard_idx], width, label=f"Shard {shard_idx + 1}", alpha=0.8)
-		else:
-			bottom = shard_class_counts[0] if shard_idx == 1 else None
-			ax1.bar(x_pos, shard_class_counts[shard_idx], width, bottom=bottom, label=f"Shard {shard_idx + 1}", alpha=0.8)
+		ax1.bar(x_pos, shard_class_counts[shard_idx], width, bottom=bottom, 
+		        label=f"Shard {shard_idx + 1}", alpha=0.8, color=colors[shard_idx])
+		bottom += shard_class_counts[shard_idx]
 
 	ax1.set_xlabel("Classes")
 	ax1.set_ylabel("Sample Count")
@@ -228,9 +248,9 @@ def create_shard_distribution_visualization(
 	ax1.legend()
 	ax1.grid(True, alpha=0.3)
 
+	# Second overview plot: samples per shard
 	ax2 = axes[0, 1]
 	shard_labels = [f"Shard {i + 1}" for i in range(num_shards)]
-	colors = plt.cm.Set3(np.linspace(0, 1, num_shards))
 
 	bars = ax2.bar(shard_labels, shard_total_samples, color=colors, alpha=0.8)
 	ax2.set_ylabel("Total Samples")
@@ -240,8 +260,15 @@ def create_shard_distribution_visualization(
 	for bar, count in zip(bars, shard_total_samples):
 		ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 50, str(count), ha="center", va="bottom", fontweight="bold")
 
-	for shard_idx in range(min(2, num_shards)):
-		ax = axes[1, shard_idx]
+	# Hide unused subplots in first row (overview row)
+	for col_idx in range(2, cols):
+		axes[0, col_idx].axis('off')
+
+	# Individual shard plots - now displays ALL shards dynamically
+	for shard_idx in range(num_shards):
+		row = 1 + (shard_idx // shard_cols)
+		col = shard_idx % shard_cols
+		ax = axes[row, col]
 
 		ax.bar(range(len(class_names)), shard_class_counts[shard_idx], color=colors[shard_idx], alpha=0.8)
 		ax.set_xlabel("Classes")
@@ -250,6 +277,14 @@ def create_shard_distribution_visualization(
 		ax.set_xticks(range(len(class_names)))
 		ax.set_xticklabels(class_names, rotation=45, ha="right")
 		ax.grid(True, alpha=0.3)
+
+	# Hide any unused subplots in the individual shard rows
+	for shard_idx in range(num_shards, rows * shard_cols):
+		if shard_idx >= num_shards:
+			row = 1 + (shard_idx // shard_cols)
+			col = shard_idx % shard_cols
+			if row < rows and col < cols:
+				axes[row, col].axis('off')
 
 	plt.tight_layout()
 	save_path = os.path.join(save_dir, "shard_class_distribution.png")
@@ -1154,21 +1189,7 @@ def create_gating_routing_barplots(gating_model, x_data, y_data, class_names, sa
 
 
 def create_overall_sisa_roc_curve(shard_models, gating_model, x_test, y_test, class_names, save_dir, training_type='training', unlearned_classes=None):
-    """Create overall ROC curves for the complete SISA system.
-    
-    Args:
-        shard_models: List of trained shard models
-        gating_model: The trained gating model  
-        x_test: Test data features
-        y_test: Test data labels
-        class_names: List of class names
-        save_dir: Directory to save the ROC curve
-        training_type: Type of training ('training' or 'unlearning')
-        unlearned_classes: List of class indices that have been unlearned (only used for unlearning)
-    
-    Returns:
-        str: Path to the saved ROC curve image
-    """
+
     print("   Creating overall SISA system ROC curve...")
 
     dataset_mean, dataset_std = _get_dataset_normalization()
@@ -1206,9 +1227,26 @@ def create_overall_sisa_roc_curve(shard_models, gating_model, x_test, y_test, cl
         y_true_filtered = all_labels
         y_probs_filtered = all_probs
         filtered_classes = list(range(len(class_names)))
+        active_class_names = class_names  # All classes for training
         print(f"   Using all {len(class_names)} classes for training ROC")
+    elif training_type == 'with_deleted_classes':
+        # SPECIAL CASE: Show ALL classes including deleted ones
+        # This demonstrates unlearning effectiveness (deleted classes will have poor AUC)
+        # CRITICAL: Don't filter anything - use FULL class range to match confusion matrix
+        y_true_filtered = all_labels
+        y_probs_filtered = all_probs
+        
+        # Use ALL class indices (0 to len(class_names)-1) regardless of what's in test set
+        # This ensures consistency with confusion matrix which shows all classes
+        filtered_classes = list(range(len(class_names)))
+        active_class_names = class_names  # All classes including deleted
+        
+        print(f"   Using ALL {len(class_names)} classes (INCLUDING deleted) to show unlearning effect")
+        if unlearned_classes:
+            deleted_names = [class_names[i] for i in unlearned_classes if i < len(class_names)]
+            print(f"   Deleted classes (will show poor performance): {deleted_names}")
     else:
-        # For unlearning, exclude unlearned classes from ROC computation
+        # For unlearning evaluation, exclude deleted classes from ROC computation
         if unlearned_classes is None:
             unlearned_classes = []
         
@@ -1218,16 +1256,22 @@ def create_overall_sisa_roc_curve(shard_models, gating_model, x_test, y_test, cl
         # Only include classes that have samples in the test set
         filtered_classes = [i for i in potential_classes if i in unique_labels_in_test]
         
+        # CRITICAL: Filter class_names to only show active classes in plot
+        active_class_names = [class_names[i] for i in filtered_classes]
+        
         y_true_filtered = all_labels
         y_probs_filtered = all_probs
-        print(f"   Using {len(filtered_classes)} classes for unlearning ROC (excluding {len(unlearned_classes)} unlearned classes)")
+        print(f"   Using {len(filtered_classes)} active classes for ROC (excluding {len(unlearned_classes)} unlearned classes)")
         if unlearned_classes:
             excluded_names = [class_names[i] for i in unlearned_classes]
             print(f"   Excluded classes: {excluded_names}")
-        print(f"   Classes with test samples: {[class_names[i] for i in filtered_classes]}")
+        print(f"   Active classes: {active_class_names}")
     
     # Binarize labels for multiclass ROC
     y_true_bin = label_binarize(y_true_filtered, classes=filtered_classes)
+    
+    # Get unique labels actually present in test set for validation
+    unique_labels_in_test = np.unique(y_true_filtered)
     
     # Calculate ROC curve for each class with interpolation for smoother curves
     fpr = {}
@@ -1235,6 +1279,11 @@ def create_overall_sisa_roc_curve(shard_models, gating_model, x_test, y_test, cl
     roc_auc = {}
     
     for i, class_idx in enumerate(filtered_classes):
+        # Skip classes that have no samples in test set (can't calculate ROC)
+        if class_idx not in unique_labels_in_test:
+            print(f"   Skipping class {class_names[class_idx]} (no samples in test set)")
+            continue
+            
         if i < y_probs_filtered.shape[1] and i < y_true_bin.shape[1]:
             # Get raw ROC curve
             fpr_raw, tpr_raw, thresholds = roc_curve(y_true_bin[:, i], y_probs_filtered[:, class_idx])
@@ -1256,11 +1305,19 @@ def create_overall_sisa_roc_curve(shard_models, gating_model, x_test, y_test, cl
     plt.figure(figsize=(12, 10))
     colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
     
+    # Use appropriate class names for legend
+    display_class_names = active_class_names if training_type not in ['training', 'with_deleted_classes'] else class_names
+    
     for i, class_idx in enumerate(filtered_classes):
         if class_idx in fpr and class_idx in tpr:
             color = colors[i % len(colors)]
+            # For active_classes_only, use the filtered list index
+            if training_type not in ['training', 'with_deleted_classes']:
+                label_name = display_class_names[i]
+            else:
+                label_name = class_names[class_idx]
             plt.plot(fpr[class_idx], tpr[class_idx], color=color, linewidth=2,
-                    label=f'{class_names[class_idx]} (AUC = {roc_auc[class_idx]:.3f})')
+                    label=f'{label_name} (AUC = {roc_auc[class_idx]:.3f})')
     
     # Plot diagonal line
     plt.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5)
@@ -1284,16 +1341,7 @@ def create_overall_sisa_roc_curve(shard_models, gating_model, x_test, y_test, cl
 
 
 def create_overall_sisa_training_curves(all_shard_histories, save_dir, training_type='training'):
-    """Create overall training curves combining all shard training histories.
-    
-    Args:
-        all_shard_histories: List of training histories for all shards
-        save_dir: Directory to save the training curves
-        training_type: Type of training ('training' or 'unlearning')
-    
-    Returns:
-        str: Path to the saved training curves image
-    """
+
     print("   Creating overall SISA system training curves...")
     
     # Combine all shard histories
@@ -1396,19 +1444,7 @@ def create_overall_sisa_training_curves(all_shard_histories, save_dir, training_
 
 
 def create_overall_sisa_confusion_matrix(shard_models, gating_model, x_test, y_test, class_names, save_dir, training_type='training', unlearned_classes=None):
-    """Create overall confusion matrix for the complete SISA system using the same evaluation logic.
-    
-    Args:
-        shard_models: List of trained shard models
-        gating_model: The trained gating model
-        x_test: Test data features
-        y_test: Test data labels
-        class_names: List of class names
-        save_dir: Directory to save the confusion matrix
-        training_type: Type of evaluation (e.g., 'training', 'final')
-        unlearned_classes: List of class indices that have been unlearned (will be excluded)
-    """
-    
+
     print("   Creating overall SISA system confusion matrix (using same logic as evaluation)...")
     
     dataset_mean, dataset_std = _get_dataset_normalization()
@@ -1442,8 +1478,16 @@ def create_overall_sisa_confusion_matrix(shard_models, gating_model, x_test, y_t
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
     
-    # Filter out unlearned classes from evaluation (they should not appear in confusion matrix)
-    if unlearned_classes is not None and len(unlearned_classes) > 0:
+    # Handle filtering based on training_type
+    if training_type == 'with_deleted_classes':
+        # SPECIAL CASE: Keep ALL classes including deleted to show unlearning effect
+        print(f"   Showing ALL classes (INCLUDING deleted) in confusion matrix")
+        if unlearned_classes:
+            deleted_names = [class_names[i] for i in unlearned_classes if i < len(class_names)]
+            print(f"   Deleted classes (will show 0% accuracy): {deleted_names}")
+        # Don't filter anything - keep all samples
+    elif unlearned_classes is not None and len(unlearned_classes) > 0:
+        # Filter out unlearned classes from evaluation (active classes only)
         print(f"   Filtering out unlearned classes: {[class_names[i] for i in unlearned_classes if i < len(class_names)]}")
         
         # Keep only samples that don't belong to unlearned classes
@@ -1543,15 +1587,7 @@ def create_overall_sisa_confusion_matrix(shard_models, gating_model, x_test, y_t
 
 
 def create_accuracy_comparison_chart(training_accuracy, unlearning_accuracy, unlearned_class, save_dir):
-    """
-    Create bar chart comparing training vs unlearning accuracy after class removal.
-    
-    Args:
-        training_accuracy: Original training accuracy
-        unlearning_accuracy: Accuracy after unlearning
-        unlearned_class: Name of the class that was unlearned
-        save_dir: Directory to save the chart
-    """
+
     print("   Creating accuracy comparison chart...")
     
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -1562,20 +1598,24 @@ def create_accuracy_comparison_chart(training_accuracy, unlearning_accuracy, unl
     
     bars = ax.bar(categories, accuracies, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
     
-    # Add accuracy values on top of bars
-    for i, (bar, acc) in enumerate(zip(bars, accuracies)):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height + 0.005,
-                f'{acc:.1%}', ha='center', va='bottom', fontsize=12, fontweight='bold')
+    # No value labels - bars speak for themselves
     
     ax.set_ylabel('Accuracy', fontsize=12)
     ax.set_title('SISA System Accuracy: Training vs Unlearning', fontsize=14, fontweight='bold')
     ax.set_ylim(0, min(1.0, max(accuracies) * 1.15))
     ax.grid(True, alpha=0.3, axis='y')
     
-    # Add accuracy difference annotation
+    # Add accuracy difference annotation - handle both increase and decrease
     diff = training_accuracy - unlearning_accuracy
-    ax.annotate(f'Accuracy Drop: {diff:.1%}', 
+    if diff > 0:
+        # Accuracy dropped
+        label_text = f'Accuracy Drop: {abs(diff):.1%}'
+    else:
+        # Accuracy increased (rare but possible)
+        label_text = f'Accuracy Increase: {abs(diff):.1%}'
+    
+    # Use same color for both cases
+    ax.annotate(label_text, 
                 xy=(0.5, max(accuracies) * 0.5), 
                 xycoords='axes fraction',
                 ha='center', va='center',
@@ -1594,16 +1634,7 @@ def create_accuracy_comparison_chart(training_accuracy, unlearning_accuracy, unl
 
 
 def create_time_comparison_chart(gating_training_time, base_model_time, unlearning_total_time, retraining_time, save_dir):
-    """
-    Create bar chart showing actual raw timing breakdown (NO plotting time included).
-    
-    Args:
-        gating_training_time: Gating network training time in seconds
-        base_model_time: Base model training time + evaluation in seconds
-        unlearning_total_time: Total unlearning time (find/remove + retrain + evaluation) in seconds
-        retraining_time: Just the model retraining time + evaluation in seconds
-        save_dir: Directory to save the chart
-    """
+
     print("   Creating time comparison chart with real timing data...")
     
     # Debug: Print the actual values
@@ -1636,11 +1667,7 @@ def create_time_comparison_chart(gating_training_time, base_model_time, unlearni
     
     bars = ax.bar(categories, times, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
     
-    # Add time values on top of bars
-    for i, (bar, time_val) in enumerate(zip(bars, times)):
-        height = bar.get_height()
-        ax.text(bar.get_x() + bar.get_width()/2., height + max(times) * 0.01,
-                f'{time_val:.1f}s', ha='center', va='bottom', fontsize=12, fontweight='bold')
+    # No value labels - bars speak for themselves
     
     ax.set_ylabel('Time (seconds)', fontsize=12)
     ax.set_title('SISA System Real Time Breakdown', fontsize=14, fontweight='bold')
@@ -1673,20 +1700,7 @@ def create_time_comparison_chart(gating_training_time, base_model_time, unlearni
 
 
 def create_pure_training_time_chart(gating_training_time, base_model_training_time, find_delete_time, retraining_time_only, save_dir):
-    """
-    Create bar chart showing ONLY raw training times (NO evaluation time included).
-    This shows pure model training operations:
-    1) Gating Network Training (model training only)
-    2) Base Model Training (all shards, model training only, no incremental evaluations)
-    3) Unlearning Operations (Find + Delete + Retraining combined as ONE bar)
-    
-    Args:
-        gating_training_time: Pure gating network training time in seconds (no eval)
-        base_model_training_time: Pure base model training time in seconds (no eval)
-        find_delete_time: Time to find and delete samples from shards in seconds
-        retraining_time_only: Pure retraining time in seconds (no eval)
-        save_dir: Directory to save the chart
-    """
+
     print("   Creating PURE training time comparison chart (no evaluation time)...")
     
     # Combine Find+Delete+Retrain into single "Unlearning Operations" value
@@ -1766,16 +1780,7 @@ def create_pure_training_time_chart(gating_training_time, base_model_training_ti
 
 
 def create_classification_metrics_comparison_chart(training_report, unlearning_report, unlearned_class, save_dir):
-    """
-    Create grouped bar chart comparing classification metrics (precision, recall, f1-score) 
-    for each class between training and unlearning phases.
-    
-    Args:
-        training_report: Classification report dict from training phase
-        unlearning_report: Classification report dict from unlearning phase  
-        unlearned_class: Name of the class that was unlearned
-        save_dir: Directory to save the chart
-    """
+
     print("   Creating classification metrics comparison chart...")
     
     # Extract class names and metrics
@@ -1787,27 +1792,24 @@ def create_classification_metrics_comparison_chart(training_report, unlearning_r
     unlearning_recall = []
     unlearning_f1 = []
     
-    # Get common classes (exclude unlearned class from unlearning metrics)
+    # Get common classes - show ACTUAL model predictions (no fake zeros)
     for class_name in training_report.keys():
         if class_name not in ['accuracy', 'macro avg', 'weighted avg', 'micro avg']:
+            # Only add classes that exist in BOTH reports (no fake data)
+            if class_name not in unlearning_report:
+                print(f"   Warning: Class '{class_name}' not in unlearning report, skipping")
+                continue
+                
             class_names.append(class_name)
             training_precision.append(training_report[class_name]['precision'])
             training_recall.append(training_report[class_name]['recall'])
             training_f1.append(training_report[class_name]['f1-score'])
             
-            # For unlearning, use 0 for unlearned class, otherwise get from report
-            if class_name == unlearned_class:
-                unlearning_precision.append(0.0)
-                unlearning_recall.append(0.0)
-                unlearning_f1.append(0.0)
-            elif class_name in unlearning_report:
-                unlearning_precision.append(unlearning_report[class_name]['precision'])
-                unlearning_recall.append(unlearning_report[class_name]['recall'])
-                unlearning_f1.append(unlearning_report[class_name]['f1-score'])
-            else:
-                unlearning_precision.append(0.0)
-                unlearning_recall.append(0.0)
-                unlearning_f1.append(0.0)
+            # Use ACTUAL RAW model predictions from unlearning_report (including deleted classes)
+            # Model naturally produces low metrics after unlearning - show TRUE behavior
+            unlearning_precision.append(unlearning_report[class_name]['precision'])
+            unlearning_recall.append(unlearning_report[class_name]['recall'])
+            unlearning_f1.append(unlearning_report[class_name]['f1-score'])
     
     # Set up the plot with more spacing to avoid text overlap
     fig, axes = plt.subplots(3, 1, figsize=(16, 14))
@@ -1831,13 +1833,7 @@ def create_classification_metrics_comparison_chart(training_report, unlearning_r
         bars1 = ax.bar(x - width/2, training_vals, width, label='Training', color=colors[0], alpha=0.8, edgecolor='black', linewidth=1)
         bars2 = ax.bar(x + width/2, unlearning_vals, width, label='Unlearning', color=colors[1], alpha=0.8, edgecolor='black', linewidth=1)
         
-        # Add value labels on bars with better positioning
-        for bars, vals in [(bars1, training_vals), (bars2, unlearning_vals)]:
-            for bar, val in zip(bars, vals):
-                height = bar.get_height()
-                if height > 0:
-                    ax.text(bar.get_x() + bar.get_width()/2., height + 0.015,
-                            f'{val:.3f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+        # No value labels - bars speak for themselves
         
         ax.set_ylabel(metric_name, fontsize=13, fontweight='bold')
         ax.set_title(f'{metric_name} by Class', fontsize=14, fontweight='bold', pad=15)
@@ -1861,14 +1857,7 @@ def create_classification_metrics_comparison_chart(training_report, unlearning_r
 
 
 def create_efficiency_metrics_chart(save_dir, training_type='optimization'):
-    """
-    Create a comprehensive efficiency metrics visualization showing the performance improvements
-    from TRUE gating routing, O(1) filtering, and metadata caching optimizations.
-    
-    Args:
-        save_dir: Directory to save the chart
-        training_type: Type identifier for the chart filename
-    """
+
     print("   Creating efficiency metrics comparison chart...")
     
     # Performance data from our optimizations
