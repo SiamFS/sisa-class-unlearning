@@ -154,9 +154,21 @@ def _run_sisa_batch(
         return final_preds, combined_probabilities
 
     if gating_model is not None and routing_mode != 'confidence':
-        combined_probabilities = _route_via_gating(
-            batch_x_normalized, shard_models, gating_model, shard_class_indices, num_classes
-        )
+        # W24: use the fitted gate/cosine blend when available. `fit_ensemble_params`
+        # attaches these after training; if it was never called (or the fit lost to the
+        # gate alone, in which case it stores alpha=1.0) this falls through to plain
+        # gate routing, so an unfitted gate can never be made worse by this path.
+        alpha = getattr(gating_model, 'ensemble_alpha', None)
+        temperature = getattr(gating_model, 'ensemble_temperature', None)
+        if routing_mode == 'ensemble' and alpha is not None and alpha < 1.0:
+            combined_probabilities = _route_via_ensemble(
+                batch_x_normalized, shard_models, gating_model, shard_class_indices,
+                num_classes, alpha, temperature,
+            )
+        else:
+            combined_probabilities = _route_via_gating(
+                batch_x_normalized, shard_models, gating_model, shard_class_indices, num_classes
+            )
         top_confidence, final_preds = combined_probabilities.max(dim=1)
         if threshold is not None:
             final_preds = torch.where(top_confidence >= threshold, final_preds, torch.full_like(final_preds, -1))
@@ -245,6 +257,125 @@ def _route_via_cosine(
     stacked_probs = torch.stack(per_shard_probs, dim=0)  # (num_shards, batch, num_classes)
     selector = winning_shard.view(1, batch_size, 1).expand(1, batch_size, num_classes)
     return stacked_probs.gather(0, selector).squeeze(0)
+
+
+def _shard_routing_cosines(
+    batch_x_normalized: torch.Tensor,
+    shard_models: List[torch.nn.Module],
+    shard_class_indices: List[List[int]],
+    num_classes: int,
+) -> torch.Tensor:
+    """Each shard's best cosine similarity to one of its owned class vectors, (batch, K)."""
+    batch_size = batch_x_normalized.size(0)
+    device = batch_x_normalized.device
+    scores = []
+    for shard_idx, model in enumerate(shard_models):
+        owned = sorted(shard_class_indices[shard_idx]) if shard_idx < len(shard_class_indices) else []
+        if model is None or not owned:
+            scores.append(torch.full((batch_size,), -float('inf'), device=device))
+            continue
+        with torch.no_grad():
+            cosines = model.routing_cosine(batch_x_normalized)
+        if cosines.shape[1] == num_classes:
+            cosines = cosines[:, owned]
+        scores.append(cosines.max(dim=1).values)
+    return torch.stack(scores, dim=1)
+
+
+def fit_ensemble_params(shard_models, gating_model, shard_class_indices, class_names,
+                        x_val, y_val, normalize, batch_size: int = 256):
+    """Fit the gate/cosine blend weights on VALIDATION data (W24).
+
+    The gate estimates P(shard|x) discriminatively; cosine-to-class-vector estimates it
+    generatively from each shard's own geometry. They err on different inputs, so the
+    log-linear blend
+
+        s_k(x) = alpha * log P_gate(k|x) + (1 - alpha) * log P_cos(k|x)
+
+    beats either alone (measured 94.63% -> 95.45% routing, 83.26% -> 84.07% combined).
+
+    `alpha` and the cosine temperature are fitted here rather than hardcoded because the
+    optimum moves with the gate's strength -- a full-resolution gate fits alpha ~= 0.40
+    while a downsampled one fits ~= 0.80, so a stale constant could make the ensemble
+    *worse* than the gate alone. Two scalars fitted on held-out validation, refit in
+    milliseconds after any retrain, so this adds nothing meaningful to unlearning cost.
+
+    The fitted values are attached to `gating_model`; `_run_sisa_batch` falls back to
+    plain gate routing if they are absent, so this is always safe to skip.
+    """
+    num_classes = len(class_names)
+    class_to_shard = {c: k for k, owned in enumerate(shard_class_indices) for c in owned}
+    keep = np.array([int(c) in class_to_shard for c in y_val])
+    if not keep.any():
+        return None
+    x_val, y_val = x_val[keep], y_val[keep]
+    true_shard = torch.tensor([class_to_shard[int(c)] for c in y_val], device=DEVICE)
+
+    gate_lp, cos_raw = [], []
+    for start in range(0, len(x_val), batch_size):
+        chunk = torch.from_numpy(x_val[start:start + batch_size].astype(np.float32))
+        chunk = normalize(chunk).to(DEVICE)
+        with torch.no_grad():
+            gate_lp.append(torch.log_softmax(gating_model(chunk), dim=1))
+        cos_raw.append(_shard_routing_cosines(chunk, shard_models, shard_class_indices, num_classes))
+    gate_lp = torch.cat(gate_lp)
+    cos_raw = torch.cat(cos_raw)
+
+    best = None
+    for temperature in (0.02, 0.05, 0.1, 0.2, 0.5):
+        cos_lp = torch.log_softmax(cos_raw / temperature, dim=1)
+        for alpha in np.arange(0.0, 1.01, 0.05):
+            acc = ((alpha * gate_lp + (1 - alpha) * cos_lp).argmax(dim=1) == true_shard).float().mean().item()
+            if best is None or acc > best[0]:
+                best = (acc, float(alpha), float(temperature))
+
+    acc, alpha, temperature = best
+    gate_only = (gate_lp.argmax(dim=1) == true_shard).float().mean().item()
+    # Never adopt a blend that is worse than the gate alone on validation.
+    if acc < gate_only:
+        alpha, temperature, acc = 1.0, 1.0, gate_only
+    gating_model.ensemble_alpha = alpha
+    gating_model.ensemble_temperature = temperature
+    print(f"   - Ensemble routing fitted on validation: alpha={alpha:.2f}, T={temperature} "
+          f"(val routing {acc*100:.2f}%, gate alone {gate_only*100:.2f}%)")
+    return alpha, temperature
+
+
+def _route_via_ensemble(
+    batch_x_normalized: torch.Tensor,
+    shard_models: List[torch.nn.Module],
+    gating_model: torch.nn.Module,
+    shard_class_indices: List[List[int]],
+    num_classes: int,
+    alpha: float,
+    temperature: float,
+) -> torch.Tensor:
+    """W24: route by the fitted gate/cosine blend, then use the winner's own softmax."""
+    batch_size = batch_x_normalized.size(0)
+    device = batch_x_normalized.device
+
+    with torch.no_grad():
+        gate_lp = torch.log_softmax(gating_model(batch_x_normalized), dim=1)
+    cos_raw = _shard_routing_cosines(batch_x_normalized, shard_models, shard_class_indices, num_classes)
+    cos_lp = torch.log_softmax(cos_raw / temperature, dim=1)
+    winning_shard = (alpha * gate_lp + (1 - alpha) * cos_lp).argmax(dim=1)
+
+    per_shard_probs = []
+    for shard_idx, model in enumerate(shard_models):
+        owned = sorted(shard_class_indices[shard_idx]) if shard_idx < len(shard_class_indices) else []
+        if model is None or not owned:
+            per_shard_probs.append(torch.zeros(batch_size, num_classes, device=device))
+            continue
+        with torch.no_grad():
+            logits = model(batch_x_normalized)
+        owned_logits = logits if logits.shape[1] != num_classes else logits[:, owned]
+        per_shard_probs.append(
+            _scatter_local_to_global(torch.softmax(owned_logits, dim=1), owned, num_classes, device)
+        )
+
+    stacked = torch.stack(per_shard_probs, dim=0)
+    selector = winning_shard.view(1, batch_size, 1).expand(1, batch_size, num_classes)
+    return stacked.gather(0, selector).squeeze(0)
 
 
 def _route_via_gating(

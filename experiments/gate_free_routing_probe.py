@@ -85,15 +85,25 @@ def _forward_all(models, x, normalize, batch_size=256):
     )
 
 
-def _gating_route(gating_model, x, normalize, batch_size=256):
-    """Reference only: the learned gate's shard choice for every sample."""
-    preds = []
+def _gating_logits(gating_model, x, normalize, batch_size=256):
+    """Raw gate logits over shards, (n_samples, num_shards)."""
+    out = []
     for start in range(0, len(x), batch_size):
         chunk = torch.from_numpy(x[start:start + batch_size].astype(np.float32))
         chunk = normalize(chunk).to(DEVICE)
         with torch.no_grad():
-            preds.append(gating_model(chunk).argmax(dim=1).cpu().numpy())
-    return np.concatenate(preds)
+            out.append(gating_model(chunk).cpu().numpy())
+    return np.concatenate(out)
+
+
+def _gating_route(gating_model, x, normalize, batch_size=256):
+    """Reference only: the learned gate's shard choice for every sample."""
+    return _gating_logits(gating_model, x, normalize, batch_size).argmax(axis=1)
+
+
+def _log_softmax(z, axis=-1):
+    z = z - z.max(axis=axis, keepdims=True)
+    return z - np.log(np.exp(z).sum(axis=axis, keepdims=True))
 
 
 def _softmax(z, axis=-1):
@@ -332,6 +342,99 @@ def main():
             for si in range(num_shards)
         ])
         results.append(("platt (2 params/shard)", *evaluate(p.argmax(axis=0)), "fitted"))
+
+    # --- W24: gate + cosine ensemble ----------------------------------------------
+    # The gate estimates P(shard|x) discriminatively; cosine-to-class-vector estimates
+    # it generatively via P(x|shard). They fail on different inputs, so a log-linear
+    # blend can beat either. alpha and the cosine temperature are fit on VALIDATION
+    # only -- fitting them on test would be tuning on the test set.
+    if gating_model is not None:
+        def cos_scores(feats_per_shard):
+            out = []
+            for si in range(num_shards):
+                w = models[si].fc_layer[5].weight.detach().cpu().numpy()
+                w = w[owned_sorted[si]] if w.shape[0] == len(class_names) else w
+                f = feats_per_shard[si]
+                fn_ = f / (np.linalg.norm(f, axis=1, keepdims=True) + 1e-12)
+                wn = w / (np.linalg.norm(w, axis=1, keepdims=True) + 1e-12)
+                out.append((fn_ @ wn.T).max(axis=1))
+            return np.stack(out, axis=1)  # (n, num_shards)
+
+        val_gate_lp = _log_softmax(_gating_logits(gating_model, x_val, normalize, args.batch_size), axis=1)
+        test_gate_lp = _log_softmax(_gating_logits(gating_model, x_test, normalize, args.batch_size), axis=1)
+        val_cos, test_cos = cos_scores(val_feats), cos_scores(test_feats)
+
+        best = None
+        for temp in (0.02, 0.05, 0.1, 0.2, 0.5):
+            v_cos_lp = _log_softmax(val_cos / temp, axis=1)
+            for alpha in np.arange(0.0, 1.01, 0.05):
+                acc = float(((alpha * val_gate_lp + (1 - alpha) * v_cos_lp).argmax(axis=1) == true_shard_val).mean())
+                if best is None or acc > best[0]:
+                    best = (acc, float(alpha), temp)
+
+        val_acc, alpha, temp = best
+        t_cos_lp = _log_softmax(test_cos / temp, axis=1)
+        choice = (alpha * test_gate_lp + (1 - alpha) * t_cos_lp).argmax(axis=1)
+        results.append((f"gate+cosine (a={alpha:.2f},T={temp})", *evaluate(choice), "ensemble"))
+        print(f"\n  Ensemble fit on validation: alpha={alpha:.2f}, T={temp} "
+              f"(val routing {val_acc*100:.2f}%)")
+
+    # --- W24b: GATE-FREE ensemble --------------------------------------------------
+    # Blend several parameter-free scores. They fail on different inputs (feature-space
+    # geometry vs. logit mass), so a weighted combination may beat any single one --
+    # and unlike the gate+cosine blend this uses NO learned router at all, so there is
+    # still nothing extra to unlearn. Weights are fit on VALIDATION only.
+    def _component_scores(feats, logits):
+        """Per-shard score matrices, (n_samples, num_shards), for each component."""
+        comp = {}
+        cos = []
+        for si in range(num_shards):
+            w = models[si].fc_layer[5].weight.detach().cpu().numpy()
+            w = w[owned_sorted[si]] if w.shape[0] == len(class_names) else w
+            f = feats[si]
+            fn_ = f / (np.linalg.norm(f, axis=1, keepdims=True) + 1e-12)
+            wn = w / (np.linalg.norm(w, axis=1, keepdims=True) + 1e-12)
+            cos.append((fn_ @ wn.T).max(axis=1))
+        comp['head_cosine'] = np.stack(cos, axis=1)
+        comp['energy_deb'] = np.stack(
+            [score_energy_debiased(_owned(logits[si], owned_sorted[si])) for si in range(num_shards)], axis=1)
+        comp['max_logit'] = np.stack(
+            [score_max_logit(_owned(logits[si], owned_sorted[si])) for si in range(num_shards)], axis=1)
+        comp['max_softmax'] = np.stack(
+            [score_max_softmax(_owned(logits[si], owned_sorted[si])) for si in range(num_shards)], axis=1)
+        return comp
+
+    val_comp = _component_scores(val_feats, val_logits)
+    test_comp = _component_scores(test_feats, test_logits)
+    names = list(val_comp.keys())
+
+    # Standardise each component per shard using validation stats, so components with
+    # different natural scales (cosine in [-1,1] vs. raw logits) are comparable.
+    stats = {n: (val_comp[n].mean(axis=0), val_comp[n].std(axis=0) + 1e-12) for n in names}
+    def z(comp, n):
+        mu, sd = stats[n]
+        return (comp[n] - mu) / sd
+
+    best_gf = None
+    grid = np.arange(0.0, 1.01, 0.1)
+    for w0 in grid:
+        for w1 in grid:
+            for w2 in grid:
+                w3 = 1.0 - w0 - w1 - w2
+                if w3 < -1e-9 or w3 > 1.0:
+                    continue
+                ws = [w0, w1, w2, max(0.0, w3)]
+                s = sum(ws[i] * z(val_comp, names[i]) for i in range(len(names)))
+                acc = float((s.argmax(axis=1) == true_shard_val).mean())
+                if best_gf is None or acc > best_gf[0]:
+                    best_gf = (acc, ws)
+
+    gf_val, ws = best_gf
+    s_test = sum(ws[i] * z(test_comp, names[i]) for i in range(len(names)))
+    label = "+".join(f"{names[i]}:{ws[i]:.1f}" for i in range(len(names)) if ws[i] > 0.001)
+    results.append((f"gate-free ensemble", *evaluate(s_test.argmax(axis=1)), "free"))
+    print(f"\n  Gate-free ensemble weights (fit on validation, val routing {gf_val*100:.2f}%):")
+    print(f"    {label}")
 
     # --- report -------------------------------------------------------------------
     print("\n" + "=" * 78)

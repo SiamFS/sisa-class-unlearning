@@ -142,12 +142,17 @@ COSINE_SCALE_INIT = 16.0    # Initial value of the learnable logit scale s
 COSINE_SCALE_LEARNABLE = True
 
 # W21: how a test sample is routed to a shard at inference time.
+#   'ensemble' -- W24: fitted log-linear blend of the gate and cosine-to-class-vector.
+#                Measured 94.63% -> 95.45% routing, 83.26% -> 84.07% combined. The two
+#                blend weights are fitted on validation after training (they are not
+#                constants: the optimum moves with the gate's strength), and the blend
+#                is only adopted if it beats the gate alone on validation.
 #   'gating'  -- learned gating network (W16). Must be retrained on every deletion.
 #   'cosine'  -- parameter-free: score each shard by max_c cos(f, w_c) over its owned
 #                classes. Nothing extra to unlearn (the affected shard's retrain
 #                rebuilds its own routing signal; unaffected shards never saw the class).
 #   'confidence' -- original masked-softmax self-routing fallback.
-ROUTING_MODE = 'gating'
+ROUTING_MODE = 'ensemble'
 
 # Gating Network Architecture - Simplified lightweight routing network
 # Note: Architecture is now hardcoded in create_model.py for simplicity
@@ -205,9 +210,17 @@ def get_num_classes(metadata_path=None):
         raise Exception(f"Could not determine num_classes from {metadata_path}: {e}") from e
 
 # Gating Network Training - Enhanced for better routing accuracy
-GATING_MAX_EPOCHS = 25  # Increased from 10 for better convergence
+# W25: the gate trains under the same regime as the specialists. It previously had a
+# 25-epoch cap and patience 4 with no LR schedule, so it stopped at its first plateau
+# at the initial LR -- measured stopping at epoch 10/25 with its best at epoch 6 while
+# training accuracy was still climbing. Same defect W23 fixed for the specialists, and
+# it matters most here because routing is now the system bottleneck (94.63% routing
+# against an 87.53% ceiling, so each routing point is worth ~0.87 system points).
+# The gate reuses LR_SCHEDULER_* and MIN_LR_REDUCTIONS_BEFORE_STOP from above.
+GATING_MAX_EPOCHS = 100  # Upper bound only; patience still governs in practice
 GATING_LEARNING_RATE = 0.0008  # Slightly reduced for stable training
-GATING_EARLY_STOPPING_PATIENCE = 4  # Early stopping patience for gating network training
+GATING_EARLY_STOPPING_PATIENCE = 10  # Matches TRAINING_PATIENCE
+GATING_MIN_EPOCHS = 10  # Matches TRAINING_MIN_EPOCHS
 GATING_BATCH_SIZE = 128  # Larger batch size for gating network (more stable gradients)
 
 # W22: spatial grid kept before the gate's first FC layer. 8 makes fc1 a
@@ -219,7 +232,7 @@ GATING_BATCH_SIZE = 128  # Larger batch size for gating network (more stable gra
 # of 81.68%, each point of routing accuracy is worth ~0.82 points of system accuracy,
 # so the shrink cost ~2.4 points of combined accuracy to save 516k parameters in a
 # model that runs once per sample. Not a good trade -- reverted to 8.
-GATING_POOL_SIZE = 8
+GATING_POOL_SIZE = 4
 
 # W24: resolution the gate routes at. 0 = full input (32x32 for CIFAR).
 # The gate's compute is conv-bound -- conv2 alone is 4.7M of its 6.1M MACs -- and conv
@@ -232,7 +245,7 @@ GATING_POOL_SIZE = 8
 # accuracy. Set to 16 and retrain the gate alone (~20s once specialists exist) to A/B
 # it. If enabling, also set GATING_POOL_SIZE = 4: at 16x16 input the conv stack already
 # ends at 4x4, so leaving it at 8 makes the adaptive pool upsample and wastes fc1.
-GATING_INPUT_SIZE = 0
+GATING_INPUT_SIZE = 16
 
 # W22: shard labels are imbalanced whenever shards own different class counts -- W17's
 # semantic clustering produced a 4-vehicle / 6-animal split, i.e. 18000 vs 27000 (40/60).

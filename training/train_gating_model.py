@@ -123,14 +123,35 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
     else:
         optimizer = optim.Adam(model.parameters(), lr=config.GATING_LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     
-    # Early stopping setup for gating network
+    # W25: the gate now trains under the SAME regime as the specialists. It previously
+    # had none of W23's fixes -- no LR schedule, no minimum-epoch floor, patience 4 and
+    # a 25-epoch cap -- so it stopped at its first plateau while the LR was still at its
+    # initial value. Measured on the 83.26% run: it stopped at epoch 10/25 with its best
+    # at epoch 6, while training accuracy was still climbing monotonically (0.888 ->
+    # 0.954). That is exactly the premature-stopping defect W23 fixed everywhere else,
+    # and it matters more here than anywhere: routing is now the system bottleneck.
     best_val_acc = 0.0
     best_model_state = None
     epochs = config.GATING_MAX_EPOCHS
-    patience = config.GATING_EARLY_STOPPING_PATIENCE  # Use config parameter for early stopping
+    patience = config.GATING_EARLY_STOPPING_PATIENCE
+    min_epochs = getattr(config, 'GATING_MIN_EPOCHS', 0)
+    min_improvement = config.TRAINING_MIN_DELTA  # same accuracy threshold as the specialists
     patience_counter = 0
-    min_improvement = 0.001  # Minimum improvement threshold
-    
+
+    scheduler = None
+    if getattr(config, 'LR_SCHEDULER', 'none') == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max',
+            factor=config.LR_SCHEDULER_FACTOR,
+            patience=config.LR_SCHEDULER_PATIENCE,
+            min_lr=config.LR_SCHEDULER_MIN_LR,
+        )
+    lr_reductions = 0
+    min_lr_reductions = getattr(config, 'MIN_LR_REDUCTIONS_BEFORE_STOP', 0) if scheduler is not None else 0
+    print(f"   - Gate schedule: max_epochs={epochs}, patience={patience}, min_epochs={min_epochs}, "
+          f"LR plateau x{min_lr_reductions} before stopping")
+
+
     # START: Track pure gating training time
     import time
     pure_gating_start = time.time()
@@ -179,7 +200,18 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         avg_val_loss = val_loss / len(val_loader)
         
         print(f"   - Epoch {epoch+1}/{epochs}: Train Loss={avg_train_loss:.4f}, Train Acc={train_acc:.4f}, Val Loss={avg_val_loss:.4f}, Val Acc={val_acc:.4f}")
-        
+
+        # W25: anneal the LR on plateau, mirroring the specialists.
+        if scheduler is not None:
+            prev_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(val_acc)
+            new_lr = optimizer.param_groups[0]['lr']
+            if new_lr < prev_lr:
+                lr_reductions += 1
+                gate_note = (f" (reduction {lr_reductions} of {min_lr_reductions} required before stopping)"
+                             if lr_reductions < min_lr_reductions else "")
+                print(f"   - LR reduced: {prev_lr:.2e} -> {new_lr:.2e}{gate_note}")
+
         # Enhanced early stopping for gating network
         if val_acc > best_val_acc + min_improvement:
             best_val_acc = val_acc
@@ -189,8 +221,18 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"   - Early stopping triggered at epoch {epoch+1} (no improvement for {patience} epochs)")
-                break
+                # W25: same two guards the specialists get -- honour the minimum-epoch
+                # floor, and do not stop until the LR has actually been annealed. A
+                # plateau at the starting LR says nothing about the lower ones.
+                if (epoch + 1) < min_epochs:
+                    pass
+                elif lr_reductions < min_lr_reductions:
+                    print(f"   - Plateau reached, but only {lr_reductions}/{min_lr_reductions} LR "
+                          f"reductions so far -- continuing at a lower LR instead of stopping.")
+                    patience_counter = 0
+                else:
+                    print(f"   - Early stopping triggered at epoch {epoch+1} (no improvement for {patience} epochs)")
+                    break
     
     # END: Track pure gating training time
     pure_gating_end = time.time()

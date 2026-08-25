@@ -32,6 +32,7 @@ from plots import (
     create_overall_sisa_roc_curve,
     create_overall_sisa_training_curves,
     load_shard_class_indices,
+    fit_ensemble_params,
 )
 from training.create_model import save_model_pytorch, load_model_pytorch, DEVICE
 from training.train_gating_model import train_gating
@@ -500,6 +501,19 @@ if __name__ == "__main__":
     # self-routing only if gating training itself failed above (gating_model
     # is None in that case).
     shard_class_indices = load_shard_class_indices(sisa_data_dir, num_shards)
+
+    # W24: fit the gate/cosine routing blend on validation now that the specialists
+    # exist (the gate is trained before them, so this cannot happen any earlier).
+    # Attaches two scalars to gating_model; _run_sisa_batch falls back to plain gate
+    # routing if this is skipped or if the blend loses to the gate on validation.
+    if gating_model is not None and getattr(config, 'ROUTING_MODE', 'gating') == 'ensemble':
+        x_val_ens = np.load(os.path.join(sisa_data_dir, "validation_data/x_validation.npy"))
+        y_val_ens = np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy"))
+        fit_ensemble_params(
+            all_shard_final_models, gating_model, shard_class_indices, class_names,
+            x_val_ens, y_val_ens, T.Normalize(DATASET_MEAN, DATASET_STD),
+        )
+
     classified_accuracy, overall_accuracy, final_report_dict, final_eval_precomputed = evaluate_with_self_routing(
         all_shard_final_models, shard_class_indices, class_names, gating_model=gating_model
     )
