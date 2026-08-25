@@ -1,0 +1,16 @@
+{
+  "best_params": {
+    "LEARNING_RATE": 0.0008488762161408717,
+    "WEIGHT_DECAY": 3.585612610345396e-05,
+    "LABEL_SMOOTHING": 0.29087538832936755,
+    "REPLAY_RATIO": 0.4100531293444458,
+    "BATCH_SIZE": 32,
+    "FC_LAYER_DROPOUT": 0.5687496940092467
+  },
+  "best_value": 0.6266,
+  "n_trials": 30,
+  "epochs_per_trial": 100,
+  "project_name": "cifar10_sisa_pytorch",
+  "seed": 42,
+  "timestamp": "2026-08-25T00:26:39.606513"
+}

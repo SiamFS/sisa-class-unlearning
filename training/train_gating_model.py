@@ -10,14 +10,18 @@ import torchvision.transforms as T
 
 # Import global configuration
 import config
+from utils.seeding import seeded_generator
 
 from training.create_model import create_gating_model, save_model_pytorch, DEVICE
+from training.augmentation import build_augmenter
 
 def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, excluded_classes=None):
 
-    # Basic augmentation to prevent overfitting
+    # W19/W22: geometric augmentation is per-sample (a torchvision Compose applied to a
+    # batched tensor gives the whole batch one shared decision) and now includes the
+    # random crop the gate previously lacked entirely.
+    gating_augmenter = build_augmenter(config.get_augmentation_config('baseline'), config.SEED)
     train_transforms = T.Compose([
-        T.RandomHorizontalFlip(p=0.5),  # Only horizontal flip
         T.Normalize(dataset_mean, dataset_std)
     ])
     val_transforms = T.Compose([
@@ -77,19 +81,37 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
     print(f"   - Created {len(y_gating)} labels for Gating Network training.")
     
     # 4. Create DataLoader
+    # W22: was a hardcoded literal 42 -- harmless only while config.SEED happens to be
+    # 42, and the exact class of stray-literal reproducibility bug W4 already fixed once.
     x_train_split, x_val_split, y_train_split, y_val_split = train_test_split(
-        x_train_full, y_gating, test_size=0.2, stratify=y_gating, random_state=42
+        x_train_full, y_gating, test_size=0.2, stratify=y_gating, random_state=config.SEED
     )
     
     train_dataset = TensorDataset(torch.from_numpy(x_train_split).float(), torch.from_numpy(y_train_split).long())
     val_dataset = TensorDataset(torch.from_numpy(x_val_split).float(), torch.from_numpy(y_val_split).long())
     
-    train_loader = DataLoader(train_dataset, batch_size=config.GATING_BATCH_SIZE, shuffle=True, num_workers=0)
+    train_loader = DataLoader(
+        train_dataset, batch_size=config.GATING_BATCH_SIZE, shuffle=True, num_workers=0,
+        generator=seeded_generator(config.SEED),
+    )
     val_loader = DataLoader(val_dataset, batch_size=config.GATING_BATCH_SIZE, num_workers=0)
     
     # 5. Training Loop with Early Stopping
     model = create_gating_model(num_shards)
-    criterion = nn.CrossEntropyLoss()
+
+    # W22: inverse-frequency class weights. Shard labels are imbalanced whenever shards
+    # own different numbers of classes -- W17's semantic clustering made this 18000 vs
+    # 27000 (40/60) -- and unweighted cross-entropy drifts toward the majority shard.
+    class_weights = None
+    if getattr(config, 'GATING_CLASS_WEIGHTS', False):
+        counts = np.bincount(y_train_split, minlength=num_shards).astype(np.float64)
+        if (counts > 0).all():
+            weights = counts.sum() / (num_shards * counts)
+            class_weights = torch.tensor(weights, dtype=torch.float32, device=DEVICE)
+            print(f"   - Shard label counts: {counts.astype(int).tolist()}")
+            print(f"   - Applying class weights: {[round(float(w), 4) for w in weights]}")
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = optim.Adam(model.parameters(), lr=config.GATING_LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     
     # Early stopping setup for gating network
@@ -111,6 +133,7 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         train_total = 0
         
         for x_batch, y_batch in train_loader:
+            x_batch = gating_augmenter(x_batch)
             x_batch = train_transforms(x_batch).to(DEVICE)
             y_batch = y_batch.to(DEVICE)
             

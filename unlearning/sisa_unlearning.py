@@ -15,6 +15,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 # Import global configuration
 import config
+from utils.seeding import set_seed
+
+set_seed(config.SEED)
 
 from training.train_model import (
     train_model,
@@ -26,7 +29,6 @@ from plots import (
     create_overall_sisa_confusion_matrix,
     create_overall_sisa_roc_curve,
     create_overall_sisa_training_curves,
-    create_gating_routing_barplots,
     create_accuracy_comparison_chart,
     create_time_comparison_chart,
     create_pure_training_time_chart,
@@ -34,49 +36,19 @@ from plots import (
     _run_sisa_batch,
     _normalize_probabilities_tensor,
     _apply_temperature_tensor,
+    load_shard_class_indices,
 )
-from training.create_model import save_model_pytorch, load_model_pytorch, DEVICE
-
-# Enhanced logging class for unlearning process
-class UnlearningLogger:
-    def __init__(self, log_file="unlearning.txt"):
-        self.log_file = log_file
-        self.terminal = sys.stdout
-        
-        # Create log file if it doesn't exist
-        os.makedirs(os.path.dirname(os.path.abspath(log_file)) if os.path.dirname(log_file) else ".", exist_ok=True)
-        
-        # Open file in write mode to overwrite previous output
-        self.file = open(log_file, 'w', encoding='utf-8')
-        
-        # Write session header
-        self.file.write(f"{'='*80}\n")
-        self.file.write(f"SISA Unlearning Session - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        self.file.write(f"{'='*80}\n")
-        self.file.flush()
-    
-    def write(self, message):
-        self.terminal.write(message)
-        self.file.write(message)
-        self.file.flush()
-    
-    def flush(self):
-        self.terminal.flush()
-        self.file.flush()
-    
-    def close(self):
-        if hasattr(self, 'file'):
-            self.file.close()
-    
-    def __del__(self):
-        self.close()
+from training.create_model import save_model_pytorch, load_model_pytorch, create_sisa_model, DEVICE
+from training.replay_buffer import add_to_replay_buffer, compute_replay_ratio
+from training.train_gating_model import train_gating
+from utils.run_logging import setup_run_logging
 
 class SISAUnlearning:
     def __init__(self, project_name: str, model_name: str):
         print(f"Initializing SISA Unlearning for project: '{project_name}' with model: '{model_name}'")
         self.project_name = project_name
         self.model_name = model_name
-        self.base_dir = f"../projects/{self.project_name}"
+        self.base_dir = os.path.join(config.PROJECTS_DIR, self.project_name)
         self.models_dir = os.path.join(self.base_dir, "models")
         self.data_dir = os.path.join(self.base_dir, "sisa_data")
         self.reports_dir = os.path.join(self.base_dir, "data_info")
@@ -251,51 +223,33 @@ class SISAUnlearning:
         """
         CRITICAL: Remove ALL samples of deleted classes from replay buffer.
         This ensures deleted class data NEVER re-enters training.
-        
+
         Args:
-            replay_buffer: Either dict (traditional) or SmartReplayBuffer
+            replay_buffer: dict of {class_idx: {'X':.., 'y':..}}
             deleted_classes: Set of class indices to remove
-        
+
         Returns:
             Cleaned replay buffer
         """
         if not replay_buffer:
             return replay_buffer
-        
+
         print(f"\n   🔍 FILTERING REPLAY BUFFER: Removing deleted classes {deleted_classes}")
-        
-        # Handle SmartReplayBuffer
-        if hasattr(replay_buffer, 'buffer'):
-            original_classes = set(replay_buffer.buffer.keys())
-            classes_to_remove = original_classes & deleted_classes
-            
-            if classes_to_remove:
-                for class_idx in classes_to_remove:
-                    sample_count = replay_buffer.buffer[class_idx]['sample_count']
-                    del replay_buffer.buffer[class_idx]
-                    print(f"   ✓ Removed {sample_count} samples of deleted class {self.class_names[class_idx]} from smart replay buffer")
-                
-                remaining_classes = set(replay_buffer.buffer.keys())
-                print(f"   ✓ Replay buffer cleaned: {len(remaining_classes)} classes remain")
-            else:
-                print(f"   ✓ Replay buffer already clean (no deleted classes found)")
-        
-        # Handle traditional dict replay buffer
+
+        original_classes = set(replay_buffer.keys())
+        classes_to_remove = original_classes & deleted_classes
+
+        if classes_to_remove:
+            for class_idx in classes_to_remove:
+                sample_count = len(replay_buffer[class_idx]['y'])
+                del replay_buffer[class_idx]
+                print(f"   ✓ Removed {sample_count} samples of deleted class {self.class_names[class_idx]} from replay buffer")
+
+            remaining_classes = set(replay_buffer.keys())
+            print(f"   ✓ Replay buffer cleaned: {len(remaining_classes)} classes remain")
         else:
-            original_classes = set(replay_buffer.keys())
-            classes_to_remove = original_classes & deleted_classes
-            
-            if classes_to_remove:
-                for class_idx in classes_to_remove:
-                    sample_count = len(replay_buffer[class_idx]['y'])
-                    del replay_buffer[class_idx]
-                    print(f"   ✓ Removed {sample_count} samples of deleted class {self.class_names[class_idx]} from replay buffer")
-                
-                remaining_classes = set(replay_buffer.keys())
-                print(f"   ✓ Replay buffer cleaned: {len(remaining_classes)} classes remain")
-            else:
-                print(f"   ✓ Replay buffer already clean (no deleted classes found)")
-        
+            print(f"   ✓ Replay buffer already clean (no deleted classes found)")
+
         return replay_buffer
 
     def _load_shard_metadatas(self) -> List[Dict]:
@@ -331,8 +285,7 @@ class SISAUnlearning:
         # Initialize timing tracking
         self.data_removal_time = 0
         self.retraining_time = 0
-        self.gating_update_time = 0
-        
+
         # Backup test set before any modifications
         self._backup_test_set_if_needed()
         
@@ -475,7 +428,7 @@ class SISAUnlearning:
         retraining_start = time.time()
         for shard_idx, info in affected_shards.items():
             retrain_time, pure_retrain_time = self._retrain_shard_incrementally(
-                shard_idx, 
+                shard_idx,
                 info['first_affected_slice'],
                 info['slice_states']  # Pass slice states for proper gap handling
             )
@@ -488,16 +441,18 @@ class SISAUnlearning:
         print(f"Retraining Time (with eval): {self.retraining_time:.2f} seconds")
         print(f"Retraining Time (pure): {self.pure_retraining_time:.2f} seconds")
         
-        # Step 3: Track unlearned class (without retraining gating network)
+        # Step 3: Track unlearned class. The gating router (W16) IS retrained
+        # here to exclude it -- see final_evaluation_with_self_routing(), called
+        # next, which retrains the gate on the updated unlearned-classes list
+        # before evaluating.
         self._track_unlearned_class(class_idx)
-        print("\n   - Skipping gating network retraining: Using existing gating network with confidence threshold")
         
         # Calculate PURE unlearning time (data removal + retraining only, no evaluation/plotting overhead)
         pure_unlearning_time = self.data_removal_time + self.retraining_time
         
-        # Step 4: Final evaluation with gating network
+        # Step 4: Final evaluation with self-routing
         evaluation_start_time = time.time()
-        shard_models, classified_accuracy, overall_accuracy, unlearning_report = self.final_evaluation_with_gating()
+        shard_models, classified_accuracy, overall_accuracy, unlearning_report = self.final_evaluation_with_self_routing()
         evaluation_time = time.time() - evaluation_start_time
 
         total_time = time.time() - overall_start_time
@@ -519,6 +474,7 @@ class SISAUnlearning:
         print("\nTIMING BREAKDOWN:")
         print(f"  - Data Removal Time: {self.data_removal_time:.2f} seconds")
         print(f"  - Retraining Time Only: {self.retraining_time:.2f} seconds")
+        print(f"  - Gating Retrain Time: {getattr(self, 'gating_retrain_time', 0.0):.2f} seconds")
         print(f"  - Pure Unlearning Time: {pure_unlearning_time:.2f} seconds (removal + retraining)")
         print(f"  - Evaluation & Overhead: {total_time - pure_unlearning_time:.2f} seconds")
         print(f"  - Total Process Time: {total_time:.2f} seconds")
@@ -527,7 +483,7 @@ class SISAUnlearning:
         print(f"  - Overall Model Accuracy on All Test Samples: {overall_accuracy:.4f}")
         print(f"\nOutput saved to: {self.base_dir}")
         print("=" * 60)
-        
+
         print("   - Test set preserved: Original test samples maintained for evaluation purposes.")
 
     def batch_unlearn_by_classes(self, class_names: List[str]):
@@ -552,13 +508,11 @@ class SISAUnlearning:
         # Initialize timing tracking
         self.data_removal_time = 0
         self.retraining_time = 0
-        self.gating_update_time = 0
-        
+
         # Initialize forgotten samples storage for batch unlearning
         self.forgotten_samples_x = []
         self.forgotten_samples_y = []
-        self.gating_update_time = 0
-        
+
         # Backup test set before any modifications
         self._backup_test_set_if_needed()
         
@@ -705,9 +659,9 @@ class SISAUnlearning:
             print(f"{'='*70}")
             print(f"First affected slice: {info['first_affected_slice']+1}")
             print(f"Slice states: {info['slice_states']}")
-            
+
             retrain_time, pure_retrain_time = self._retrain_shard_incrementally(
-                shard_idx, 
+                shard_idx,
                 info['first_affected_slice'],
                 info['slice_states']  # Pass slice states for proper gap handling
             )
@@ -731,10 +685,10 @@ class SISAUnlearning:
         
         # Step 4: Final evaluation
         print("\n" + "="*60)
-        print("Step 4: Final evaluation with gating network...")
+        print("Step 4: Final evaluation with self-routing...")
         print("="*60)
         evaluation_start_time = time.time()
-        shard_models, classified_accuracy, overall_accuracy, unlearning_report = self.final_evaluation_with_gating()
+        shard_models, classified_accuracy, overall_accuracy, unlearning_report = self.final_evaluation_with_self_routing()
         evaluation_time = time.time() - evaluation_start_time
         
         total_time = time.time() - overall_start_time
@@ -763,6 +717,7 @@ class SISAUnlearning:
         print("\nTIMING BREAKDOWN:")
         print(f"  - Data Removal Time: {self.data_removal_time:.2f} seconds")
         print(f"  - Retraining Time Only: {self.retraining_time:.2f} seconds")
+        print(f"  - Gating Retrain Time: {getattr(self, 'gating_retrain_time', 0.0):.2f} seconds")
         print(f"  - Pure Unlearning Time: {pure_unlearning_time:.2f} seconds (removal + retraining)")
         print(f"  - Evaluation & Overhead: {total_time - pure_unlearning_time:.2f} seconds")
         print(f"  - Total Process Time: {total_time:.2f} seconds")
@@ -822,6 +777,38 @@ class SISAUnlearning:
             os.remove(model_file)
             print(f"      - Deleted model weights: slice_{slice_idx}_model_{self.model_name}.pth")
 
+    def _resize_model_head(self, old_model, head_classes: List[int]):
+        """W6 dynamic head: return a model whose output head is sized to len(head_classes).
+
+        Copies every learned weight that doesn't depend on the class count (the
+        convolutional trunk and the hidden FC layer) from `old_model`; only the
+        final classification layer is freshly initialized, since its width must
+        match the shard's new (post-unlearning) owned-class count. Applying this
+        once, before retraining, means the deleted class ends up with literally
+        no output neuron rather than a masked one.
+        """
+        target_num_classes = len(head_classes)
+        old_state = old_model.state_dict()
+        old_final_classes = old_state['fc_layer.5.weight'].shape[0]
+        if old_final_classes == target_num_classes:
+            return old_model.to(DEVICE)
+
+        # W21: keep the head type of the model being resized. The transplant below is
+        # shape-based, so a cosine head needs no special handling -- `fc_layer.5.weight`
+        # changes width and is reinitialized, while the class-independent scale carries
+        # over -- but the replacement model must be built with the same head kind.
+        new_model = create_sisa_model(
+            num_classes=target_num_classes,
+            classifier_type=getattr(old_model, 'classifier_type', None),
+        )
+        new_state = new_model.state_dict()
+        transplanted = {k: v for k, v in old_state.items() if k in new_state and new_state[k].shape == v.shape}
+        new_state.update(transplanted)
+        new_model.load_state_dict(new_state)
+        skipped = sorted(set(old_state.keys()) - set(transplanted.keys()))
+        print(f"   - Resized head: {old_final_classes} -> {target_num_classes} classes (reinitialized: {skipped})")
+        return new_model.to(DEVICE)
+
     def _retrain_shard_incrementally(self, shard_idx: int, first_affected_slice: int, slice_states: Dict = None):
         """
         Retrain shard incrementally, handling empty/deleted slices properly.
@@ -842,7 +829,15 @@ class SISAUnlearning:
         shard_histories = []
         
         shard_model_dir = os.path.join(self.models_dir, f"shard_{shard_idx+1}")
-        
+
+        # W6: the shard's current (post-unlearning) owned classes define the retrained
+        # model's head size. `_update_shard_metadata` already recomputed this in Step 1,
+        # before this method is ever called.
+        with open(os.path.join(self.data_dir, f"shards/shard_{shard_idx+1}/metadata.json"), 'r') as f:
+            current_shard_meta = json.load(f)
+        head_classes = sorted(current_shard_meta.get('class_indices_present', []))
+        print(f"   - Dynamic head: retraining with {len(head_classes)} output classes (was {config.get_num_classes()})")
+
         # If no slice_states provided, create a default one
         if slice_states is None:
             slice_states = {}
@@ -870,7 +865,8 @@ class SISAUnlearning:
                 model_path = os.path.join(shard_model_dir, f"slice_{slice_idx}_model_{self.model_name}.pth")
                 if os.path.exists(model_path):
                     try:
-                        current_model, _ = load_model_pytorch(model_path)
+                        base_model, _ = load_model_pytorch(model_path)
+                        current_model = self._resize_model_head(base_model, head_classes)
                         previous_available_slice = slice_idx
                         print(f"   - Loaded base model from previous available Slice {slice_idx+1}")
                         break
@@ -878,7 +874,7 @@ class SISAUnlearning:
                         print(f"   ⚠️  Warning: Failed to load model from Slice {slice_idx+1}: {e}")
                         print(f"   - Will try previous slice or create new model")
                         continue  # Try the next previous slice
-        
+
         if current_model is None:
             print("   - No previous model found or all models corrupted, training from scratch")
         
@@ -890,64 +886,29 @@ class SISAUnlearning:
         deleted_classes_set = self.get_unlearned_classes_set()
         print(f"\n   🚫 UNLEARNING MODE: Will filter deleted classes {deleted_classes_set} from replay buffer")
         
-        # Initialize replay buffer from previous available slices (skipping empty/deleted ones)
-        if config.USE_SMART_REPLAY:
-            from training.smart_replay import create_smart_replay_buffer
-            replay_buffer = create_smart_replay_buffer(config)
-            print("   - Using smart replay buffer for unlearning")
-            
-            # Add data from all previous AVAILABLE slices (skip empty/deleted ones)
-            for slice_idx in range(first_affected_slice):
-                # Only process slices that have data
-                if slice_states.get(slice_idx, 'empty') != 'has_data':
-                    continue
-                
-                x_s, y_s = self._load_slice_data(shard_idx, slice_idx)
-                if x_s is not None and len(x_s) > 0:
-                    # Need to load a model to compute importance scores
-                    base_model_path = os.path.join(shard_model_dir, f"slice_{slice_idx}_model_{self.model_name}.pth")
-                    if os.path.exists(base_model_path):
-                        try:
-                            temp_model, _ = load_model_pytorch(base_model_path)
-                            replay_buffer.add_samples(x_s, y_s, temp_model, DEVICE)
-                        except Exception as e:
-                            print(f"   ⚠️  Warning: Failed to load model for replay buffer from Slice {slice_idx+1}: {e}")
-                            print(f"   - Skipping this slice in replay buffer")
-                            continue
-                        print(f"   - Added Slice {slice_idx+1} data to smart replay buffer")
-                    else:
-                        print(f"   - Warning: Slice {slice_idx+1} has data but no model found")
-        else:
-            replay_buffer = {}
-            # Traditional replay buffer logic - only from available slices
-            for slice_idx in range(first_affected_slice):
-                # Only process slices that have data
-                if slice_states.get(slice_idx, 'empty') != 'has_data':
-                    continue
-                    
-                x_s, y_s = self._load_slice_data(shard_idx, slice_idx)
-                if x_s is not None and len(x_s) > 0:
-                    unique_labels_in_slice = np.unique(y_s)
-                    for label in unique_labels_in_slice:
-                        mask = (y_s == label)
-                        class_x_data, class_y_data = x_s[mask], y_s[mask]
-                        if label in replay_buffer:
-                            replay_buffer[label]['X'] = np.vstack([replay_buffer[label]['X'], class_x_data])
-                            replay_buffer[label]['y'] = np.concatenate([replay_buffer[label]['y'], class_y_data])
-                        else:
-                            replay_buffer[label] = {'X': class_x_data, 'y': class_y_data}
-                    print(f"   - Added Slice {slice_idx+1} data to replay buffer")
+        # Initialize replay buffer from previous available slices (skipping empty/deleted ones),
+        # capped per class (W4) so it doesn't grow unboundedly across many slices.
+        replay_buffer = {}
+        replay_seen_counts = {}  # per-class "samples ever seen" count, for reservoir sampling
+        replay_rng = np.random.default_rng(config.SEED)
+        for slice_idx in range(first_affected_slice):
+            # Only process slices that have data
+            if slice_states.get(slice_idx, 'empty') != 'has_data':
+                continue
+
+            x_s, y_s = self._load_slice_data(shard_idx, slice_idx)
+            if x_s is not None and len(x_s) > 0:
+                add_to_replay_buffer(replay_buffer, x_s, y_s, replay_rng,
+                                      config.MAX_REPLAY_SAMPLES_PER_CLASS, replay_seen_counts)
+                print(f"   - Added Slice {slice_idx+1} data to replay buffer")
         
         # CRITICAL: Filter out ALL deleted classes from replay buffer
         replay_buffer = self._filter_replay_buffer_for_unlearning(replay_buffer, deleted_classes_set)
         
         # VERIFICATION: Assert replay buffer is clean
         if replay_buffer:
-            if hasattr(replay_buffer, 'buffer'):
-                buffer_classes = set(replay_buffer.buffer.keys())
-            else:
-                buffer_classes = set(replay_buffer.keys())
-            
+            buffer_classes = set(replay_buffer.keys())
+
             contamination = buffer_classes & deleted_classes_set
             if contamination:
                 contaminated_names = [self.class_names[c] for c in contamination]
@@ -975,7 +936,7 @@ class SISAUnlearning:
 
             print(f"\n   --- Retraining Slice {slice_idx+1} (Incremental Logic) ---")
             print(f"   - Current model state: {'Available' if current_model is not None else 'Training from scratch'}")
-            print(f"   - Replay buffer status: {len(replay_buffer.buffer) if hasattr(replay_buffer, 'buffer') else len(replay_buffer)} classes available")
+            print(f"   - Replay buffer status: {len(replay_buffer)} classes available")
             
             # Get cumulative classes up to this slice (excluding unlearned classes)
             cumulative_classes = self._get_cumulative_classes_up_to_slice_unlearning(shard_idx, slice_idx)
@@ -989,9 +950,13 @@ class SISAUnlearning:
             x_slice, y_slice = self._load_slice_data(shard_idx, slice_idx)
             if x_slice is None: continue
 
-            # Use static replay ratio for unlearning
-            current_replay_ratio = config.UNLEARNING_REPLAY_RATIO
-            print(f"   - Using replay ratio: {current_replay_ratio}")
+            # W18: identical class-balanced replay rule as the original training loop.
+            # These two paths MUST agree -- if unlearning retrains under a different
+            # replay recipe than training used, the W8 scratch-reference comparison is
+            # no longer apples-to-apples and the exactness proof does not hold.
+            current_replay_ratio = compute_replay_ratio(replay_buffer, y_slice)
+            print(f"   - Using replay ratio: {current_replay_ratio:.3f} "
+                  f"({len(replay_buffer)} replay class(es), {len(np.unique(y_slice))} in slice)")
 
             # START: Track pure training time (before train_model call)
             slice_train_start = time.time()
@@ -1004,13 +969,13 @@ class SISAUnlearning:
                 lr=config.UNLEARNING_LEARNING_RATE,  # From global config
                 validation_data=(x_val_filtered, y_val_filtered),  # Use incremental validation
                 active_classes=active_classes,
+                head_classes=head_classes,  # W6: dynamic head sized to the shard's post-unlearning classes
                 replay_buffer=replay_buffer,
                 replay_ratio=current_replay_ratio,  # Use dynamic ratio
                 dataset_mean=self.dataset_mean,
                 dataset_std=self.dataset_std,
                 training_type='unlearning',  # Proper early stopping for unlearning
                 augmentation_config=augmentation_config,  # Use balance-based augmentation for unlearning
-                use_smart_replay=config.USE_SMART_REPLAY,
                 device=DEVICE
             )
             
@@ -1036,7 +1001,7 @@ class SISAUnlearning:
                 if current_model is not None and len(x_val_filtered) > 0:
                     create_shard_confusion_matrix(
                         current_model, x_val_filtered, y_val_filtered, self.class_names,
-                        shard_idx, reports_dir, active_classes
+                        shard_idx, reports_dir, active_classes, head_classes=head_classes
                     )
             
             # Update replay buffer with retrained slice data
@@ -1048,31 +1013,17 @@ class SISAUnlearning:
                 y_slice_filtered = y_slice[mask_keep]
                 
                 if len(y_slice_filtered) > 0:
-                    if config.USE_SMART_REPLAY and hasattr(replay_buffer, 'add_samples'):
-                        # Smart replay buffer - add with importance scoring
-                        replay_buffer.add_samples(x_slice_filtered, y_slice_filtered, current_model, DEVICE)
-                        print(f"      ✓ Updated smart replay buffer (filtered out deleted classes)")
-                    else:
-                        # Traditional replay buffer - simple class-wise storage
-                        unique_labels_in_slice = np.unique(y_slice_filtered)
-                        for label in unique_labels_in_slice:
-                            if label in deleted_classes_set:
-                                continue  # Extra safety: skip deleted classes
-                            mask = (y_slice_filtered == label)
-                            class_x_data, class_y_data = x_slice_filtered[mask], y_slice_filtered[mask]
-                            if label in replay_buffer:
-                                replay_buffer[label]['X'] = np.vstack([replay_buffer[label]['X'], class_x_data])
-                                replay_buffer[label]['y'] = np.concatenate([replay_buffer[label]['y'], class_y_data])
-                            else:
-                                replay_buffer[label] = {'X': class_x_data, 'y': class_y_data}
-                        print(f"      ✓ Updated replay buffer (filtered out deleted classes)")
+                    # Traditional replay buffer, capped per class via reservoir sampling (W4)
+                    add_to_replay_buffer(replay_buffer, x_slice_filtered, y_slice_filtered, replay_rng,
+                                          config.MAX_REPLAY_SAMPLES_PER_CLASS, replay_seen_counts)
+                    print(f"      ✓ Updated replay buffer (filtered out deleted classes)")
                 else:
                     print(f"      ⚠️  No samples to add to replay buffer after filtering deleted classes")
 
                 if current_model is not None and len(x_val_filtered) > 0:
                     create_shard_confusion_matrix(
                         current_model, x_val_filtered, y_val_filtered, self.class_names,
-                        shard_idx, reports_dir, active_classes
+                        shard_idx, reports_dir, active_classes, head_classes=head_classes
                     )
 
             slice_save_path = os.path.join(shard_model_dir, f"slice_{slice_idx}_model_{self.model_name}.pth")
@@ -1091,58 +1042,91 @@ class SISAUnlearning:
         return total_retrain_time, pure_retrain_time
 
 
-    def final_evaluation_with_gating(self):
-        print("\n" + "="*20 + " Final Evaluation with Gating Network " + "="*20)
-        shard_models = []
+    def final_evaluation_with_self_routing(self):
+        print("\n" + "="*20 + " Final Evaluation with Self-Routing " + "="*20)
+        # Positional list (index i == shard i+1); missing models stay None so
+        # they line up with shard_class_indices by index.
+        shard_models = [None] * self.num_shards
         for i in range(self.num_shards):
             model_path = os.path.join(self.models_dir, f"shard_{i+1}", f"final_model_shard{i+1}_{self.model_name}.pth")
-            
+
             if os.path.exists(model_path):
                 model, _ = load_model_pytorch(model_path)
-                shard_models.append(model.eval())
+                shard_models[i] = model.eval()
             else:
                 print(f"   - Warning: No final model found for shard {i+1} at {os.path.basename(model_path)}")
 
-        gating_model_path = os.path.join(self.models_dir, "gating_model.pth")
-        if not os.path.exists(gating_model_path):
-            print("FATAL: Gating model not found. Cannot perform evaluation.")
-            return None, 0.0, 0.0, None
-            
-        gating_model, _ = load_model_pytorch(gating_model_path, num_shards=self.num_shards)
-        
-        classified_accuracy, overall_accuracy, unlearning_report = self.evaluate_with_gating_network(shard_models, gating_model, self.class_names)
-        
-        # Clean up gating model from memory after evaluation (SISA compliance)
-        del gating_model
-        torch.cuda.empty_cache()  # Clear GPU memory if using CUDA
-        
+        shard_class_indices = load_shard_class_indices(self.data_dir, self.num_shards)
+
+        # W16: the gate is the real router now, so it must be retrained excluding
+        # every class unlearned so far (including the one just tracked) for the
+        # system to stay exact -- an untrained-on-that-class gate and a
+        # retrained-to-exclude-it gate must behave indistinguishably on that
+        # class's images, which is only true right after a retrain.
+        gating_model = None
+        gating_path = os.path.join(self.models_dir, "gating_model.pth")
+        self.gating_retrain_time = 0.0
+        if os.path.exists(gating_path):
+            print("\n--- Retraining gating network to exclude all unlearned classes ---")
+            gate_retrain_start = time.time()
+            train_gating(
+                num_shards=self.num_shards,
+                base_dir=self.base_dir,
+                num_slices=self.num_slices,
+                dataset_mean=self.dataset_mean,
+                dataset_std=self.dataset_std,
+                excluded_classes=self.get_unlearned_classes(),
+            )
+            self.gating_retrain_time = time.time() - gate_retrain_start
+            print(f"Gating Retrain Time: {self.gating_retrain_time:.2f} seconds")
+            gating_model, _ = load_model_pytorch(gating_path, num_shards=self.num_shards)
+            gating_model.eval()
+        else:
+            print(f"   - Warning: No gating model found at {os.path.basename(gating_path)}; "
+                  f"falling back to confidence-based self-routing.")
+
+        classified_accuracy, overall_accuracy, unlearning_report = self.evaluate_with_self_routing(
+            shard_models, shard_class_indices, self.class_names, gating_model=gating_model
+        )
+
         return shard_models, classified_accuracy, overall_accuracy, unlearning_report
 
-    def evaluate_with_gating_network(self, shard_models, gating_model, class_names, threshold=config.CONFIDENCE_THRESHOLD):
-        print("\n" + "="*20 + f" Production Evaluation with Confidence Threshold={threshold:.2f} " + "="*20)
+    def evaluate_with_self_routing(self, shard_models, shard_class_indices, class_names, threshold=None, gating_model=None):
+        """The primary, reported evaluation: raw self-routing, no confidence threshold
+        (W5). A threshold is a deployment-time rejection knob, not exactness evidence --
+        pass one explicitly only for an isolated, clearly-labeled deployment check; it
+        never affects the numbers this method returns from its default (threshold=None)
+        call, which is the one used for every unlearning report.
+        """
+        if threshold is None:
+            print("\n" + "="*20 + " Self-Routing Evaluation (raw, no confidence threshold) " + "="*20)
+        else:
+            print("\n" + "="*20 + f" DEPLOYMENT-ONLY Evaluation with Confidence Threshold={threshold:.2f} (NOT exactness evidence) " + "="*20)
         x_test = np.load(os.path.join(self.test_data_dir, "x_test.npy"))
         y_test = np.load(os.path.join(self.test_data_dir, "y_test.npy"))
 
-        gating_model.eval()
-        for model in shard_models: model.eval()
+        for model in shard_models:
+            if model is not None:
+                model.eval()
 
-        # Real-time gating network routing (no caching - proper for new samples)
+        # Real-time self-routing (no caching - proper for new samples)
         all_final_preds = []
         all_true_labels = []
         batch_size = config.BATCH_SIZE
-        
+
         # Get unlearned classes for analysis
         unlearned_classes_set = self.get_unlearned_classes_set()
-        
+
         with torch.no_grad():
             for i in range(0, len(x_test), batch_size):
                 batch_x = torch.from_numpy(x_test[i:i+batch_size]).float()
                 batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
-                
-                # Use REAL-TIME gating network routing WITH threshold (production mode)
+
+                # Self-routing WITH threshold (production mode)
                 # Threshold helps detect uncertain predictions on deleted/unknown classes
                 batch_final_preds, _ = _run_sisa_batch(
-                    batch_x_normalized, shard_models, gating_model, class_names, threshold
+                    batch_x_normalized, shard_models, class_names, shard_class_indices, threshold,
+                    gating_model=gating_model,
                 )
                 
                 # Keep predictions including -1 (uncertain/unknown samples)
@@ -1155,20 +1139,19 @@ class SISAUnlearning:
         all_final_preds = np.array(all_final_preds)
         all_true_labels = np.array(all_true_labels)
 
-        # ============================================================================
-        # PRODUCTION EVALUATION: Includes confidence-based rejection
-        # Predictions with low confidence are marked as -1 (unknown/rejected)
-        # This demonstrates real-world deployment where uncertain predictions are rejected
-        # ============================================================================
-        
-        # Count rejected predictions (marked as -1 due to low confidence)
+        # Count rejected predictions (marked as -1 due to low confidence). Always 0
+        # when threshold=None (the default, exactness-evidence path) since
+        # _run_sisa_batch never rejects without a threshold.
         rejected_count = np.sum(all_final_preds == -1)
         rejected_percentage = (rejected_count / len(all_final_preds)) * 100
-        
-        print("\n--- PRODUCTION EVALUATION WITH CONFIDENCE THRESHOLDING ---")
-        print(f"Total Test Samples: {len(all_final_preds)}")
-        print(f"Rejected Predictions (low confidence): {rejected_count} ({rejected_percentage:.2f}%)")
-        print(f"Accepted Predictions: {len(all_final_preds) - rejected_count} ({100 - rejected_percentage:.2f}%)")
+
+        if threshold is None:
+            print(f"Total Test Samples: {len(all_final_preds)} (raw self-routing, nothing rejected)")
+        else:
+            print("\n--- DEPLOYMENT-ONLY: CONFIDENCE THRESHOLDING (not exactness evidence) ---")
+            print(f"Total Test Samples: {len(all_final_preds)}")
+            print(f"Rejected Predictions (low confidence): {rejected_count} ({rejected_percentage:.2f}%)")
+            print(f"Accepted Predictions: {len(all_final_preds) - rejected_count} ({100 - rejected_percentage:.2f}%)")
         
         # Filter out rejected predictions for accuracy calculation
         valid_mask = all_final_preds != -1
@@ -1231,7 +1214,8 @@ class SISAUnlearning:
 
                 # Get RAW predictions without post-processing
                 batch_raw_preds, _ = _run_sisa_batch(
-                    batch_x_normalized, shard_models, gating_model, class_names, threshold=None
+                    batch_x_normalized, shard_models, class_names, shard_class_indices, threshold=None,
+                    gating_model=gating_model,
                 )
 
                 all_raw_preds.extend(batch_raw_preds.cpu().numpy())
@@ -1324,27 +1308,35 @@ class SISAUnlearning:
         # Get deleted class names for display
         deleted_class_names = [class_names[idx] for idx in unlearned_class_indices if idx < len(class_names)]
         
-        # Re-run predictions WITHOUT confidence threshold for active classes
+        # Re-run predictions WITHOUT confidence threshold for active classes.
+        # W9: this single pass is also reused (via `precomputed=`) by every plot
+        # call below, which previously each re-ran _run_sisa_batch over the same
+        # test set independently (~7 redundant passes collapsed into this one).
         print("\nRe-evaluating with NO confidence threshold for clean active class metrics...")
         all_active_preds = []
+        all_active_probs = []
         all_active_labels = []
-        
+
         with torch.no_grad():
             for i in range(0, len(x_test), batch_size):
                 batch_x = torch.from_numpy(x_test[i:i+batch_size]).float()
                 batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
                 batch_y = y_test[i:i+batch_size]
-                
+
                 # NO threshold - get predictions on all samples
-                batch_preds, _ = _run_sisa_batch(
-                    batch_x_normalized, shard_models, gating_model, class_names, threshold=None
+                batch_preds, batch_probs = _run_sisa_batch(
+                    batch_x_normalized, shard_models, class_names, shard_class_indices, threshold=None,
+                    gating_model=gating_model,
                 )
-                
+
                 all_active_preds.extend(batch_preds.cpu().numpy())
+                all_active_probs.append(batch_probs.cpu().numpy())
                 all_active_labels.extend(batch_y)
-        
+
         all_active_preds = np.array(all_active_preds)
+        all_active_probs = np.concatenate(all_active_probs, axis=0)
         all_active_labels = np.array(all_active_labels)
+        raw_eval_precomputed = (all_active_preds, all_active_probs, all_active_labels)
         
         # Filter to keep only active class samples (samples whose TRUE label is NOT deleted)
         active_mask = np.array([label not in unlearned_class_indices for label in all_active_labels])
@@ -1426,26 +1418,28 @@ class SISAUnlearning:
         print("   Creating ROC curves for active classes only...")
         create_overall_sisa_roc_curve(
             shard_models,
-            gating_model,
+            shard_class_indices,
             x_test,
             y_test,
             class_names,
             self.reports_dir,
             'active_classes_only',
-            unlearned_classes=unlearned_classes
+            unlearned_classes=unlearned_classes,
+            precomputed=raw_eval_precomputed,
         )
-        
+
         # Confusion Matrix for active classes
         print("   Creating confusion matrix for active classes only...")
         create_overall_sisa_confusion_matrix(
             shard_models,
-            gating_model,
+            shard_class_indices,
             x_test,
             y_test,
             class_names,
             self.reports_dir,
             'active_classes_only',
-            unlearned_classes=unlearned_classes
+            unlearned_classes=unlearned_classes,
+            precomputed=raw_eval_precomputed,
         )
         
         # Training curves for active classes (if available)
@@ -1472,26 +1466,28 @@ class SISAUnlearning:
         print("   Creating ROC curves with ALL classes (including deleted)...")
         create_overall_sisa_roc_curve(
             shard_models,
-            gating_model,
+            shard_class_indices,
             x_test,
             y_test,
             class_names,
             self.reports_dir,
             'with_deleted_classes',
-            unlearned_classes=None  # Don't filter - show ALL classes
+            unlearned_classes=None,  # Don't filter - show ALL classes
+            precomputed=raw_eval_precomputed,
         )
-        
+
         # Confusion matrix - ALL classes including deleted
         print("   Creating confusion matrix with ALL classes (including deleted)...")
         create_overall_sisa_confusion_matrix(
             shard_models,
-            gating_model,
+            shard_class_indices,
             x_test,
             y_test,
             class_names,
             self.reports_dir,
             'with_deleted_classes',
-            unlearned_classes=None  # Don't filter - show ALL classes
+            unlearned_classes=None,  # Don't filter - show ALL classes
+            precomputed=raw_eval_precomputed,
         )
         
         # ============================================================================
@@ -1503,29 +1499,31 @@ class SISAUnlearning:
         
         create_overall_sisa_roc_curve(
             shard_models,
-            gating_model,
+            shard_class_indices,
             x_test,
             y_test,
             class_names,
             self.reports_dir,
             'unlearning_evaluation',
-            unlearned_classes=unlearned_classes  # Exclude deleted classes
+            unlearned_classes=unlearned_classes,  # Exclude deleted classes
+            precomputed=raw_eval_precomputed,
         )
-        
+
         # Create overall confusion matrix showing only active classes
         print("\n" + "=" * 50)
         print("CREATING OVERALL SISA SYSTEM CONFUSION MATRIX (AFTER UNLEARNING)")
         print("=" * 50)
-        
+
         create_overall_sisa_confusion_matrix(
             shard_models,
-            gating_model,
+            shard_class_indices,
             x_test,
             y_test,
             class_names,
             self.reports_dir,
             'unlearning_evaluation',
-            unlearned_classes=unlearned_classes  # Exclude unlearned classes
+            unlearned_classes=unlearned_classes,  # Exclude unlearned classes
+            precomputed=raw_eval_precomputed,
         )
         
         # Generate updated training curves showing unlearning impact
@@ -1566,45 +1564,18 @@ class SISAUnlearning:
             count = np.sum(y_forgotten == class_idx)
             print(f"  - {self.class_names[class_idx]}: {count} samples")
 
-        # Load gating model for proper SISA prediction
-        gating_model_path = os.path.join(self.models_dir, "gating_model.pth")
-        gating_model, _ = load_model_pytorch(gating_model_path, num_shards=self.num_shards)
-        gating_model.eval()
-        
-        # Use gating-based prediction
-        all_preds = []
-        all_confidences = []
-        
+        # Self-routing prediction (single source of truth, same as all other evaluation)
+        shard_class_indices = load_shard_class_indices(self.data_dir, self.num_shards)
+        batch_x = torch.from_numpy(x_forgotten).float()
+        batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
         with torch.no_grad():
-            for sample in x_forgotten:
-                batch_x = torch.from_numpy(sample).unsqueeze(0).float()
-                batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
-                
-                # Get gating prediction
-                gating_logits = gating_model(batch_x_normalized)
-                shard_pred = gating_logits.argmax(dim=1).item()
-                
-                # Get specialist predictions
-                specialist_outputs = [torch.softmax(model(batch_x_normalized), dim=1) for model in shard_models]
-                
-                # Find predictions and confidences for each shard
-                shard_predictions = []
-                shard_confidences = []
-                for shard_output in specialist_outputs:
-                    conf, pred = torch.max(shard_output[0], dim=0)
-                    shard_predictions.append(pred.item())
-                    shard_confidences.append(conf.item())
-                
-                # Use gating-selected prediction
-                final_prediction = shard_predictions[shard_pred]
-                final_confidence = shard_confidences[shard_pred]
-                
-                all_preds.append(final_prediction)
-                all_confidences.append(final_confidence)
-        
-        all_preds = np.array(all_preds)
-        all_confidences = np.array(all_confidences)
-        
+            preds_tensor, probs_tensor = _run_sisa_batch(
+                batch_x_normalized, shard_models, self.class_names, shard_class_indices, threshold=None,
+                gating_model=getattr(self, 'gating_model', None),
+            )
+        all_preds = preds_tensor.cpu().numpy()
+        all_confidences = probs_tensor.max(dim=1).values.cpu().numpy()
+
         # Calculate overall accuracy
         num_correct = np.sum(all_preds == y_forgotten)
         total_samples = len(y_forgotten)
@@ -1793,8 +1764,10 @@ class SISAUnlearning:
         STD_THRESHOLD = 2.0       # Higher threshold for unlearning
         
         if balance_ratio >= PERFECT_BALANCE_THRESHOLD and std_dev <= STD_THRESHOLD:
-            print("   Classes are perfectly balanced for unlearning - NO AUGMENTATION")
-            return None
+            # W19: must mirror entry_training.py -- retraining under a different
+            # augmentation recipe than original training would break the W8 comparison.
+            print("   Classes are perfectly balanced for unlearning - using baseline augmentation")
+            return config.get_augmentation_config('baseline', is_unlearning=True)
         elif balance_ratio >= BALANCE_THRESHOLD and std_dev <= 3.0:
             print("   Classes are well balanced for unlearning - using minimal augmentation")
             return config.get_augmentation_config('minimal', is_unlearning=True)
@@ -1806,112 +1779,20 @@ class SISAUnlearning:
             return config.get_augmentation_config('moderate', is_unlearning=True)
 
     def _get_training_metrics(self):
-        """Extract training accuracy and detailed timing breakdown from training.txt file."""
-        with open("training.txt", 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Look for final accuracy
-        import re
-        accuracy_match = re.search(r'Final SISA System Accuracy:\s*([\d.]+)', content)
-        training_accuracy = float(accuracy_match.group(1))
-        
-        # Extract REAL timing information from training.txt
-        # 1. Gating network training time - use PURE time for accuracy
-        gating_match = re.search(r'Gating Network Training Time \(pure\):\s*([\d.]+)\s*seconds', content)
-        gating_training_time = float(gating_match.group(1)) if gating_match else 20.0
-        
-        # 2. Base model training time with eval (parse actual value)
-        base_match = re.search(r'Base Model Training Time \(with eval\):\s*([\d.]+)\s*seconds', content)
-        base_model_time = float(base_match.group(1)) if base_match else 50.0
-        
-        # 3. NEW: Base model training time pure (parse actual value)
-        pure_match = re.search(r'Base Model Training Time \(pure\):\s*([\d.]+)\s*seconds', content)
-        pure_training_time = float(pure_match.group(1)) if pure_match else base_model_time
-        
-        # 3. Total training time (for validation)
-        time_match = re.search(r'Total Training Time:\s*([\d.]+)\s*seconds', content)
-        total_training_time = float(time_match.group(1)) if time_match else 100.0
-        
-        # Extract real training classification report from training.txt
-        training_report = self._parse_classification_report_from_training_log(content)
-        
-        return training_accuracy, gating_training_time, base_model_time, pure_training_time, training_report
+        """Read training accuracy and timing breakdown from training_metrics.json
+        (written by entry_training.py -- W7). No log scraping, no fallbacks: if
+        the project hasn't been trained, this fails loudly rather than guessing."""
+        metrics_path = os.path.join(self.data_dir, "training_metrics.json")
+        with open(metrics_path, 'r', encoding='utf-8') as f:
+            metrics = json.load(f)
 
-    def _parse_classification_report_from_training_log(self, content: str) -> dict:
-        """Parse the real classification report from training.txt content."""
-        try:
-            # Find the classification report section
-            report_start = content.find("Final Classification Report:")
-            if report_start == -1:
-                raise Exception("Could not find 'Final Classification Report:' in training.txt")
-            
-            # Extract the report section (between "precision    recall" and "Final SISA System Accuracy")
-            precision_line = content.find("precision    recall  f1-score   support", report_start)
-            accuracy_line = content.find("Final SISA System Accuracy:", report_start)
-            
-            if precision_line == -1 or accuracy_line == -1:
-                raise Exception("Could not find classification report data structure in training.txt")
-            
-            report_section = content[precision_line:accuracy_line]
-            lines = report_section.strip().split('\n')
-            
-            # Parse the classification report
-            training_report = {}
-            class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
-            
-            for line in lines[2:]:  # Skip header lines
-                line = line.strip()
-                if not line or line.startswith('accuracy') or line.startswith('macro avg') or line.startswith('weighted avg'):
-                    continue
-                
-                # Parse class-specific metrics
-                parts = line.split()
-                if len(parts) >= 4 and parts[0] in class_names:
-                    class_name = parts[0]
-                    precision = float(parts[1])
-                    recall = float(parts[2])
-                    f1_score = float(parts[3])
-                    support = int(parts[4])
-                    
-                    training_report[class_name] = {
-                        'precision': precision,
-                        'recall': recall,
-                        'f1-score': f1_score,
-                        'support': support
-                    }
-            
-            # Parse accuracy, macro avg, and weighted avg
-            for line in lines:
-                line = line.strip()
-                if line.startswith('accuracy'):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        training_report['accuracy'] = float(parts[1])
-                elif line.startswith('macro avg'):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        training_report['macro avg'] = {
-                            'precision': float(parts[2]),
-                            'recall': float(parts[3]),
-                            'f1-score': float(parts[4]),
-                            'support': int(parts[5])
-                        }
-                elif line.startswith('weighted avg'):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        training_report['weighted avg'] = {
-                            'precision': float(parts[2]),
-                            'recall': float(parts[3]),
-                            'f1-score': float(parts[4]),
-                            'support': int(parts[5])
-                        }
-            
-            return training_report
-            
-        except Exception as e:
-            print(f"   Error: Could not parse training classification report: {e}")
-            print("   Make sure training.txt exists and contains valid classification report data")
-            raise
+        training_accuracy = metrics['final_accuracy']
+        gating_training_time = metrics['gating_training_time_pure']
+        base_model_time = metrics['base_model_training_time_with_eval']
+        pure_training_time = metrics['base_model_training_time_pure']
+        training_report = metrics['classification_report']
+
+        return training_accuracy, gating_training_time, base_model_time, pure_training_time, training_report
 
     def _create_comparison_visualizations(self, unlearning_accuracy, total_time, retrain_time, unlearned_class, 
                                         training_report=None, unlearning_report=None):
@@ -1985,7 +1866,7 @@ class SISAUnlearning:
         print(f"COMPREHENSIVE DELETED CLASS EVALUATION: '{deleted_class_name.upper()}'")
         print("=" * 80)
         
-        # Get training baseline metrics from training.txt
+        # Get training baseline metrics from training_metrics.json (W7)
         training_accuracy_for_deleted_class = self._get_pre_unlearning_class_accuracy(deleted_class_name)
             
         print(f"Pre-unlearning accuracy on '{deleted_class_name}': {training_accuracy_for_deleted_class:.4f}")
@@ -2024,30 +1905,20 @@ class SISAUnlearning:
         print(f"Test samples for '{deleted_class_name}': {len(x_deleted)}")
         print(f"Test samples for remaining classes: {len(x_remaining)}")
         
-        # Load gating model
-        gating_model_path = os.path.join(self.models_dir, "gating_model.pth")
-        if not os.path.exists(gating_model_path):
-            print("   Warning: Gating model not found. Cannot perform SISA evaluation.")
-            return
-            
-        # Import model creation function
-        from training.create_model import load_model_pytorch
-        
-        gating_model, _ = load_model_pytorch(gating_model_path, num_shards=self.num_shards)
-        gating_model.eval()
-        
+        shard_class_indices = load_shard_class_indices(self.data_dir, self.num_shards)
+
         # Set up evaluation
         dataset_mean, dataset_std = self._get_dataset_normalization()
         eval_transforms = T.Compose([T.Normalize(dataset_mean, dataset_std)])
-        
+
         # Evaluation 1: Post-unlearning accuracy on DELETED class (should be ~0%)
         post_unlearning_deleted_accuracy = self._evaluate_sisa_on_data(
-            shard_models, gating_model, x_deleted, y_deleted, eval_transforms
+            shard_models, shard_class_indices, x_deleted, y_deleted, eval_transforms
         )
-        
+
         # Evaluation 2: Post-unlearning accuracy on REMAINING classes (should maintain performance)
         post_unlearning_remaining_accuracy = self._evaluate_sisa_on_data(
-            shard_models, gating_model, x_remaining, y_remaining, eval_transforms
+            shard_models, shard_class_indices, x_remaining, y_remaining, eval_transforms
         )
         
         # Results summary
@@ -2066,7 +1937,7 @@ class SISAUnlearning:
         
         # Logical evaluation with threshold
         # GDPR Compliance: Model should perform at random chance (no evidence of training on deleted data)
-        random_chance = 1.0 / len(self.class_names)  # For CIFAR-10: 1/10 = 0.10
+        random_chance = 1.0 / len(self.class_names)  # Dataset-agnostic: 1/num_classes
         success_threshold_lower = random_chance - 0.05  # 0.05 (5%) - below random is acceptable
         success_threshold_upper = random_chance + 0.05  # 0.15 (15%) - above random is still acceptable
         
@@ -2091,52 +1962,38 @@ class SISAUnlearning:
         print("=" * 80)
 
     def _get_pre_unlearning_class_accuracy(self, class_name: str) -> float:
-        """Extract pre-unlearning accuracy for specific class from training.txt."""
-        training_log_path = "training.txt"
-        if not os.path.exists(training_log_path):
-            return 0.74  # Default fallback
-            
-        try:
-            with open(training_log_path, 'r') as f:
-                content = f.read()
-                
-            # Look for class-specific precision/recall in classification report
-            import re
-            pattern = rf'\s+{re.escape(class_name)}\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)'
-            match = re.search(pattern, content)
-            
-            if match:
-                precision, recall, _ = map(float, match.groups())
-                return (precision + recall) / 2  # Average of precision and recall
-            else:
-                # Extract overall accuracy as fallback
-                acc_match = re.search(r'Final SISA System Accuracy: ([0-9.]+)', content)
-                if acc_match:
-                    return float(acc_match.group(1))
-                else:
-                    raise Exception(f"Could not find accuracy for class '{class_name}' in training.txt")
-                
-        except Exception as e:
-            print(f"   Error: Could not extract class accuracy: {e}")
-            raise
-    
-    def _evaluate_sisa_on_data(self, shard_models, gating_model, x_data, y_data, eval_transforms):
+        """Pre-unlearning accuracy for a specific class, from training_metrics.json's
+        classification report (W7). No hardcoded fallback: a missing metrics file or
+        class entry is a real problem (project never trained / class name typo'd),
+        not something to silently paper over with a guessed number."""
+        metrics_path = os.path.join(self.data_dir, "training_metrics.json")
+        with open(metrics_path, 'r', encoding='utf-8') as f:
+            metrics = json.load(f)
+
+        report = metrics['classification_report']
+        if class_name not in report:
+            raise KeyError(f"Class '{class_name}' not found in {metrics_path}'s classification_report")
+
+        class_metrics = report[class_name]
+        return (class_metrics['precision'] + class_metrics['recall']) / 2
+
+    def _evaluate_sisa_on_data(self, shard_models, shard_class_indices, x_data, y_data, eval_transforms):
         """Evaluate SISA system on given data with post-processing filtering for unlearned classes."""
         if len(x_data) == 0:
             return 0.0
-            
+
         all_preds = []
         batch_size = config.BATCH_SIZE
-        unlearned_classes_set = self.get_unlearned_classes_set()  # O(1) cached set lookup
-        
+
         with torch.no_grad():
             for i in range(0, len(x_data), batch_size):
                 batch_x = torch.from_numpy(x_data[i:i+batch_size]).float()
                 batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
-                
+
                 # Let model predict naturally - keep raw predictions
                 batch_preds, _ = _run_sisa_batch(
-                    batch_x_normalized, shard_models, gating_model, self.class_names, threshold=None
+                    batch_x_normalized, shard_models, self.class_names, shard_class_indices, threshold=None,
+                    gating_model=getattr(self, 'gating_model', None),
                 )
                 
                 # Keep RAW predictions to see true model behavior after unlearning
@@ -2199,35 +2056,36 @@ class SISAUnlearning:
 
 
 if __name__ == "__main__":
-    # Set up logging to overwrite previous unlearning output
-    logger = UnlearningLogger("unlearning.txt")
-    sys.stdout = logger
-    
-    try:
-        parser = argparse.ArgumentParser(
-            description="SISA Machine Unlearning",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="""
+    parser = argparse.ArgumentParser(
+        description="SISA Machine Unlearning",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 Examples:
   # Single class unlearning
   python unlearning/sisa_unlearning.py --class-name cat
-  
+
   # Batch unlearning (multiple classes)
   python unlearning/sisa_unlearning.py --class-name cat dog ship
   python unlearning/sisa_unlearning.py --class-name cat dog
-  
+
   # With custom project
   python unlearning/sisa_unlearning.py --class-name cat dog --project-name my_project
-            """
-        )
-        parser.add_argument('--class-name', type=str, nargs='+', 
-                          help='Name(s) of the class(es) to forget. Use spaces to separate multiple classes.')
-        parser.add_argument('--index', type=int, help='Index of specific sample to forget')  
-        parser.add_argument('--project-name', type=str, default='cifar10_sisa_pytorch', help='Project name')
-        parser.add_argument('--model-name', type=str, default='custom_cnn', help='Model architecture name')
-        
-        args = parser.parse_args()
-        
+        """
+    )
+    parser.add_argument('--class-name', type=str, nargs='+',
+                      help='Name(s) of the class(es) to forget. Use spaces to separate multiple classes.')
+    parser.add_argument('--index', type=int, help='Index of specific sample to forget')
+    parser.add_argument('--project-name', type=str, default='cifar10_sisa_pytorch', help='Project name')
+    parser.add_argument('--model-name', type=str, default='custom_cnn', help='Model architecture name')
+
+    args = parser.parse_args()
+
+    # Project-scoped, timestamped logging (W10) -- now that --project-name is known.
+    _restore_logging, _log_path = setup_run_logging(
+        os.path.join(config.PROJECTS_DIR, args.project_name, "logs"), "unlearning"
+    )
+
+    try:
         if not args.class_name and args.index is None:
             print("Error: Either --class-name or --index must be specified")
             sys.exit(1)
@@ -2273,6 +2131,5 @@ Examples:
         traceback.print_exc()
         sys.exit(1)
     finally:
-        # Restore stdout and close logger
-        sys.stdout = sys.__stdout__
-        logger.close()
+        print(f"Log saved to: {_log_path}")
+        _restore_logging()

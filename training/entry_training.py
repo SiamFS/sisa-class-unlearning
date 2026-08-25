@@ -8,12 +8,16 @@ import torch
 import torch.nn as nn
 import json
 import time
+from datetime import datetime
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report
 import torchvision.transforms as T
 
 # Import global configuration
 import config
+from utils.seeding import set_seed
+
+set_seed(config.SEED)
 
 from training.train_model import (
     train_model,
@@ -27,54 +31,24 @@ from plots import (
     create_overall_sisa_confusion_matrix,
     create_overall_sisa_roc_curve,
     create_overall_sisa_training_curves,
+    load_shard_class_indices,
 )
 from training.create_model import save_model_pytorch, load_model_pytorch, DEVICE
 from training.train_gating_model import train_gating
-
-# Enhanced logging class to save terminal output to files
-class TrainingLogger:
-    def __init__(self, log_file="training.txt"):
-        self.log_file = log_file
-        self.terminal = sys.stdout
-        
-        # Create log file if it doesn't exist
-        os.makedirs(os.path.dirname(os.path.abspath(log_file)) if os.path.dirname(log_file) else ".", exist_ok=True)
-        
-        # Open file in write mode to overwrite previous sessions
-        self.file = open(log_file, 'w', encoding='utf-8')
-        
-        # Write session header
-        self.file.write(f"{'='*80}\n")
-        self.file.write(f"SISA Training Session - {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        self.file.write(f"{'='*80}\n")
-        self.file.flush()
-    
-    def write(self, message):
-        self.terminal.write(message)
-        self.file.write(message)
-        self.file.flush()
-    
-    def flush(self):
-        self.terminal.flush()
-        self.file.flush()
-    
-    def close(self):
-        if hasattr(self, 'file'):
-            self.file.close()
-    
-    def __del__(self):
-        self.close()
+from training.replay_buffer import add_to_replay_buffer, compute_replay_ratio
+from utils.run_logging import setup_run_logging
 
 # --- Main Configuration ---
 project_name = config.PROJECT_NAME
 MODEL_NAME = config.MODEL_TYPE
-base_dir = f"../{config.PROJECTS_DIR}/{project_name}"
-sisa_data_dir = f"{base_dir}/sisa_data"
-models_dir = f"{base_dir}/models"
-reports_dir = f"{base_dir}/data_info"
+base_dir = os.path.join(config.PROJECTS_DIR, project_name)
+sisa_data_dir = os.path.join(base_dir, "sisa_data")
+models_dir = os.path.join(base_dir, "models")
+reports_dir = os.path.join(base_dir, "data_info")
 
 # --- Load SISA Metadata & Define Transforms ---
-with open(os.path.join(sisa_data_dir, "metadata.json"), 'r') as f:
+sisa_metadata_path = os.path.join(sisa_data_dir, "metadata.json")
+with open(sisa_metadata_path, 'r') as f:
     metadata = json.load(f)
 num_shards = metadata['num_shards']
 num_slices = metadata['num_slices']
@@ -110,7 +84,7 @@ def get_actual_classes_in_slice(shard_idx, slice_idx):
     """
     try:
         # Load the actual slice labels to see what classes are present
-        y_slice_path = f"../{config.PROJECTS_DIR}/{project_name}/sisa_data/shards/shard_{shard_idx+1}/slice_{slice_idx}_y.npy"
+        y_slice_path = os.path.join(config.PROJECTS_DIR, project_name, "sisa_data", "shards", f"shard_{shard_idx+1}", f"slice_{slice_idx}_y.npy")
         y_slice = np.load(y_slice_path)
         
         # Get unique classes in this slice
@@ -160,58 +134,12 @@ def get_incremental_validation_data(shard_idx, slice_idx, shard_metadatas, valid
     
     return x_val_filtered, y_val_filtered
 
-def get_gating_routed_validation_data(gating_model, x_val, y_val, target_shard_idx, 
-                                      cumulative_classes, dataset_mean, dataset_std, 
-                                      confidence_threshold=0.6):
-
-    if gating_model is None:
-        # Use standard class filtering if gating network unavailable
-        val_mask = np.isin(y_val, cumulative_classes)
-        x_val_filtered = x_val[val_mask]
-        y_val_filtered = y_val[val_mask]
-        print(f"   Standard validation (gating unavailable): {len(cumulative_classes)} classes, {len(x_val_filtered)} samples")
-        return x_val_filtered, y_val_filtered
-    
-    # Use gating network for intelligent routing
-    gating_transform = T.Compose([T.Normalize(dataset_mean, dataset_std)])
-    
-    with torch.no_grad():
-        # Convert to tensor and transform
-        x_val_tensor = torch.from_numpy(x_val.astype(np.float32)).to(DEVICE)
-        x_val_normalized = gating_transform(x_val_tensor)
-        
-        # Get gating predictions
-        gating_outputs = gating_model(x_val_normalized)
-        gating_probs = torch.softmax(gating_outputs, dim=1)
-        predicted_shards = torch.argmax(gating_probs, dim=1)
-        max_confidences = torch.max(gating_probs, dim=1)[0]
-        
-        # Create routing mask - route to target shard with minimum confidence
-        routing_mask = (predicted_shards == target_shard_idx) & (max_confidences >= confidence_threshold)
-        routing_mask_np = routing_mask.cpu().numpy()
-        
-        # Apply gating-based routing
-        x_val_gated = x_val[routing_mask_np]
-        y_val_gated = y_val[routing_mask_np]
-        
-        # Then filter by incremental learning classes (what slice should know)
-        if len(x_val_gated) > 0:
-            incremental_mask = np.isin(y_val_gated, cumulative_classes)
-            x_val_final = x_val_gated[incremental_mask]
-            y_val_final = y_val_gated[incremental_mask]
-        else:
-            x_val_final, y_val_final = np.array([]), np.array([])
-    
-    print(f"   Gating-routed validation: {len(x_val_final)} samples (from {len(x_val_gated)} gating-routed, {len(cumulative_classes)} classes)")
-    
-    return x_val_final, y_val_final
-
 def get_true_label_validation_data(shard_idx, cumulative_classes, validation_data):
 
     x_val, y_val = validation_data
     
     # Load shard metadata to get which classes this shard handles
-    shard_metadata_path = f"../{config.PROJECTS_DIR}/{project_name}/sisa_data/shards/shard_{shard_idx+1}/metadata.json"
+    shard_metadata_path = os.path.join(config.PROJECTS_DIR, project_name, "sisa_data", "shards", f"shard_{shard_idx+1}", "metadata.json")
     try:
         with open(shard_metadata_path, 'r') as f:
             shard_metadata = json.load(f)
@@ -230,15 +158,17 @@ def get_true_label_validation_data(shard_idx, cumulative_classes, validation_dat
     
     return x_val_filtered, y_val_filtered
 
-def evaluate_with_gating_network(shard_models, gating_model, class_names, threshold=None):
+def evaluate_with_self_routing(shard_models, shard_class_indices, class_names, threshold=None, gating_model=None):
     print("\n" + "="*20 + " Final SISA System Evaluation " + "="*20)
     x_test = np.load(os.path.join(sisa_data_dir, "test_data/x_test.npy"))
     y_test = np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy"))
 
-    for model in shard_models: model.eval()
-    gating_model.eval()
+    for model in shard_models:
+        if model is not None:
+            model.eval()
 
     all_final_preds = []
+    all_final_probs = []
     all_true_labels = []
 
     batch_size = config.BATCH_SIZE  # From global config
@@ -248,35 +178,47 @@ def evaluate_with_gating_network(shard_models, gating_model, class_names, thresh
             batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
             batch_y = y_test[i:i+batch_size]
 
-            batch_final_preds, _ = _run_sisa_batch(
-                batch_x_normalized, shard_models, gating_model, class_names, threshold
+            batch_final_preds, batch_probs = _run_sisa_batch(
+                batch_x_normalized, shard_models, class_names, shard_class_indices, threshold,
+                gating_model=gating_model,
             )
 
             all_final_preds.extend(batch_final_preds.cpu().numpy())
+            all_final_probs.append(batch_probs.cpu().numpy())
             all_true_labels.extend(batch_y)
-            
-    all_final_preds = np.array(all_final_preds)
-    all_true_labels = np.array(all_true_labels)
 
-    # Calculate accuracy using true SISA gating method
-    gating_accuracy = np.mean(all_final_preds == all_true_labels)
-    
+    all_final_preds = np.array(all_final_preds)
+    all_final_probs = np.concatenate(all_final_probs, axis=0)
+    all_true_labels = np.array(all_true_labels)
+    # W9: hand this single inference pass to the confusion-matrix/ROC plots below
+    # instead of each of them re-running _run_sisa_batch over the same test set.
+    precomputed_eval = (all_final_preds, all_final_probs, all_true_labels)
+
+    # Calculate accuracy using true SISA self-routing method
+    self_routing_accuracy = np.mean(all_final_preds == all_true_labels)
+
     print("\n" + "-"*60)
     print("Final Classification Report:")
     print("-"*60)
-    print("Using True SISA Gating Method (specialist routing)")
-    
-    report = classification_report(all_true_labels, all_final_preds, 
-                                 target_names=class_names, 
-                                 labels=np.arange(len(class_names)), 
+    print("Using True SISA Self-Routing Method (masked specialist confidence)")
+
+    report = classification_report(all_true_labels, all_final_preds,
+                                 target_names=class_names,
+                                 labels=np.arange(len(class_names)),
                                  zero_division=0)
-    final_accuracy = gating_accuracy
-    
+    # Dict form for structured storage (W7) -- same shape _get_training_metrics
+    # used to hand-reconstruct by regex from the printed string above.
+    report_dict = classification_report(all_true_labels, all_final_preds,
+                                 target_names=class_names,
+                                 labels=np.arange(len(class_names)),
+                                 zero_division=0, output_dict=True)
+    final_accuracy = self_routing_accuracy
+
     print(report)
     print(f"\nFinal SISA System Accuracy: {final_accuracy:.4f}")
     print("-"*60)
 
-    return final_accuracy, final_accuracy
+    return final_accuracy, final_accuracy, report_dict, precomputed_eval
 
 def check_class_balance_and_augmentation(shard_idx, class_names):
 
@@ -331,8 +273,12 @@ def check_class_balance_and_augmentation(shard_idx, class_names):
     STD_THRESHOLD = 1.5       # Standard deviation threshold for perfect balance
     
     if balance_ratio >= PERFECT_BALANCE_THRESHOLD and std_dev <= STD_THRESHOLD:
-        print("   Classes are perfectly balanced - NO AUGMENTATION")
-        return None
+        # W19: balanced no longer means "no augmentation". Augmentation is a regularizer
+        # first and an imbalance remedy second, and class-isolated CIFAR shards are
+        # perfectly balanced by construction -- so this branch always fired and the
+        # pipeline never augmented at all. Baseline = standard CIFAR crop + flip, no jitter.
+        print("   Classes are perfectly balanced - using baseline geometric augmentation")
+        return config.get_augmentation_config('baseline')
     elif balance_ratio >= BALANCE_THRESHOLD and std_dev <= 2.5:
         print("   Classes are well balanced - using minimal augmentation")
         return config.get_augmentation_config('minimal')
@@ -363,10 +309,9 @@ def update_shard_metadata_with_balance(shard_idx, balance_info):
     print(f"   Updated shard {shard_idx+1} metadata with balance information")
 
 if __name__ == "__main__":
-    # Initialize logging to save output to training.txt
-    logger = TrainingLogger("training.txt")
-    sys.stdout = logger
-    
+    # Project-scoped, timestamped logging (W10).
+    _restore_logging, _log_path = setup_run_logging(os.path.join(base_dir, "logs"), "training")
+
     print("Enhanced SISA Training with Balance-Based Augmentation")
     print("="*70)
     
@@ -414,7 +359,7 @@ if __name__ == "__main__":
 
     # Start timing base model training
     base_model_training_start_time = time.time()
-    
+
     for i in range(num_shards):
         print("\n" + "="*20 + f" Training Shard {i+1}/{num_shards} " + "="*20)
         shard_dir = os.path.join(models_dir, f"shard_{i+1}")
@@ -432,18 +377,13 @@ if __name__ == "__main__":
             'num_classes': len(active_classes)
         }
         update_shard_metadata_with_balance(i, balance_info)
-        
-        current_model, replay_buffer, shard_histories = None, None, []
-        
-        # Initialize replay buffer based on configuration
-        if config.USE_SMART_REPLAY:
-            from training.smart_replay import create_smart_replay_buffer
-            replay_buffer = create_smart_replay_buffer(config)
-            print("   - Using smart replay buffer with importance + temporal sampling")
-        else:
-            replay_buffer = {}
-            print("   - Using traditional random replay buffer")
-        
+
+        shard_histories = []
+        current_model = None
+        replay_buffer = {}
+        replay_seen_counts = {}  # per-class "samples ever seen" count, for reservoir sampling
+        replay_rng = np.random.default_rng(config.SEED)
+
         final_model_path = os.path.join(shard_dir, f"final_model_shard{i+1}_{MODEL_NAME}.pth")
         
         if os.path.exists(final_model_path):
@@ -473,9 +413,13 @@ if __name__ == "__main__":
                     validation_data=validation_data
                 )
                 
-                # Use static replay ratio from config
-                current_replay_ratio = config.REPLAY_RATIO
-                print(f"   - Using replay ratio: {current_replay_ratio}")
+                # W18: class-balanced replay ratio, derived from how many classes are in
+                # the buffer vs. in this slice. A fixed 0.3 gave the newest class ~9x the
+                # per-class batch share of each older one, which is what drove the measured
+                # task-recency bias. Deterministic (no RNG), so exactness is unaffected.
+                current_replay_ratio = compute_replay_ratio(replay_buffer, y_slice)
+                print(f"   - Using replay ratio: {current_replay_ratio:.3f} "
+                      f"({len(replay_buffer)} replay class(es), {len(np.unique(y_slice))} in slice)")
                 
                 # START: Track pure training time (before train_model call)
                 slice_train_start = time.time()
@@ -494,7 +438,6 @@ if __name__ == "__main__":
                     dataset_std=DATASET_STD,
                     training_type='incremental' if current_model is not None else 'fresh',
                     augmentation_config=augmentation_config,  # Use balance-based augmentation
-                    use_smart_replay=config.USE_SMART_REPLAY,
                     device=DEVICE
                 )
                 
@@ -539,22 +482,9 @@ if __name__ == "__main__":
                             active_classes,
                         )
                 
-                # Update replay buffer with current slice data
-                if config.USE_SMART_REPLAY and hasattr(replay_buffer, 'add_samples'):
-                    # Smart replay buffer - add with importance scoring
-                    replay_buffer.add_samples(x_slice, y_slice, current_model, DEVICE)
-                else:
-                    # Traditional replay buffer - simple class-wise storage
-                    unique_labels_in_slice = np.unique(y_slice)
-                    for label in unique_labels_in_slice:
-                        mask = (y_slice == label)
-                        class_x_data = x_slice[mask]
-                        class_y_data = y_slice[mask]
-                        if label in replay_buffer:
-                            replay_buffer[label]['X'] = np.vstack([replay_buffer[label]['X'], class_x_data])
-                            replay_buffer[label]['y'] = np.concatenate([replay_buffer[label]['y'], class_y_data])
-                        else:
-                            replay_buffer[label] = {'X': class_x_data, 'y': class_y_data}
+                # Update replay buffer with current slice data (capped per class, W4)
+                add_to_replay_buffer(replay_buffer, x_slice, y_slice, replay_rng,
+                                      config.MAX_REPLAY_SAMPLES_PER_CLASS, replay_seen_counts)
                         
             save_model_pytorch(current_model, final_model_path)
             all_shard_histories.append(shard_histories)
@@ -562,14 +492,17 @@ if __name__ == "__main__":
             
         all_shard_final_models.append(current_model)
 
-    print("\n" + "="*20 + " Final Evaluation with Pre-trained Gating Network " + "="*20)
-    
-    # Use the gating network we trained at the beginning
-    if gating_model is not None:
-        classified_accuracy, overall_accuracy = evaluate_with_gating_network(all_shard_final_models, gating_model, class_names)
-    else:
-        print("Gating network not available for final evaluation")
-        classified_accuracy, overall_accuracy = 0.0, 0.0
+    print("\n" + "="*20 + " Final Evaluation with Gating-Network Routing " + "="*20)
+
+    # W16: the gating network trained above is the real router now (measured
+    # 58%->70% combined accuracy over confidence-based self-routing -- see
+    # IMPLEMENTATION_PLAN.md W15/W16). Falls back to confidence-based
+    # self-routing only if gating training itself failed above (gating_model
+    # is None in that case).
+    shard_class_indices = load_shard_class_indices(sisa_data_dir, num_shards)
+    classified_accuracy, overall_accuracy, final_report_dict, final_eval_precomputed = evaluate_with_self_routing(
+        all_shard_final_models, shard_class_indices, class_names, gating_model=gating_model
+    )
 
     # End timing for base model training (AFTER final evaluation, BEFORE visualizations)
     base_model_training_end_time = time.time()
@@ -579,25 +512,26 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("CREATING OVERALL SISA SYSTEM CONFUSION MATRIX")
     print("=" * 50)
-    
+
     # Load test data for final evaluation
     test_data_dir = os.path.join(sisa_data_dir, "test_data")
     x_test = np.load(os.path.join(test_data_dir, "x_test.npy"))
     y_test = np.load(os.path.join(test_data_dir, "y_test.npy"))
-    
+
     create_overall_sisa_confusion_matrix(
-        all_shard_final_models, 
-        gating_model, 
-        x_test, 
-        y_test, 
-        class_names, 
-        reports_dir, 
-        'final_evaluation'
+        all_shard_final_models,
+        shard_class_indices,
+        x_test,
+        y_test,
+        class_names,
+        reports_dir,
+        'final_evaluation',
+        precomputed=final_eval_precomputed,
     )
 
     if gating_model is not None:
         print("\n" + "=" * 50)
-        print("ANALYZING GATING ROUTING DISTRIBUTIONS")
+        print("ANALYZING GATING ROUTING DISTRIBUTIONS (this is the real router used above)")
         print("=" * 50)
 
         create_gating_routing_barplots(
@@ -613,15 +547,16 @@ if __name__ == "__main__":
     print("\n" + "=" * 50)
     print("CREATING OVERALL SISA SYSTEM ROC CURVES")
     print("=" * 50)
-    
+
     create_overall_sisa_roc_curve(
         all_shard_final_models,
-        gating_model,
+        shard_class_indices,
         x_test,
         y_test,
         class_names,
         reports_dir,
-        'final_evaluation'
+        'final_evaluation',
+        precomputed=final_eval_precomputed,
     )
 
     # Create overall SISA system training curves
@@ -636,6 +571,23 @@ if __name__ == "__main__":
     )
 
     total_time = time.time() - overall_start_time
+
+    # W7: persist every reported number as structured JSON -- unlearning reads
+    # this instead of scraping training.txt.
+    training_metrics = {
+        "final_accuracy": float(classified_accuracy),
+        "gating_training_time_with_io": float(gating_training_time),
+        "gating_training_time_pure": float(pure_gating_training_time),
+        "base_model_training_time_with_eval": float(base_model_training_time),
+        "base_model_training_time_pure": float(pure_training_time),
+        "total_training_time": float(total_time),
+        "classification_report": final_report_dict,
+        "timestamp": datetime.now().isoformat(),
+    }
+    training_metrics_path = os.path.join(sisa_data_dir, "training_metrics.json")
+    with open(training_metrics_path, 'w', encoding='utf-8') as f:
+        json.dump(training_metrics, f, indent=2)
+
     print("\n" + "=" * 70)
     print("Enhanced SISA Training Completed")
     print("=" * 70)
@@ -643,15 +595,13 @@ if __name__ == "__main__":
     print(f"Gating Network Training Time (with I/O): {gating_training_time:.2f} seconds")
     print(f"Gating Network Training Time (pure): {pure_gating_training_time:.2f} seconds")
     print(f"Base Model Training Time (with eval): {base_model_training_time:.2f} seconds")
-    print(f"Base Model Training Time (pure): {pure_training_time:.2f} seconds") 
+    print(f"Base Model Training Time (pure): {pure_training_time:.2f} seconds")
     print(f"Total Training Time: {total_time:.2f} seconds")
     print(f"\nFinal SISA System Accuracy: {classified_accuracy:.4f}")
     print("Confidence Threshold Used: disabled for final evaluation")
     print(f"Models and reports saved to: {base_dir}")
-    print("Training log saved to: training.txt")
+    print(f"Training metrics saved to: {training_metrics_path}")
+    print(f"Log saved to: {_log_path}")
     print("=" * 70)
-    
-    # Cleanup logging
-    sys.stdout = logger.terminal
-    logger.close()
-    print("Training completed! Check training.txt for detailed logs.")
+
+    _restore_logging()

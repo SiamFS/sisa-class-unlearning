@@ -1,6 +1,8 @@
 import numpy as np
 from collections import Counter
 
+from data_processing.semantic_clustering import cluster_classes_semantically
+
 def create_shards_with_indices(X, y, part_number, class_names=None):
 
     if part_number <= 0:
@@ -15,7 +17,6 @@ def create_shards_with_indices(X, y, part_number, class_names=None):
 def _create_class_isolated_shards(X, y, indices, part_number, class_names):
 
     # Mathematical parameters from data_process.txt analysis
-    ALPHA = 5.0  # Imbalance threshold multiplier
     BETA = 0.6   # Max shard fraction per class
     GAMMA = 0.5  # Minimum split efficiency factor
     MAX_IMBALANCE_RATIO = 3.0  # Maximum acceptable shard imbalance
@@ -54,16 +55,42 @@ def _create_class_isolated_shards(X, y, indices, part_number, class_names):
     # 3. Smart class assignment with load balancing
     shards_content = [[] for _ in range(part_number)]
     shard_sizes = np.zeros(part_number)
-    
+
     # Sort classes by size (descending) for better balancing
     sorted_class_indices = sorted(class_data.keys(), key=lambda k: class_data[k]['count'], reverse=True)
-    
+
+    # W17: group standard-path classes by WordNet semantic similarity (not just
+    # sample-count balance) so shards are visually/semantically distinct --
+    # makes the gating network's routing decision easier by construction.
+    # Falls back to the pure balance algorithm if WordNet data can't be
+    # loaded (e.g. no internet access for the one-time NLTK download) rather
+    # than crashing the whole run.
+    if part_number > len(class_data):
+        # More shards requested than classes exist: clustering can't produce
+        # more clusters than samples. Falls back to the balance algorithm,
+        # which already tolerates this (extra shards end up empty and are
+        # skipped when the final shards are built below).
+        class_to_shard_map = None
+        print(f"    Note: {part_number} shards requested for only {len(class_data)} classes -- "
+              f"semantic clustering isn't meaningful here, falling back to balance assignment.")
+    else:
+        try:
+            semantic_clusters = cluster_classes_semantically(class_names, part_number)
+            class_to_shard_map = {}
+            for shard_idx, cluster_class_indices in enumerate(semantic_clusters):
+                for class_idx in cluster_class_indices:
+                    class_to_shard_map[class_idx] = shard_idx
+            print("🧬 Clustered classes by semantic similarity (WordNet) for shard assignment.")
+        except Exception as e:
+            class_to_shard_map = None
+            print(f"    Warning: semantic clustering unavailable ({e}); falling back to pure balance assignment.")
+
     print("\n🔄 Assigning classes to shards with balanced load distribution...")
-    
+
     for class_idx in sorted_class_indices:
         class_name = class_names[class_idx]
         class_count = class_data[class_idx]['count']
-        
+
         # Find target shard with advanced balancing
         if class_idx in classes_to_split:
             # For large classes, use asymmetric splitting strategy
@@ -71,8 +98,11 @@ def _create_class_isolated_shards(X, y, indices, part_number, class_names):
             target_shard_idx = _apply_asymmetric_splitting(
                 class_idx, class_data, shards_content, shard_sizes, part_number, GAMMA
             )
+        elif class_to_shard_map is not None:
+            # Standard assignment: semantic cluster membership decides the shard
+            target_shard_idx = class_to_shard_map[class_idx]
         else:
-            # Standard balanced assignment
+            # Fallback: pure sample-count balance (semantic clustering unavailable)
             target_shard_idx = _find_balanced_shard(shard_sizes, class_count, MAX_IMBALANCE_RATIO)
         
         # Add class to selected shard

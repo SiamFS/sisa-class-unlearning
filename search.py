@@ -22,21 +22,22 @@ class SISASearchTool:
         print(f"Initializing SISA Search Tool for project: '{project_name}' with model: '{model_name}'")
         self.project_name = project_name
         self.model_name = model_name
-        self.base_dir = f"../{config.PROJECTS_DIR}/{self.project_name}"
+        self.base_dir = os.path.join(config.PROJECTS_DIR, self.project_name)
         self.models_dir = os.path.join(self.base_dir, "models")
         self.data_dir = os.path.join(self.base_dir, "sisa_data")
         self.reports_dir = os.path.join(self.base_dir, "data_info")
         
         # Load metadata first to get class names and normalization
         self.metadata = self._load_metadata()
-        
-        # Load class names dynamically from metadata
-        if 'class_names' in self.metadata:
-            self.class_names = self.metadata['class_names']
-            print(f"Loaded {len(self.class_names)} class names from metadata: {self.class_names}")
-        else:
-            print("Warning: Class names not found in metadata. Using CIFAR-10 defaults.")
-            self.class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+
+        # Load class names dynamically from metadata (no dataset-specific fallback:
+        # silently defaulting to CIFAR-10 labels would mislabel any other dataset)
+        if 'class_names' not in self.metadata:
+            raise KeyError(
+                "metadata.json is missing 'class_names'. Re-run data_processing/entry_data_processing.py first."
+            )
+        self.class_names = self.metadata['class_names']
+        print(f"Loaded {len(self.class_names)} class names from metadata: {self.class_names}")
         
         # Load normalization stats dynamically from metadata
         if 'normalization_mean' in self.metadata and 'normalization_std' in self.metadata:
@@ -122,34 +123,39 @@ class SISASearchTool:
         return []
 
     def _load_models(self):
-        """Load all shard models and gating model"""
+        """Load all shard models (self-routing: no gating network needed)."""
         print("Loading SISA models...")
-        
-        # Load shard models
-        shard_models = []
+
         num_shards = self.metadata.get('num_shards', 2)  # Default to 2 shards
-        
+        # Positional list (index i == shard i+1); missing models stay None so
+        # they line up with self.shard_classes / shard_class_indices by index.
+        shard_models = [None] * num_shards
+
         for i in range(num_shards):
             model_path = os.path.join(self.models_dir, f"shard_{i+1}", f"final_model_shard{i+1}_{self.model_name}.pth")
-            
+
             if os.path.exists(model_path):
                 model, _ = load_model_pytorch(model_path)
-                shard_models.append(model.eval())
+                shard_models[i] = model.eval()
                 print(f"   - Loaded shard {i+1} model")
             else:
                 print(f"   - Warning: No model found for shard {i+1}")
 
-        # Load gating model
-        gating_model_path = os.path.join(self.models_dir, "gating_model.pth")
-        gating_model = None
-        if os.path.exists(gating_model_path):
-            gating_model, _ = load_model_pytorch(gating_model_path, num_shards=num_shards)
-            gating_model = gating_model.eval()
-            print("   - Loaded gating model")
-        else:
-            print("   - Warning: Gating model not found")
-            
-        return shard_models, gating_model
+        return shard_models
+
+    def _load_gating_model(self):
+        """W16: the gating network is the real router now if one exists for this
+        project; falls back to confidence-based self-routing (gating_model=None)
+        for older projects trained before this switch."""
+        num_shards = self.metadata.get('num_shards', 2)
+        gating_path = os.path.join(self.models_dir, "gating_model.pth")
+        if os.path.exists(gating_path):
+            gating_model, _ = load_model_pytorch(gating_path, num_shards=num_shards)
+            gating_model.eval()
+            print("   - Loaded gating network (real router)")
+            return gating_model
+        print("   - No gating network found; falling back to confidence-based self-routing")
+        return None
 
     def search_class_predictions(self, class_name: str, num_samples: int = config.DEFAULT_SEARCH_SAMPLES, threshold: float = config.CONFIDENCE_THRESHOLD):
         """Search for predictions on a specific class with visualization"""
@@ -164,9 +170,10 @@ class SISASearchTool:
         print("Searching in current SISA test dataset...")
         
         # Load models
-        shard_models, gating_model = self._load_models()
-        
-        if not shard_models or not gating_model:
+        shard_models = self._load_models()
+        gating_model = self._load_gating_model()
+
+        if not shard_models or all(model is None for model in shard_models):
             print("ERROR: Could not load required models!")
             return
         
@@ -190,8 +197,10 @@ class SISASearchTool:
         print(f"Found {len(class_samples)} total '{class_name}' samples in current test set")
         print(f"Analyzing first {samples_to_analyze} samples...")
         
-        # Make predictions using TRUE SISA routing (same as evaluation)
-        predictions, confidences = self._predict_with_true_sisa_batch(selected_samples, shard_models, gating_model, threshold)
+        # Make predictions using TRUE SISA self-routing (same as training/unlearning evaluation)
+        num_shards = self.metadata.get('num_shards', 2)
+        shard_class_indices = [self.shard_classes.get(i, []) for i in range(num_shards)]
+        predictions, confidences = self._predict_with_true_sisa_batch(selected_samples, shard_models, shard_class_indices, threshold, gating_model)
         
         # Calculate accuracy
         correct_predictions = 0
@@ -239,24 +248,26 @@ class SISASearchTool:
         print(f"\nVisualization saved to: {os.path.join(self.reports_dir, f'Class_Search_{class_name}_Analysis.png')}")
         print("="*70)
 
-    def _predict_with_true_sisa_batch(self, samples, shard_models, gating_model, threshold):
-        """Use TRUE SISA routing (_run_sisa_batch) for consistency with evaluation"""
+    def _predict_with_true_sisa_batch(self, samples, shard_models, shard_class_indices, threshold, gating_model=None):
+        """Use TRUE SISA routing (_run_sisa_batch) for consistency with evaluation --
+        gating-network routing (W16) if available, confidence-based self-routing otherwise."""
         predictions = []
         confidences = []
-        
+
         with torch.no_grad():
             for sample in samples:
                 # Convert single sample to batch format
                 batch_x = torch.from_numpy(sample).unsqueeze(0).float()
                 batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
-                
+
                 # Use TRUE SISA routing (same as evaluation)
                 batch_preds, batch_probs = _run_sisa_batch(
-                    batch_x_normalized, 
-                    shard_models, 
-                    gating_model, 
-                    self.class_names, 
-                    threshold
+                    batch_x_normalized,
+                    shard_models,
+                    self.class_names,
+                    shard_class_indices,
+                    threshold,
+                    gating_model=gating_model,
                 )
                 
                 pred = batch_preds[0].item()
@@ -270,100 +281,6 @@ class SISASearchTool:
                 confidences.append(conf)
         
         return predictions, confidences
-
-    def _predict_with_gating(self, samples, shard_models, gating_model, threshold):
-        """Make predictions using an improved gating network approach with ensemble fallback"""
-        predictions = []
-        confidences = []
-        detailed_results = []
-        
-        with torch.no_grad():
-            for idx, sample in enumerate(samples):
-                # Convert single sample to batch format
-                batch_x = torch.from_numpy(sample).unsqueeze(0).float()
-                batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
-                
-                # Get gating prediction
-                gating_logits = gating_model(batch_x_normalized)
-                gating_probs = torch.softmax(gating_logits, dim=1)
-                shard_pred = gating_logits.argmax(dim=1).item()
-                
-                # Get specialist predictions for all shards
-                specialist_outputs = [torch.softmax(model(batch_x_normalized), dim=1) for model in shard_models]
-                
-                # Analyze what each shard predicts
-                shard_predictions = []
-                shard_confidences = []
-                for shard_idx, shard_output in enumerate(specialist_outputs):
-                    conf, pred = torch.max(shard_output[0], dim=0)
-                    shard_predictions.append(pred.item())
-                    shard_confidences.append(conf.item())
-                
-                # IMPROVED DECISION LOGIC:
-                # 1. Check if gating selection is confident AND the selected shard is confident
-                gating_confidence = gating_probs[0, shard_pred].item()
-                selected_shard_confidence = shard_confidences[shard_pred]
-                
-                # Store detailed analysis
-                detailed_info = {
-                    'sample_idx': idx + 1,
-                    'gating_selected_shard': shard_pred + 1,
-                    'gating_confidence': gating_confidence,
-                    'gating_weights': gating_probs[0].cpu().numpy().tolist(),
-                    'shard_predictions': [(self.class_names[pred], f"{conf:.3f}") for pred, conf in zip(shard_predictions, shard_confidences)],
-                }
-                
-                final_prediction = None
-                final_confidence = 0.0
-                method_used = "unknown"
-                
-                # Find the most confident shard (but only consider valid class predictions)
-                best_shard = -1
-                best_confidence = 0.0
-                
-                # Check each shard and only consider predictions for classes they were trained on
-                for shard_idx, (pred_class, confidence) in enumerate(zip(shard_predictions, shard_confidences)):
-                    # Only consider this shard if it predicts a class it was trained on
-                    if pred_class in self.shard_classes.get(shard_idx, []):
-                        if confidence > best_confidence:
-                            best_shard = shard_idx
-                            best_confidence = confidence
-                
-                # Strategy 1: Use best shard if it's significantly more confident AND predicting valid class
-                if (best_shard != -1 and 
-                    best_confidence >= threshold and 
-                    best_confidence > selected_shard_confidence + config.CONFIDENCE_BOOST_THRESHOLD and
-                    shard_predictions[best_shard] in self.shard_classes.get(best_shard, [])):
-                    
-                    final_prediction = shard_predictions[best_shard]
-                    final_confidence = best_confidence
-                    method_used = "best_shard"
-                    detailed_info['override_shard'] = best_shard + 1
-                    detailed_info['override_reason'] = f"Better confidence: {best_confidence:.3f} vs {selected_shard_confidence:.3f} (valid class)"
-                
-                # Strategy 2: Use gating if selected shard is confident enough AND predicting valid class
-                elif (selected_shard_confidence >= threshold and 
-                      shard_predictions[shard_pred] in self.shard_classes.get(shard_pred, [])):
-                    final_prediction = shard_predictions[shard_pred]
-                    final_confidence = selected_shard_confidence
-                    method_used = "gating"
-                
-                # If gating confidence is too low, mark as uncertain but still use selected shard
-                else:
-                    final_prediction = shard_predictions[shard_pred]
-                    final_confidence = selected_shard_confidence
-                    method_used = "gating_uncertain"
-                
-                # Store results
-                predictions.append(final_prediction)
-                confidences.append(final_confidence)
-                
-                detailed_info['final_method'] = method_used
-                detailed_info['final_prediction'] = self.class_names[final_prediction] if final_prediction != -1 else 'UNKNOWN'
-                detailed_info['final_confidence'] = final_confidence
-                detailed_results.append(detailed_info)
-        
-        return predictions, confidences, detailed_results
 
     def _create_prediction_visualization(self, samples, true_labels, predictions, confidences, class_name):
         """Create a 4x4 grid visualization similar to unlearning verification"""
@@ -432,7 +349,7 @@ def main():
         search_tool.search_class_predictions(args.class_name, args.samples, args.threshold)
         
         print("\nAnalysis completed")
-        print(f"Check the generated visualization in: ../projects/{args.project}/data_info/")
+        print(f"Check the generated visualization in: {os.path.join(config.PROJECTS_DIR, args.project, 'data_info')}")
         
     except Exception as e:
         print(f"\nAn error occurred: {e}")

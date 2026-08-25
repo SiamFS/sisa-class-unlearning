@@ -23,35 +23,17 @@ if str(CURRENT_DIR) not in sys.path:
 from sharding import create_shards_with_indices
 from slicing import create_slices
 from plots import create_data_processing_visualizations, visualize_sample_images
-# Setup automatic output logging
-class Logger:
-    def __init__(self, filename):
-        self.terminal = sys.stdout
-        self.log = open(filename, 'w', encoding='utf-8')
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-        self.log.flush()
-
-    def flush(self):
-        pass
-
-# Initialize automatic logging
-sys.stdout = Logger('data_processing.txt')
-
-# Add header with timestamp
-print("=" * 80)
-print("SISA FRAMEWORK - DATA PROCESSING")
-print("=" * 80)
-print(f"Processing started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-print("=" * 80)
+from datasets import get_dataset_class
 
 sys.path.append('..')
 import config
+from utils.seeding import set_seed
+from utils.run_logging import setup_run_logging
 
-# Get class names from dataset (configurable for different datasets)
-class_names = torchvision.datasets.CIFAR10(root=config.DATA_DIR, train=True, download=True).classes
+set_seed(config.SEED)
+
+# W12: which dataset to load is a config choice, not a hardcoded torchvision call.
+DatasetClass = get_dataset_class(config.DATASET)
 
 # Define command-line arguments with config.py defaults
 parser = argparse.ArgumentParser(description='SISA Framework Sequential Data Processing')
@@ -63,59 +45,66 @@ args = parser.parse_args()
 project_name = config.PROJECT_NAME
 num_shards = args.num_shards
 num_slices = args.num_slices
-base_dir = f"../{config.PROJECTS_DIR}/{project_name}"
-data_info_dir = f"{base_dir}/data_info"
+base_dir = os.path.join(config.PROJECTS_DIR, project_name)
+data_info_dir = os.path.join(base_dir, "data_info")
 os.makedirs(base_dir, exist_ok=True)
 os.makedirs(data_info_dir, exist_ok=True)
 
+# Project-scoped, timestamped logging (W10) -- now that base_dir is known.
+_restore_logging, _log_path = setup_run_logging(os.path.join(base_dir, "logs"), "data_processing")
+
+print("=" * 80)
+print("SISA FRAMEWORK - DATA PROCESSING")
+print("=" * 80)
+print(f"Processing started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 80)
 
 print(f"   - Number of Shards: {num_shards}")
 print(f"   - Number of Slices per Shard: {num_slices}")
 
-def load_cifar10_data():
-    """Load CIFAR-10 data and implement a 70-10-20 split (train-validation-test)."""
-    cifar10_train = torchvision.datasets.CIFAR10(root=config.DATA_DIR, train=True, download=True)
-    cifar10_test = torchvision.datasets.CIFAR10(root=config.DATA_DIR, train=False, download=True)
+def load_dataset():
+    """Load config.DATASET using the canonical split: the official train set
+    (carved into train/validation) and the official test set, untouched."""
+    dataset_train = DatasetClass(root=config.DATA_DIR, train=True, download=True)
+    dataset_test = DatasetClass(root=config.DATA_DIR, train=False, download=True)
+    class_names = dataset_train.classes
 
-    x_train_val = cifar10_train.data
-    y_train_val = np.array(cifar10_train.targets)
-    x_test = cifar10_test.data
-    y_test = np.array(cifar10_test.targets)
-
-    # Combine for unified processing and splitting
-    x_combined = np.concatenate([x_train_val, x_test], axis=0)
-    y_combined = np.concatenate([y_train_val, y_test], axis=0)
+    x_train_full = dataset_train.data
+    y_train_full = np.array(dataset_train.targets)
+    x_test = dataset_test.data
+    y_test = np.array(dataset_test.targets)
 
     # Convert to PyTorch format (C, H, W) and normalize to [0, 1]
-    x_combined = np.transpose(x_combined, (0, 3, 1, 2)).astype(np.float32) / 255.0
-    
+    x_train_full = np.transpose(x_train_full, (0, 3, 1, 2)).astype(np.float32) / 255.0
+    x_test = np.transpose(x_test, (0, 3, 1, 2)).astype(np.float32) / 255.0
+
     print(f"Loaded {config.DATASET_NAME} with preprocessing:")
-    print(f"   - Combined data shape: {x_combined.shape}")
-    print(f"   - Data range: [{x_combined.min():.2f}, {x_combined.max():.2f}]")
+    print(f"   - Official train shape: {x_train_full.shape}")
+    print(f"   - Official test shape: {x_test.shape}")
+    print(f"   - Data range: [{x_train_full.min():.2f}, {x_train_full.max():.2f}]")
 
-    # Implement 70-10-20 split (train-validation-test)
-    x_train, x_temp, y_train, y_temp = train_test_split(
-        x_combined, y_combined, test_size=0.3, random_state=42, stratify=y_combined
-    )
-    x_val, x_test, y_val, y_test = train_test_split(
-        x_temp, y_temp, test_size=(2/3), random_state=42, stratify=y_temp
+    # Carve validation out of the official 50k train set ONLY (45k/5k stratified).
+    # The official 10k test set is never resplit or mixed with train.
+    x_train, x_val, y_train, y_val = train_test_split(
+        x_train_full, y_train_full, test_size=0.1, random_state=config.SEED, stratify=y_train_full
     )
 
-    total_samples = len(x_combined)
-    print("Data split completed:")
+    total_samples = len(x_train_full) + len(x_test)
+    print(f"Data split completed (canonical {config.DATASET_NAME} split):")
     print(f"   - Train: {len(x_train):,} samples ({len(x_train)/total_samples:.1%})")
     print(f"   - Validation: {len(x_val):,} samples ({len(x_val)/total_samples:.1%})")
-    print(f"   - Test: {len(x_test):,} samples ({len(x_test)/total_samples:.1%})")
-    
+    print(f"   - Test: {len(x_test):,} samples ({len(x_test)/total_samples:.1%}) [official {config.DATASET_NAME} test set, untouched]")
+
     split_info = {
         'total_samples': total_samples,
         'train_samples': len(x_train),
         'val_samples': len(x_val),
         'test_samples': len(x_test),
-        'random_state': 42
+        'random_state': config.SEED,
+        'split_strategy': f'canonical_{config.DATASET}_official_train_test',
     }
-    
-    return x_train, y_train, split_info, x_test, y_test, x_val, y_val
+
+    return x_train, y_train, split_info, x_test, y_test, x_val, y_val, class_names
 
 def create_data_visualizations():
     """Generates comprehensive visualizations for SISA data processing."""
@@ -160,7 +149,7 @@ def create_data_visualizations():
 # --- Main Execution ---
 
 # Load data
-x_train, y_train, split_info, x_test, y_test, x_val, y_val = load_cifar10_data()
+x_train, y_train, split_info, x_test, y_test, x_val, y_val, class_names = load_dataset()
 
 # --- NEW: Dynamically calculate normalization statistics from the training data ---
 print("\nCalculating normalization statistics from the training set...")
@@ -308,3 +297,6 @@ print("Strategy: Class Isolation sharding and Class-Sequential slicing")
 print(f"NPY data saved to: {sisa_data_dir}")
 print(f"Save time: {save_time:.2f} seconds ({total_slices_saved} slices)")
 print("=" * 60)
+print(f"Log saved to: {_log_path}")
+
+_restore_logging()

@@ -52,64 +52,235 @@ def _apply_temperature_tensor(probs: torch.Tensor, temperature: float) -> torch.
 
 
 
+def _scatter_local_to_global(
+    local_output: torch.Tensor,
+    owned_classes_sorted: Sequence[int],
+    num_global_classes: int,
+    device,
+) -> torch.Tensor:
+    """Place a shard specialist's output into full global class space.
+
+    A specialist's head may be sized to only the classes it currently owns
+    (dynamic head after unlearning, plan W6) or to the full global class
+    count (a shard not yet touched by unlearning). Both are handled the same
+    way here: an already global-width tensor passes through unchanged;
+    otherwise its columns are assumed ordered by `sorted(owned_classes_sorted)`
+    and are scattered into their global positions, leaving every other column
+    at 0.
+    """
+    if local_output.shape[1] == num_global_classes:
+        return local_output
+    global_output = torch.zeros(local_output.size(0), num_global_classes, device=device)
+    idx = torch.tensor(list(owned_classes_sorted), device=device, dtype=torch.long)
+    global_output[:, idx] = local_output
+    return global_output
+
+
+def load_shard_class_indices(data_dir: str, num_shards: int) -> List[List[int]]:
+    """Read each shard's owned class indices from its metadata.json.
+
+    This is the single source of truth for self-routing: which classes a shard
+    is a specialist for is read directly from data on disk (never learned),
+    so routing carries nothing that unlearning would need to remove.
+    """
+    shard_class_indices: List[List[int]] = []
+    for shard_idx in range(num_shards):
+        meta_path = os.path.join(data_dir, "shards", f"shard_{shard_idx + 1}", "metadata.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                shard_meta = json.load(f)
+            shard_class_indices.append(shard_meta.get('class_indices_present', []))
+        else:
+            shard_class_indices.append([])
+    return shard_class_indices
+
+
 def _run_sisa_batch(
     batch_x_normalized: torch.Tensor,
     shard_models: List[torch.nn.Module],
-    gating_model: torch.nn.Module,
     class_names: List[str],
+    shard_class_indices: List[List[int]],
     threshold: Optional[float] = None,
+    gating_model: Optional[torch.nn.Module] = None,
+    routing_mode: Optional[str] = None,
 ):
-    """Execute SISA inference for a batch using TRUE gating routing (efficiency optimized)."""
-    gating_logits = gating_model(batch_x_normalized)
-    gating_probs = torch.softmax(gating_logits, dim=1)
+    """Execute SISA inference for a batch.
 
+    `routing_mode` (defaults to `config.ROUTING_MODE`) selects the mechanism:
+
+    - `'cosine'` (W21): parameter-free. Each specialist scores the batch by its highest
+      cosine similarity to one of its owned class vectors; the highest-scoring shard
+      wins. Because both features and class vectors are L2-normalized, these scores are
+      bounded and comparable across independently trained specialists -- the property
+      raw softmax confidence and logsumexp energy both lack (measured 61.4% and 65.6%
+      routing respectively, versus 75.1% for cosine-to-prototype, in
+      experiments/gate_free_routing_probe.py). Nothing here is a separate learned
+      component, so a deletion needs no router retrain: the affected shard's own
+      retrain rebuilds its routing signal, and every other shard never saw the class.
+    - `'gating'`: the learned router described below.
+    - `'confidence'`: the original masked-softmax fallback described below.
+
+    Two further routing mechanisms, selected by whether `gating_model` is given:
+
+    - `gating_model` provided (W16): a small learned router picks the winning
+      shard directly (measured 58%->70% combined accuracy vs. confidence-based
+      routing -- see IMPLEMENTATION_PLAN.md W15/W16). Because this router's
+      weights are shaped by training on real images of every class -- including
+      whatever gets deleted later -- it must be retrained excluding a class's
+      data every time that class is unlearned (train_gating(excluded_classes=...),
+      wired in from unlearning/sisa_unlearning.py) for the system to stay exact:
+      an untrained-on-cat gate and a retrained-to-exclude-cat gate must behave
+      indistinguishably on cat images, which is only true right after a retrain.
+    - `gating_model=None` (default, original design): parameter-free
+      confidence-based self-routing -- every specialist's softmax is masked to
+      the classes its shard owns (from shard metadata, not learned), and the
+      highest-confidence owned class across all specialists wins. Nothing
+      learned in this path, so nothing needs retraining when a class is
+      deleted -- kept as the fallback for any caller not wired up to a gate.
+    """
     num_classes = len(class_names)
     batch_size = batch_x_normalized.size(0)
-    
-    final_preds = torch.empty(batch_size, dtype=torch.long, device=DEVICE)
-    combined_probabilities = torch.empty((batch_size, num_classes), dtype=torch.float32, device=DEVICE)
 
-    # TRUE SISA APPROACH: Route each sample to its chosen shard only
-    for idx in range(batch_size):
-        # Get gating decision for this sample
-        chosen_shard_idx = torch.argmax(gating_probs[idx]).item()
-        confidence = gating_probs[idx][chosen_shard_idx].item()
-        
-        # Only process through chosen shard (efficiency optimization!)
-        single_sample = batch_x_normalized[idx:idx+1]  # Keep batch dimension
-        if shard_models[chosen_shard_idx] is not None:
-            with torch.no_grad():
-                specialist_logits = shard_models[chosen_shard_idx](single_sample)
-                specialist_probs = torch.softmax(specialist_logits, dim=1)[0]  # Remove batch dim
-        else:
-            # Fallback for None shard
-            specialist_probs = torch.full((num_classes,), 1.0 / num_classes, device=DEVICE)
-        
-        # Apply temperature scaling
-        chosen_probs = _apply_temperature_tensor(specialist_probs.unsqueeze(0), config.PRIMARY_SPECIALIST_TEMPERATURE)[0]
-        final_pred = torch.argmax(chosen_probs).item()
+    if routing_mode is None:
+        routing_mode = getattr(config, 'ROUTING_MODE', 'gating')
 
-        # Apply confidence thresholding if specified
+    if routing_mode == 'cosine':
+        combined_probabilities = _route_via_cosine(
+            batch_x_normalized, shard_models, shard_class_indices, num_classes
+        )
+        top_confidence, final_preds = combined_probabilities.max(dim=1)
         if threshold is not None:
-            if gating_probs[idx].numel() > 1:
-                top_values, _ = torch.topk(gating_probs[idx], k=min(2, gating_probs[idx].numel()))
-                margin = (top_values[0] - top_values[1]).item() if top_values.numel() > 1 else top_values[0].item()
-            else:
-                margin = confidence
+            final_preds = torch.where(top_confidence >= threshold, final_preds, torch.full_like(final_preds, -1))
+        return final_preds, combined_probabilities
 
-            meets_confidence = confidence >= threshold
-            meets_margin = margin >= config.GATING_MARGIN_THRESHOLD if gating_probs[idx].numel() > 1 else True
+    if gating_model is not None and routing_mode != 'confidence':
+        combined_probabilities = _route_via_gating(
+            batch_x_normalized, shard_models, gating_model, shard_class_indices, num_classes
+        )
+        top_confidence, final_preds = combined_probabilities.max(dim=1)
+        if threshold is not None:
+            final_preds = torch.where(top_confidence >= threshold, final_preds, torch.full_like(final_preds, -1))
+        return final_preds, combined_probabilities
 
-            if not (meets_confidence and meets_margin):
-                final_pred = -1  # Unknown prediction due to low confidence
+    masked_probs_per_shard = []
+    for shard_idx, model in enumerate(shard_models):
+        owned = shard_class_indices[shard_idx] if shard_idx < len(shard_class_indices) else []
+        if model is None or not owned:
+            masked_probs_per_shard.append(torch.zeros(batch_size, num_classes, device=DEVICE))
+            continue
 
-        final_preds[idx] = final_pred
-        combined_probabilities[idx] = chosen_probs
+        with torch.no_grad():
+            specialist_logits = model(batch_x_normalized)
+            specialist_probs = torch.softmax(specialist_logits, dim=1)
+        specialist_probs = _apply_temperature_tensor(specialist_probs, config.PRIMARY_SPECIALIST_TEMPERATURE)
+
+        if specialist_probs.shape[1] == num_classes:
+            # Global-width head (shard not yet unlearned, or legacy checkpoint): mask to owned classes.
+            mask = torch.zeros(num_classes, device=DEVICE)
+            mask[owned] = 1.0
+            masked_probs_per_shard.append(specialist_probs * mask)
+        else:
+            # Reduced (dynamic) head: columns are already local-indexed by sorted(owned).
+            masked_probs_per_shard.append(
+                _scatter_local_to_global(specialist_probs, sorted(owned), num_classes, DEVICE)
+            )
+
+    # Highest owned-class confidence across all specialists, per sample
+    stacked = torch.stack(masked_probs_per_shard, dim=0)  # (num_shards, batch, num_classes)
+    combined_probabilities, _ = stacked.max(dim=0)
+    combined_probabilities = _normalize_probabilities_tensor(combined_probabilities)
+
+    top_confidence, final_preds = combined_probabilities.max(dim=1)
+
+    if threshold is not None:
+        final_preds = torch.where(top_confidence >= threshold, final_preds, torch.full_like(final_preds, -1))
 
     return final_preds, combined_probabilities
 
 
-SISA_METADATA_PATH = f"../{config.PROJECTS_DIR}/{config.PROJECT_NAME}/sisa_data/metadata.json"
+def _route_via_cosine(
+    batch_x_normalized: torch.Tensor,
+    shard_models: List[torch.nn.Module],
+    shard_class_indices: List[List[int]],
+    num_classes: int,
+) -> torch.Tensor:
+    """W21: parameter-free routing by maximum cosine similarity to an owned class vector.
+
+    For each shard, `routing_cosine` gives every sample's similarity to each of that
+    shard's class vectors. The shard whose best owned-class similarity is highest wins,
+    and that shard's own softmax over its owned logits becomes the reported distribution
+    (scattered to global class width for downstream reporting).
+    """
+    batch_size = batch_x_normalized.size(0)
+    device = batch_x_normalized.device
+
+    shard_scores = []
+    per_shard_probs = []
+
+    for shard_idx, model in enumerate(shard_models):
+        owned = shard_class_indices[shard_idx] if shard_idx < len(shard_class_indices) else []
+        owned_sorted = sorted(owned)
+
+        if model is None or not owned_sorted:
+            shard_scores.append(torch.full((batch_size,), -float('inf'), device=device))
+            per_shard_probs.append(torch.zeros(batch_size, num_classes, device=device))
+            continue
+
+        with torch.no_grad():
+            cosines = model.routing_cosine(batch_x_normalized)
+            specialist_logits = model(batch_x_normalized)
+
+        # A reduced (post-unlearning) head is already local-indexed by sorted(owned);
+        # a global-width head must be gathered down to the columns this shard owns.
+        is_reduced_head = cosines.shape[1] != num_classes
+        owned_cosines = cosines if is_reduced_head else cosines[:, owned_sorted]
+        owned_logits = specialist_logits if is_reduced_head else specialist_logits[:, owned_sorted]
+
+        shard_scores.append(owned_cosines.max(dim=1).values)
+        per_shard_probs.append(
+            _scatter_local_to_global(torch.softmax(owned_logits, dim=1), owned_sorted, num_classes, device)
+        )
+
+    winning_shard = torch.stack(shard_scores, dim=0).argmax(dim=0)  # (batch,)
+    stacked_probs = torch.stack(per_shard_probs, dim=0)  # (num_shards, batch, num_classes)
+    selector = winning_shard.view(1, batch_size, 1).expand(1, batch_size, num_classes)
+    return stacked_probs.gather(0, selector).squeeze(0)
+
+
+def _route_via_gating(
+    batch_x_normalized: torch.Tensor,
+    shard_models: List[torch.nn.Module],
+    gating_model: torch.nn.Module,
+    shard_class_indices: List[List[int]],
+    num_classes: int,
+) -> torch.Tensor:
+    """W16: pick the winning shard via the learned gate, then use that shard's
+    own local softmax (computed directly over its gathered owned-logits, not a
+    full-width masked-then-renormalized softmax) as the reported distribution.
+    Validated in experiments/gating_routing_probe.py before being wired in here.
+    """
+    batch_size = batch_x_normalized.size(0)
+
+    with torch.no_grad():
+        gating_logits = gating_model(batch_x_normalized)
+    predicted_shard = gating_logits.argmax(dim=1)  # (batch,)
+
+    per_shard_probs = []
+    for shard_idx, model in enumerate(shard_models):
+        owned = shard_class_indices[shard_idx] if shard_idx < len(shard_class_indices) else []
+        owned_sorted = sorted(owned)
+        with torch.no_grad():
+            specialist_logits = model(batch_x_normalized)
+        is_reduced_head = specialist_logits.shape[1] != num_classes
+        owned_logits = specialist_logits if is_reduced_head else specialist_logits[:, owned_sorted]
+        local_probs = torch.softmax(owned_logits / config.PRIMARY_SPECIALIST_TEMPERATURE, dim=1)
+        per_shard_probs.append(_scatter_local_to_global(local_probs, owned_sorted, num_classes, DEVICE))
+
+    stacked_probs = torch.stack(per_shard_probs, dim=0)  # (num_shards, batch, num_classes)
+    return stacked_probs[predicted_shard, torch.arange(batch_size, device=DEVICE)]
+
+
+SISA_METADATA_PATH = os.path.join(config.PROJECTS_DIR, config.PROJECT_NAME, "sisa_data", "metadata.json")
 
 
 def create_data_processing_visualizations(
@@ -144,7 +315,7 @@ def create_overall_dataset_visualization(
 ) -> None:
 	"""Create overall dataset split visualization."""
 
-	total_train = sum(len(shard["slices"][0]["y"]) * len(shard["slices"]) for shard in shards_data)
+	total_train = sum(len(s["y"]) for shard in shards_data for s in shard["slices"])
 	total_val = len(validation_data[1])
 	total_test = len(test_data[1])
 	total_samples = total_train + total_val + total_test
@@ -546,20 +717,6 @@ def visualize_sample_images(
 # ============================================================================
 # Training visualization helpers (to be migrated from `training/train_model.py`)
 # ============================================================================
-
-
-def _normalize_probabilities_tensor(probs: torch.Tensor) -> torch.Tensor:
-	denominator = probs.sum(dim=-1, keepdim=True).clamp_min(config.MIN_PROB_EPSILON)
-	return probs / denominator
-
-
-def _apply_temperature_tensor(probs: torch.Tensor, temperature: float) -> torch.Tensor:
-	normalized = _normalize_probabilities_tensor(probs)
-	if temperature is None or abs(temperature - 1.0) < 1e-6:
-		return normalized
-
-	log_probs = torch.log(normalized.clamp(min=config.MIN_PROB_EPSILON))
-	return torch.softmax(log_probs / temperature, dim=-1)
 
 
 def _apply_temperature_numpy(prob_array: np.ndarray, temperature: float) -> np.ndarray:
@@ -1003,12 +1160,21 @@ Per-Class Performance:
     return save_path, overall_accuracy
 
 
-def create_shard_confusion_matrix(model, x_test, y_test, class_names, shard_idx, save_dir, active_classes):
-    """Generate aggregate confusion matrix for an entire shard across all of its classes."""
+def create_shard_confusion_matrix(model, x_test, y_test, class_names, shard_idx, save_dir, active_classes, head_classes=None):
+    """Generate aggregate confusion matrix for an entire shard across all of its classes.
+
+    `active_classes` selects which test samples/columns are evaluated (may be a growing
+    subset during incremental training). `head_classes` is the model's actual fixed head
+    class list (sorted(head_classes) is the column ordering of a reduced/dynamic head) and
+    defaults to `active_classes` for callers that always pass the shard's full class set.
+    """
 
     if not active_classes:
         print(f"   - Skipping shard {shard_idx+1} confusion matrix (no active classes provided)")
         return None, 0.0
+
+    if head_classes is None:
+        head_classes = active_classes
 
     dataset_mean, dataset_std = _get_dataset_normalization()
     eval_transforms = T.Compose([T.Normalize(dataset_mean, dataset_std)])
@@ -1023,6 +1189,8 @@ def create_shard_confusion_matrix(model, x_test, y_test, class_names, shard_idx,
 
     active_classes_sorted = sorted(active_classes)
     active_tensor = torch.tensor(active_classes_sorted, device=DEVICE)
+    head_classes_sorted = sorted(head_classes)
+    num_global_classes = len(class_names)
 
     model.eval()
     preds = []
@@ -1038,6 +1206,9 @@ def create_shard_confusion_matrix(model, x_test, y_test, class_names, shard_idx,
             logits = model(batch_x)
             probs = torch.softmax(logits, dim=1)
             probs = _apply_temperature_tensor(probs, config.SPECIALIST_EVAL_TEMPERATURE)
+            # Model output may be head-reduced (dynamic head, W6) or global-width;
+            # scatter into global class space either way before selecting active columns.
+            probs = _scatter_local_to_global(probs, head_classes_sorted, num_global_classes, DEVICE)
 
             filtered = probs[:, active_tensor]
             mapped_preds = active_tensor[torch.argmax(filtered, dim=1)]
@@ -1179,39 +1350,45 @@ def create_gating_routing_barplots(gating_model, x_data, y_data, class_names, sa
     return output_path
 
 
-def create_overall_sisa_roc_curve(shard_models, gating_model, x_test, y_test, class_names, save_dir, training_type='training', unlearned_classes=None):
+def create_overall_sisa_roc_curve(shard_models, shard_class_indices, x_test, y_test, class_names, save_dir, training_type='training', unlearned_classes=None, precomputed=None):
+    """`precomputed`, if given, is (all_preds, all_probs, all_labels) from a prior
+    _run_sisa_batch pass over this exact (shard_models, x_test, y_test) -- skips
+    re-running inference (W9: this and create_overall_sisa_confusion_matrix were
+    each independently re-inferring the full test set on every call)."""
 
     print("   Creating overall SISA system ROC curve...")
 
-    dataset_mean, dataset_std = _get_dataset_normalization()
-    eval_transforms = T.Compose([T.Normalize(dataset_mean, dataset_std)])
+    if precomputed is not None:
+        _, all_probs, all_labels = precomputed
+    else:
+        dataset_mean, dataset_std = _get_dataset_normalization()
+        eval_transforms = T.Compose([T.Normalize(dataset_mean, dataset_std)])
 
-    for model in shard_models:
-        if model is not None:
-            model.eval()
-    gating_model.eval()
+        for model in shard_models:
+            if model is not None:
+                model.eval()
 
-    batch_size = config.BATCH_SIZE
-    threshold = None
-    all_probs_batches = []
-    all_labels = []
+        batch_size = config.BATCH_SIZE
+        threshold = None
+        all_probs_batches = []
+        all_labels = []
 
-    with torch.no_grad():
-        for i in range(0, len(x_test), batch_size):
-            batch_x = torch.from_numpy(x_test[i:i+batch_size]).float()
-            batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
-            batch_y = y_test[i:i+batch_size]
+        with torch.no_grad():
+            for i in range(0, len(x_test), batch_size):
+                batch_x = torch.from_numpy(x_test[i:i+batch_size]).float()
+                batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
+                batch_y = y_test[i:i+batch_size]
 
-            _, combined_probs = _run_sisa_batch(
-                batch_x_normalized, shard_models, gating_model, class_names, threshold
-            )
+                _, combined_probs = _run_sisa_batch(
+                    batch_x_normalized, shard_models, class_names, shard_class_indices, threshold
+                )
 
-            all_probs_batches.append(combined_probs.cpu().numpy())
-            all_labels.extend(batch_y)
+                all_probs_batches.append(combined_probs.cpu().numpy())
+                all_labels.extend(batch_y)
 
-    all_probs = np.concatenate(all_probs_batches, axis=0)
-    all_labels = np.array(all_labels)
-    
+        all_probs = np.concatenate(all_probs_batches, axis=0)
+        all_labels = np.array(all_labels)
+
     # Filter for specialist classes like in evaluation
     if training_type == 'training':
         # Use all classes for training
@@ -1334,24 +1511,7 @@ def create_overall_sisa_roc_curve(shard_models, gating_model, x_test, y_test, cl
 def create_overall_sisa_training_curves(all_shard_histories, save_dir, training_type='training'):
 
     print("   Creating overall SISA system training curves...")
-    
-    # Combine all shard histories
-    combined_train_losses = []
-    combined_train_accuracies = []
-    combined_val_losses = []
-    combined_val_accuracies = []
-    
-    # Get the maximum number of epochs across all shards
-    max_epochs = 0
-    shard_epoch_counts = []
-    
-    for shard_idx, shard_histories in enumerate(all_shard_histories):
-        shard_total_epochs = 0
-        for slice_history in shard_histories:
-            shard_total_epochs += len(slice_history['loss'])
-        shard_epoch_counts.append(shard_total_epochs)
-        max_epochs = max(max_epochs, shard_total_epochs)
-    
+
     # Create figure with subplots
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
     colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown']
@@ -1389,13 +1549,7 @@ def create_overall_sisa_training_curves(all_shard_histories, save_dir, training_
         # Plot validation accuracy
         ax4.plot(epochs, shard_val_accs, color=color, alpha=0.7, linewidth=1.5,
                 label=f'Shard {shard_idx + 1}')
-        
-        # Store for overall average calculation
-        combined_train_losses.append(shard_train_losses)
-        combined_train_accuracies.append(shard_train_accs)
-        combined_val_losses.append(shard_val_losses)
-        combined_val_accuracies.append(shard_val_accs)
-    
+
     # Configure subplots
     ax1.set_title('Training Loss by Shard', fontweight='bold')
     ax1.set_xlabel('Epoch')
@@ -1434,41 +1588,46 @@ def create_overall_sisa_training_curves(all_shard_histories, save_dir, training_
     return save_path
 
 
-def create_overall_sisa_confusion_matrix(shard_models, gating_model, x_test, y_test, class_names, save_dir, training_type='training', unlearned_classes=None):
+def create_overall_sisa_confusion_matrix(shard_models, shard_class_indices, x_test, y_test, class_names, save_dir, training_type='training', unlearned_classes=None, precomputed=None):
+    """`precomputed`, if given, is (all_preds, all_probs, all_labels) from a prior
+    _run_sisa_batch pass over this exact (shard_models, x_test, y_test) -- see
+    create_overall_sisa_roc_curve's docstring (W9)."""
 
     print("   Creating overall SISA system confusion matrix (using same logic as evaluation)...")
-    
-    dataset_mean, dataset_std = _get_dataset_normalization()
-    eval_transforms = T.Compose([T.Normalize(dataset_mean, dataset_std)])
-    
-    # Move models to evaluation mode
-    for model in shard_models:
-        if model is not None:
-            model.eval()
-    gating_model.eval()
-    
-    all_preds = []
-    all_labels = []
-    
-    batch_size = config.BATCH_SIZE
-    threshold = None
-    
-    with torch.no_grad():
-        for i in range(0, len(x_test), batch_size):
-            batch_x_numpy = x_test[i:i+batch_size]
-            batch_x = torch.from_numpy(batch_x_numpy).float()
-            batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
-            batch_y = y_test[i:i+batch_size]
-            batch_final_preds, _ = _run_sisa_batch(
-                batch_x_normalized, shard_models, gating_model, class_names, threshold
-            )
 
-            all_preds.extend(batch_final_preds.cpu().numpy())
-            all_labels.extend(batch_y)
-    
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    
+    if precomputed is not None:
+        all_preds, _, all_labels = precomputed
+    else:
+        dataset_mean, dataset_std = _get_dataset_normalization()
+        eval_transforms = T.Compose([T.Normalize(dataset_mean, dataset_std)])
+
+        # Move models to evaluation mode
+        for model in shard_models:
+            if model is not None:
+                model.eval()
+
+        all_preds = []
+        all_labels = []
+
+        batch_size = config.BATCH_SIZE
+        threshold = None
+
+        with torch.no_grad():
+            for i in range(0, len(x_test), batch_size):
+                batch_x_numpy = x_test[i:i+batch_size]
+                batch_x = torch.from_numpy(batch_x_numpy).float()
+                batch_x_normalized = eval_transforms(batch_x).to(DEVICE)
+                batch_y = y_test[i:i+batch_size]
+                batch_final_preds, _ = _run_sisa_batch(
+                    batch_x_normalized, shard_models, class_names, shard_class_indices, threshold
+                )
+
+                all_preds.extend(batch_final_preds.cpu().numpy())
+                all_labels.extend(batch_y)
+
+        all_preds = np.array(all_preds)
+        all_labels = np.array(all_labels)
+
     # Handle filtering based on training_type
     if training_type == 'with_deleted_classes':
         # SPECIAL CASE: Keep ALL classes including deleted to show unlearning effect
@@ -1996,6 +2155,125 @@ def create_efficiency_metrics_chart(save_dir, training_type='optimization'):
     return save_path
 
 
+# ============================================================================
+# W8: exactness proof harness plots (plan §4.5)
+# ============================================================================
+
+def create_exactness_comparison_chart(param_distance: dict, pred_agreement: float,
+                                       output_kl: float, class_name: str, save_dir: str) -> str:
+    """Parameter-distance and prediction-agreement bars (unlearned vs scratch)."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].bar(['L2', 'Cosine dist.'], [param_distance['l2'], param_distance['cosine']], color=['steelblue', 'indianred'])
+    axes[0].set_title('Parameter Distance\n(unlearned vs scratch)', fontweight='bold')
+    axes[0].set_ylabel('Distance')
+    axes[0].text(0.5, -0.25, 'Not expected to be ~0 -- RNG-sequence differs\nfrom the original run (see report notes).',
+                 transform=axes[0].transAxes, ha='center', fontsize=8, style='italic', color='dimgray')
+
+    axes[1].bar(['Agreement'], [pred_agreement * 100], color='seagreen')
+    axes[1].set_ylim(0, 100)
+    axes[1].set_ylabel('% of test set')
+    axes[1].set_title('Prediction Agreement\n(unlearned vs scratch)', fontweight='bold')
+    axes[1].text(0, pred_agreement * 100 + 2, f'{pred_agreement*100:.2f}%', ha='center', fontweight='bold')
+
+    axes[2].bar(['Mean KL'], [output_kl], color='darkorange')
+    axes[2].set_ylabel('Nats')
+    axes[2].set_title('Output-Distribution Distance\n(unlearned vs scratch)', fontweight='bold')
+    axes[2].text(0, output_kl, f'{output_kl:.4f}', ha='center', va='bottom', fontweight='bold')
+
+    plt.suptitle(f"Exactness Comparison -- deleted class '{class_name}'", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'exactness_comparison_{class_name}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"   - Exactness comparison chart saved: {os.path.basename(save_path)}")
+    return save_path
+
+
+def create_mia_roc_chart(mia_results: dict, class_name: str, save_dir: str) -> str:
+    """MIA ROC curves for original/unlearned/scratch models, AUC annotated.
+    `mia_results`: {label: (fpr, tpr, auc)}.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+    colors = {'original': 'firebrick', 'unlearned': 'seagreen', 'scratch': 'steelblue'}
+
+    for label, (fpr, tpr, roc_auc) in mia_results.items():
+        ax.plot(fpr, tpr, label=f'{label} (AUC={roc_auc:.3f})', color=colors.get(label, 'gray'), linewidth=2)
+
+    ax.plot([0, 1], [0, 1], linestyle='--', color='black', alpha=0.4, label='Random guess (AUC=0.5)')
+    ax.set_xlabel('False Positive Rate')
+    ax.set_ylabel('True Positive Rate')
+    ax.set_title(f"Membership-Inference ROC -- deleted class '{class_name}'", fontweight='bold')
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'mia_roc_{class_name}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"   - MIA ROC chart saved: {os.path.basename(save_path)}")
+    return save_path
+
+
+def create_exactness_confusion_matrices(labels: np.ndarray, preds_original: np.ndarray,
+                                         preds_unlearned: np.ndarray, preds_scratch: np.ndarray,
+                                         class_names: Sequence[str], class_name: str, save_dir: str) -> str:
+    """Confusion matrices before / after (unlearned) / scratch, side by side."""
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+    triples = [('Original (pre-unlearning)', preds_original), ('Unlearned', preds_unlearned), ('Scratch reference', preds_scratch)]
+
+    for ax, (title, preds) in zip(axes, triples):
+        cm = confusion_matrix(labels, preds, labels=np.arange(len(class_names)))
+        sns.heatmap(cm, annot=False, fmt='d', cmap='Blues', ax=ax,
+                    xticklabels=class_names, yticklabels=class_names, cbar=False)
+        ax.set_title(title, fontweight='bold')
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.tick_params(axis='x', rotation=45)
+
+    plt.suptitle(f"Confusion Matrices -- deleted class '{class_name}'", fontsize=14, fontweight='bold')
+    plt.tight_layout()
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'exactness_confusion_matrices_{class_name}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"   - Exactness confusion matrices saved: {os.path.basename(save_path)}")
+    return save_path
+
+
+def create_efficiency_comparison_chart(scratch_time: float, unlearn_time: float, num_shards: int,
+                                        num_slices: int, class_name: str, save_dir: str) -> str:
+    """Scratch (full retrain) time vs real unlearning retrain time, with the
+    theoretical SISA speedup (plan §4.3: up to (R+1)*S/2x, R=shards, S=slices)
+    annotated alongside the empirically measured speedup.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(7, 6))
+    bars = ax.bar(['Full retrain\n(scratch)', 'SISA retrain\n(real unlearning)'],
+                   [scratch_time, unlearn_time], color=['indianred', 'seagreen'])
+    for bar, val in zip(bars, [scratch_time, unlearn_time]):
+        ax.text(bar.get_x() + bar.get_width() / 2, val, f'{val:.1f}s', ha='center', va='bottom', fontweight='bold')
+
+    ax.set_ylabel('Seconds')
+    ax.set_title(f"Retraining Efficiency -- deleted class '{class_name}'", fontweight='bold')
+
+    empirical_speedup = scratch_time / unlearn_time if unlearn_time > 0 else float('inf')
+    theoretical_speedup = (num_shards + 1) * num_slices / 2
+    ax.text(0.5, -0.18,
+            f'Empirical speedup: {empirical_speedup:.2f}x   |   Theoretical ceiling (R+1)·S/2: {theoretical_speedup:.2f}x',
+            transform=ax.transAxes, ha='center', fontsize=9, style='italic')
+
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f'efficiency_comparison_{class_name}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"   - Efficiency comparison chart saved: {os.path.basename(save_path)}")
+    return save_path
+
+
 __all__ = [
 	"create_data_processing_visualizations",
 	"create_overall_dataset_visualization",
@@ -2016,4 +2294,8 @@ __all__ = [
 	"create_pure_training_time_chart",
 	"create_classification_metrics_comparison_chart",
 	"create_efficiency_metrics_chart",
+	"create_exactness_comparison_chart",
+	"create_mia_roc_chart",
+	"create_exactness_confusion_matrices",
+	"create_efficiency_comparison_chart",
 ]

@@ -16,18 +16,20 @@ from typing import List, Optional
 import config
 from training.create_model import create_sisa_model, DEVICE
 from training.early_stopping import SISAEarlyStopping
+from training.augmentation import build_augmenter
 
 # Import utility functions from plots.py (single source of truth)
 from plots import (
     _normalize_probabilities_tensor,
-    _apply_temperature_tensor, 
+    _apply_temperature_tensor,
     _apply_temperature_numpy,
-    _run_sisa_batch
+    _run_sisa_batch,
+    _scatter_local_to_global,
 )
 
 TRUE_LABEL_TITLE = 'True Label'
 PREDICTED_LABEL_TITLE = 'Predicted Label'
-SISA_METADATA_PATH = f"../{config.PROJECTS_DIR}/{config.PROJECT_NAME}/sisa_data/metadata.json"
+SISA_METADATA_PATH = os.path.join(config.PROJECTS_DIR, config.PROJECT_NAME, "sisa_data", "metadata.json")
 
 
 def _filter_data_by_class(X, y, active_classes):
@@ -43,33 +45,56 @@ def _filter_data_by_class(X, y, active_classes):
     
     return X[mask], y_remapped, label_map
 
-def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BATCH_SIZE, lr=config.LEARNING_RATE, 
+def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BATCH_SIZE, lr=config.LEARNING_RATE,
                   validation_data=None, active_classes=None, replay_buffer=None, replay_ratio=0.2,
                   dataset_mean=None, dataset_std=None, training_type='fresh', augmentation_config=None,
-                  use_smart_replay=False, device=None):
+                  device=None, head_classes=None):
     """
     Trains a SISA model with specialized validation and an optional replay mechanism.
+
+    `head_classes` (W6, dynamic head): the fixed, sorted list of global class ids the
+    model's output head is sized to. When None (default), the model keeps its original
+    global-width head and every label stays in global-id space, exactly as before this
+    parameter existed. When provided, a fresh model is created with `num_classes=len(head_classes)`,
+    every training/replay label is remapped from global id to its position in
+    `sorted(head_classes)` before the loss, and validation output is scattered back to
+    global space so the existing `active_classes`-based column selection keeps working
+    unchanged. `active_classes` continues to mean "classes visible/evaluated so far" and
+    must always be a subset of `head_classes` when both are given.
     """
+    head_label_map = None
+    if head_classes is not None:
+        head_label_map = {orig: new for new, orig in enumerate(sorted(head_classes))}
+
+    def _remap_to_head(labels: np.ndarray) -> np.ndarray:
+        """Map global class ids to local head-column indices (identity if no dynamic head)."""
+        if head_label_map is None:
+            return labels
+        return np.array([head_label_map[int(v)] for v in labels], dtype=np.int64)
+
     if dataset_mean is None or dataset_std is None:
         print("Warning: Normalization stats not provided. Using default RGB values.")
         dataset_mean = [0.5, 0.5, 0.5]
         dataset_std = [0.5, 0.5, 0.5]
 
-    # Build augmentation transforms based on configuration
+    # Build augmentation transforms based on configuration.
+    # W19: geometric augmentation (crop + flip) is handled by PerSampleAugmenter so each
+    # sample in a batch gets its own random draw -- applying a torchvision Compose to an
+    # already-batched tensor gives the whole batch one shared decision. Colour jitter and
+    # normalization stay in the Compose (jitter only appears on unbalanced-shard paths).
+    augmenter = build_augmenter(augmentation_config, config.SEED)
     augmentations = []
-    
+
     if augmentation_config is None:
-        # NO AUGMENTATION - Classes are balanced
-        print("   - No augmentation applied (balanced classes)")
+        print("   - No augmentation applied")
     else:
-        # Apply augmentation for imbalanced classes
         print(f"   - Using augmentation: {augmentation_config.get('reason', 'custom')}")
-        
-        # Horizontal flip
-        if augmentation_config.get('random_horizontal_flip', 0) > 0:
-            augmentations.append(T.RandomHorizontalFlip(p=augmentation_config['random_horizontal_flip']))
-            print(f"   - Horizontal flip: {augmentation_config.get('random_horizontal_flip', 0):.1f}")
-        
+
+        if augmenter.crop_padding > 0:
+            print(f"   - Random crop: padding={augmenter.crop_padding} (per-sample)")
+        if augmenter.flip_prob > 0:
+            print(f"   - Horizontal flip: {augmenter.flip_prob:.2f} (per-sample)")
+
         # Color jitter (only if any parameter > 0)
         color_params = [
             augmentation_config.get('color_jitter_brightness', 0),
@@ -85,10 +110,10 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
                 hue=color_params[3]
             ))
             print(f"   - Color jitter: brightness={color_params[0]:.2f}, contrast={color_params[1]:.2f}")
-    
+
     # Always add normalization at the end
     augmentations.append(T.Normalize(dataset_mean, dataset_std))
-    
+
     train_transforms = T.Compose(augmentations)
     val_transforms = T.Compose([
         T.Normalize(dataset_mean, dataset_std)
@@ -112,16 +137,13 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
         print(f"   - Created internal validation set with {len(x_val)} samples.")
 
     x_train_t = torch.from_numpy(X.astype(np.float32))
-    y_train_t = torch.from_numpy(y.astype(np.int64)).long()
-    
+    y_train_t = torch.from_numpy(_remap_to_head(y.astype(np.int64))).long()
+
     x_val_t = torch.from_numpy(x_val.astype(np.float32))
     y_val_t = torch.from_numpy(y_val_remapped.astype(np.int64)).long()
-    
+
     if model is None:
-        model = create_sisa_model(num_classes=10)
-        if training_type == 'fresh':
-            pass  # Already set as parameter default
-    # Note: training_type is now passed as parameter, no need to reassign
+        model = create_sisa_model(num_classes=len(head_classes) if head_classes is not None else None)
 
     history = {'loss': [], 'accuracy': [], 'val_loss': [], 'val_accuracy': [], 'lr': []}
     
@@ -133,10 +155,21 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
         patience = config.TRAINING_PATIENCE
         min_delta = config.TRAINING_MIN_DELTA
         
+    # W20: with fewer than 2 active classes the filtered validation output has a single
+    # column, so softmax is trivially 1.0 and cross-entropy is exactly 0.0 on every
+    # epoch. Early stopping can never improve on zero, so it used to restore the epoch-0
+    # weights and silently discard the whole run (shard 1's single-class slice 1 did
+    # exactly this). Fall back to the training loss, which still carries signal.
+    num_active = len(active_classes) if active_classes is not None else 0
+    degenerate_validation = num_active < 2 or len(x_val_t) == 0
+    if degenerate_validation:
+        print(f"   - Degenerate validation ({num_active} active class(es), {len(x_val_t)} samples): "
+              f"early stopping will monitor training loss instead")
+
     early_stopping = SISAEarlyStopping(
         patience=patience,
         min_delta=min_delta,
-        monitor='val_loss',
+        monitor='train_loss' if degenerate_validation else 'val_loss',
         mode='min',
         restore_best_weights=True,
         verbose=True
@@ -150,83 +183,63 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=config.WEIGHT_DECAY)  # Simple Adam optimizer
 
     if replay_buffer:
-        # Handle both traditional dict replay buffer and SmartReplayBuffer
-        if hasattr(replay_buffer, 'buffer'):
-            # SmartReplayBuffer case
-            buffer_dict = replay_buffer.buffer
-            buffer_type = "smart replay"
-        else:
-            # Traditional dict case
-            buffer_dict = replay_buffer
-            buffer_type = "traditional replay"
-        
-        num_replay_samples = sum(len(d['y']) for d in buffer_dict.values())
-        print(f"   - Using {buffer_type} buffer with {num_replay_samples} previous samples from {len(buffer_dict)} classes.")
+        num_replay_samples = sum(len(d['y']) for d in replay_buffer.values())
+        print(f"   - Using replay buffer with {num_replay_samples} previous samples from {len(replay_buffer)} classes.")
 
-    rng = np.random.default_rng(42)  # Fixed seed for reproducibility
+    rng = np.random.default_rng(config.SEED)  # Deterministic, derived from the global seed (W1)
     
+    # W18: the current-slice portion of each batch is also the loop stride. Previously
+    # the loop advanced by `batch_size` while consuming only the first `main_batch_size`
+    # indices of each chunk, silently dropping the remainder every epoch -- 31% of a
+    # slice at the old fixed 0.3 ratio, and ~72% at the class-balanced ratios W18
+    # produces, which would have undercut the very fix it delivers. Striding by
+    # `main_batch_size` means every current-slice sample is used exactly once per epoch,
+    # with replay topping each batch up to `batch_size`.
+    uses_replay = bool(replay_buffer) and replay_ratio > 0
+    main_batch_size = max(1, int(batch_size * (1 - replay_ratio))) if uses_replay else batch_size
+    replay_batch_size = batch_size - main_batch_size if uses_replay else 0
+
     for epoch in range(epochs):
         model.train()
         running_loss, correct, total = 0.0, 0, 0
+        num_steps = 0
         indices = rng.permutation(len(X))
 
-        for i in range(0, len(X), batch_size):
-            batch_indices = indices[i:i+batch_size]
-            
-            if replay_buffer and replay_ratio > 0:
-                main_batch_size = int(batch_size * (1 - replay_ratio))
-                replay_batch_size = batch_size - main_batch_size
-                
-                actual_main_indices = batch_indices[:main_batch_size]
-                if len(actual_main_indices) == 0: continue
+        for i in range(0, len(X), main_batch_size):
+            batch_indices = indices[i:i+main_batch_size]
+            if len(batch_indices) == 0:
+                continue
+            num_steps += 1
 
-                main_x = x_train_t[actual_main_indices]
-                main_y = y_train_t[actual_main_indices]
-                
-                # Choose replay strategy
-                if use_smart_replay and hasattr(replay_buffer, 'sample_for_replay'):
-                    # Smart replay buffer
-                    replay_x_np, replay_y_np = replay_buffer.sample_for_replay(replay_batch_size)
-                    if len(replay_x_np) > 0:
-                        replay_x = torch.from_numpy(replay_x_np.astype(np.float32))
-                        replay_y = torch.from_numpy(replay_y_np.astype(np.int64)).long()
-                        batch_x = torch.cat((main_x, replay_x))
-                        batch_y = torch.cat((main_y, replay_y))
-                    else:
-                        batch_x = main_x
-                        batch_y = main_y
-                else:
-                    # Traditional random replay buffer
+            if uses_replay:
+                main_x = x_train_t[batch_indices]
+                main_y = y_train_t[batch_indices]
+
+                available_classes = list(replay_buffer.keys())
+
+                if available_classes and replay_batch_size > 0:
                     replay_x_list, replay_y_list = [], []
-                    
-                    # Handle both dict and SmartReplayBuffer
-                    if hasattr(replay_buffer, 'buffer'):
-                        buffer_dict = replay_buffer.buffer
-                    else:
-                        buffer_dict = replay_buffer
-                    
-                    available_classes = list(buffer_dict.keys())
-                    
-                    if available_classes and replay_batch_size > 0:
-                        chosen_classes = rng.choice(available_classes, replay_batch_size)
-                        for class_idx in chosen_classes:
-                            class_data = buffer_dict[class_idx]
-                            sample_idx = rng.integers(0, len(class_data['X']))
-                            replay_x_list.append(class_data['X'][sample_idx])
-                            replay_y_list.append(class_data['y'][sample_idx])
-                        
-                        replay_x = torch.from_numpy(np.array(replay_x_list).astype(np.float32))
-                        replay_y = torch.from_numpy(np.array(replay_y_list).astype(np.int64)).long()
-                        
-                        batch_x = torch.cat((main_x, replay_x))
-                        batch_y = torch.cat((main_y, replay_y))
-                    else:
-                        batch_x = main_x
-                        batch_y = main_y
+                    chosen_classes = rng.choice(available_classes, replay_batch_size)
+                    for class_idx in chosen_classes:
+                        class_data = replay_buffer[class_idx]
+                        sample_idx = rng.integers(0, len(class_data['X']))
+                        replay_x_list.append(class_data['X'][sample_idx])
+                        replay_y_list.append(class_data['y'][sample_idx])
+
+                    replay_x = torch.from_numpy(np.array(replay_x_list).astype(np.float32))
+                    replay_y = torch.from_numpy(_remap_to_head(np.array(replay_y_list).astype(np.int64))).long()
+
+                    batch_x = torch.cat((main_x, replay_x))
+                    batch_y = torch.cat((main_y, replay_y))
+                else:
+                    batch_x = main_x
+                    batch_y = main_y
             else:
                 batch_x = x_train_t[batch_indices]
                 batch_y = y_train_t[batch_indices]
 
+            # Per-sample geometric augmentation first (W19), then colour jitter + normalize.
+            batch_x = augmenter(batch_x)
             batch_x = train_transforms(batch_x).to(DEVICE)
             batch_y = batch_y.to(DEVICE)
 
@@ -243,7 +256,7 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
             total += batch_y.size(0)
             correct += (predicted == batch_y).sum().item()
 
-        epoch_loss = running_loss / (len(X) / batch_size) if len(X) > 0 else 0
+        epoch_loss = running_loss / num_steps if num_steps > 0 else 0
         epoch_acc = correct / total if total > 0 else 0
 
         model.eval()
@@ -259,7 +272,13 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
                     batch_y_val = batch_y_val.to(DEVICE)
                     
                     output_full = model(batch_x_val)
-                    
+                    if head_classes is not None:
+                        # Reduced/dynamic head: scatter local head columns back to global
+                        # class space so the active_classes column selection below is valid.
+                        output_full = _scatter_local_to_global(
+                            output_full, sorted(head_classes), config.get_num_classes(), DEVICE
+                        )
+
                     # Specialist-only validation (filtered to active classes)
                     active_class_indices = torch.tensor(sorted(active_classes), device=DEVICE)
                     output_filtered = output_full[:, active_class_indices]
@@ -281,7 +300,8 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
         print(f'   Epoch {epoch+1}/{epochs} -> Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}, '
               f'Val Loss: {val_epoch_loss:.4f}, Val Acc: {val_epoch_acc:.4f}')
 
-        if early_stopping(val_epoch_loss, model, epoch):
+        monitored_loss = epoch_loss if degenerate_validation else val_epoch_loss
+        if early_stopping(monitored_loss, model, epoch):
             print("   - Early stopping triggered.")
             break
             
