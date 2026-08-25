@@ -4,28 +4,35 @@ from datetime import datetime
 import warnings
 
 class SISAEarlyStopping:
-    def __init__(self, 
+    def __init__(self,
                  patience=5,
                  min_delta=0.001,
                  restore_best_weights=True,
                  monitor='val_loss',
                  mode='min',
-                 verbose=True):
+                 verbose=True,
+                 min_epochs=0):
         self.patience = patience
         self.min_delta = min_delta
         self.restore_best_weights = restore_best_weights
         self.monitor = monitor
         self.mode = mode
         self.verbose = verbose
+        # Floor on epochs before stopping may fire. Early slices validate on very few
+        # samples (shard 2's slice 1 has 1000, and its val accuracy swung over a 0.185
+        # range), so an unguarded monitor can stop on noise -- that slice stopped at
+        # epoch 8 and restored epoch 1, undertraining the two classes that end up worst.
+        self.min_epochs = min_epochs
         self.best_score = None
         self.best_epoch = 0
         self.best_weights = None
         self.wait = 0
         self.stopped_epoch = 0
         self.early_stopped = False
-        
+
         if self.verbose:
-            print(f"Early stopping configured: patience={self.patience}, min_delta={self.min_delta}")
+            print(f"Early stopping configured: monitor={self.monitor} (mode={self.mode}), "
+                  f"patience={self.patience}, min_delta={self.min_delta}, min_epochs={self.min_epochs}")
     
     def __call__(self, current_score, model=None, epoch=None):
         if self.mode == 'min': 
@@ -53,6 +60,11 @@ class SISAEarlyStopping:
             if self.verbose and self.wait > 0:
                 print(f"  No improvement for {self.wait}/{self.patience} epochs")
                 
+        # Honour the minimum-epoch floor: keep tracking the best weights, just refuse
+        # to stop yet. `epoch` is 0-indexed, so epoch 0 is the first completed epoch.
+        if self.min_epochs and epoch is not None and (epoch + 1) < self.min_epochs:
+            return False
+
         if self.wait >= self.patience:
             self.stopped_epoch = epoch or 0
             self.early_stopped = True
@@ -61,11 +73,18 @@ class SISAEarlyStopping:
                 print(f"   Best {self.monitor}: {abs(self.best_score):.6f} at epoch {self.best_epoch}")
             return True
         return False
-    
+
     def restore_best_model(self, model):
         if self.best_weights is not None and model is not None:
-            model.load_state_dict({k: v.to(model.device if hasattr(model, 'device') else 'cpu') 
-                                 for k, v in self.best_weights.items()})
+            # The best weights were cached on CPU. `hasattr(model, 'device')` is always
+            # False for an nn.Module, so the previous code silently used 'cpu' as the
+            # target for every restore (flagged in IMPLEMENTATION_PLAN.md section 7).
+            # Take the device from the model's own parameters instead.
+            try:
+                device = next(model.parameters()).device
+            except StopIteration:
+                device = torch.device('cpu')
+            model.load_state_dict({k: v.to(device) for k, v in self.best_weights.items()})
             if self.verbose:
                 print(f"   Restored best model from epoch {self.best_epoch}")
             return True
@@ -88,15 +107,19 @@ def get_optimal_early_stopping_config(data_size=None, training_type='fresh'):
     if training_type == 'unlearning':
         patience = config.UNLEARNING_PATIENCE
         min_delta = config.UNLEARNING_MIN_DELTA
+        min_epochs = getattr(config, 'UNLEARNING_MIN_EPOCHS', 0)
     else:
         patience = config.TRAINING_PATIENCE
         min_delta = config.TRAINING_MIN_DELTA
-    
+        min_epochs = getattr(config, 'TRAINING_MIN_EPOCHS', 0)
+
+    monitor = getattr(config, 'EARLY_STOPPING_MONITOR', 'val_loss')
     return {
         'patience': patience,
         'min_delta': min_delta,
-        'monitor': 'val_loss',
-        'mode': 'min',
+        'monitor': monitor,
+        'mode': 'max' if monitor == 'val_accuracy' else 'min',
         'restore_best_weights': True,
-        'verbose': True
+        'verbose': True,
+        'min_epochs': min_epochs,
     }

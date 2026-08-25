@@ -151,10 +151,13 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     if training_type == 'unlearning':
         patience = config.UNLEARNING_PATIENCE
         min_delta = config.UNLEARNING_MIN_DELTA
+        min_epochs = getattr(config, 'UNLEARNING_MIN_EPOCHS', 0)
     else:
         patience = config.TRAINING_PATIENCE
         min_delta = config.TRAINING_MIN_DELTA
-        
+        min_epochs = getattr(config, 'TRAINING_MIN_EPOCHS', 0)
+
+
     # W20: with fewer than 2 active classes the filtered validation output has a single
     # column, so softmax is trivially 1.0 and cross-entropy is exactly 0.0 on every
     # epoch. Early stopping can never improve on zero, so it used to restore the epoch-0
@@ -163,16 +166,26 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     num_active = len(active_classes) if active_classes is not None else 0
     degenerate_validation = num_active < 2 or len(x_val_t) == 0
     if degenerate_validation:
+        # Both val_loss (exactly 0.0) and val_accuracy (exactly 1.0) are constant here,
+        # so neither can select a checkpoint. Training loss still carries signal.
+        monitor, monitor_mode = 'train_loss', 'min'
+        monitor_min_delta = config.TRAINING_MIN_DELTA_LOSS
         print(f"   - Degenerate validation ({num_active} active class(es), {len(x_val_t)} samples): "
               f"early stopping will monitor training loss instead")
+    elif getattr(config, 'EARLY_STOPPING_MONITOR', 'val_loss') == 'val_accuracy':
+        monitor, monitor_mode, monitor_min_delta = 'val_accuracy', 'max', min_delta
+    else:
+        monitor, monitor_mode = 'val_loss', 'min'
+        monitor_min_delta = config.TRAINING_MIN_DELTA_LOSS
 
     early_stopping = SISAEarlyStopping(
         patience=patience,
-        min_delta=min_delta,
-        monitor='train_loss' if degenerate_validation else 'val_loss',
-        mode='min',
+        min_delta=monitor_min_delta,
+        monitor=monitor,
+        mode=monitor_mode,
         restore_best_weights=True,
-        verbose=True
+        verbose=True,
+        min_epochs=min_epochs,
     )
 
     # Simple loss and optimization - Adam handles adaptive learning rates
@@ -180,7 +193,35 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     label_smoothing_value = config.UNLEARNING_LABEL_SMOOTHING if training_type == 'unlearning' else config.LABEL_SMOOTHING
     print(f"   - Using label smoothing: {label_smoothing_value:.3f} ({'unlearning mode' if training_type == 'unlearning' else 'normal training'})")
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing_value)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=config.WEIGHT_DECAY)  # Simple Adam optimizer
+
+    # W23: AdamW by default -- Adam's `weight_decay` is L2 folded into the adaptive
+    # update, so it is scaled by each parameter's gradient history and is not the
+    # decoupled weight decay WEIGHT_DECAY was meant to express.
+    if getattr(config, 'OPTIMIZER', 'adam').lower() == 'adamw':
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=config.WEIGHT_DECAY)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=config.WEIGHT_DECAY)
+
+    # W23: decay the global LR on plateau. Adam adapts per-parameter step scaling; it
+    # does not lower the global step size, which is why validation accuracy oscillated
+    # without settling. Plateau (rather than cosine) because early stopping leaves the
+    # run length unknown, so there is no principled T_max to anneal over.
+    scheduler = None
+    if getattr(config, 'LR_SCHEDULER', 'none') == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode=monitor_mode,
+            factor=config.LR_SCHEDULER_FACTOR,
+            patience=config.LR_SCHEDULER_PATIENCE,
+            min_lr=config.LR_SCHEDULER_MIN_LR,
+        )
+        print(f"   - LR schedule: ReduceLROnPlateau(mode={monitor_mode}, "
+              f"factor={config.LR_SCHEDULER_FACTOR}, patience={config.LR_SCHEDULER_PATIENCE})")
+
+    lr_reductions = 0
+    min_lr_reductions = getattr(config, 'MIN_LR_REDUCTIONS_BEFORE_STOP', 0) if scheduler is not None else 0
+    if min_lr_reductions:
+        print(f"   - Early stopping held until {min_lr_reductions} LR reductions have occurred")
 
     if replay_buffer:
         num_replay_samples = sum(len(d['y']) for d in replay_buffer.values())
@@ -292,7 +333,6 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
         val_epoch_loss = val_loss / (len(x_val_t) / batch_size) if len(x_val_t) > 0 else 0
         val_epoch_acc = val_correct / val_total if val_total > 0 else 0
         
-        # No lr_scheduler needed - Adam handles adaptive learning rates
         history['loss'].append(epoch_loss); history['accuracy'].append(epoch_acc)
         history['val_loss'].append(val_epoch_loss); history['val_accuracy'].append(val_epoch_acc)
         history['lr'].append(optimizer.param_groups[0]['lr'])
@@ -300,8 +340,38 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
         print(f'   Epoch {epoch+1}/{epochs} -> Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}, '
               f'Val Loss: {val_epoch_loss:.4f}, Val Acc: {val_epoch_acc:.4f}')
 
-        monitored_loss = epoch_loss if degenerate_validation else val_epoch_loss
-        if early_stopping(monitored_loss, model, epoch):
+        # One metric drives both the schedule and the stopping decision, so the LR
+        # always drops before early stopping fires on the same plateau.
+        if degenerate_validation:
+            monitored = epoch_loss
+        elif monitor == 'val_accuracy':
+            monitored = val_epoch_acc
+        else:
+            monitored = val_epoch_loss
+
+        if scheduler is not None:
+            prev_lr = optimizer.param_groups[0]['lr']
+            scheduler.step(monitored)
+            new_lr = optimizer.param_groups[0]['lr']
+            if new_lr < prev_lr:
+                lr_reductions += 1
+                gate = (f" (reduction {lr_reductions} of {min_lr_reductions} required before stopping)"
+                        if lr_reductions < min_lr_reductions else "")
+                print(f"   - LR reduced: {prev_lr:.2e} -> {new_lr:.2e}{gate}")
+
+        should_stop = early_stopping(monitored, model, epoch)
+
+        # W23: hold off stopping until the LR has actually been annealed. Without this
+        # every slice stopped at its first plateau at the initial LR. The best weights
+        # are still tracked throughout, so nothing is lost by continuing.
+        if should_stop and lr_reductions < min_lr_reductions:
+            early_stopping.early_stopped = False
+            early_stopping.wait = 0
+            print(f"   - Plateau reached, but only {lr_reductions}/{min_lr_reductions} LR "
+                  f"reductions so far -- continuing at a lower LR instead of stopping.")
+            should_stop = False
+
+        if should_stop:
             print("   - Early stopping triggered.")
             break
             

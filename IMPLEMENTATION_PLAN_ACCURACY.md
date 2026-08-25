@@ -235,7 +235,69 @@ Only needed if W21's cosine routing does not reach the gate's 94.41%.
 | Old 8×8 gate checkpoint under `GATING_POOL_SIZE=1` | loads correctly — pool size inferred from `fc1` |
 | All three routing modes run | gating / cosine / confidence |
 
-**Not yet done:** no full training run. Every number in §1 is still the pre-change baseline.
+## 5b. Results (measured)
+
+| Metric | Baseline | W18–W21 + W22 as first written | **After W22 revert** |
+|---|---|---|---|
+| **Combined accuracy** | 70.35% | 74.68% | **76.73%** |
+| Oracle ceiling (perfect routing) | 74.15% | 81.68% | **81.68%** |
+| Gate routing accuracy | 94.41% | 90.79% | 93.40% |
+| Gate validation accuracy | 95.31% | 92.76% | 94.46% |
+| Best gate-free routing | 75.06% | 77.55% | 77.55% |
+| Training time | 137.6s | 200.6s | — |
+
+**Net: +6.38 points combined, +7.53 points on the ceiling.**
+
+### What worked
+
+W18/W18e/W19/W20 moved the **oracle ceiling 74.15% → 81.68%**, i.e. the specialists
+themselves got substantially better — the system now beats, with imperfect routing, what
+perfect routing could have achieved before. Task-recency bias largely resolved: shard 1's
+recall spread across slice order narrowed from 0.23 to 0.10 (airplane 0.61 → 0.79), and
+horse stopped over-claiming (recall 0.91 → 0.71 while precision rose 0.55 → 0.77).
+
+### What backfired, and the correction
+
+**W22 cost 2.05 points and was reverted.** Two changes, both wrong:
+
+- **Class weights flipped the bias instead of centring it** — routing went 3679/6321 to
+  4521/5479 against a true 4000/6000; shard 1 in-shard retention rose 89% → 95% while
+  shard 2 fell 98% → 88%. Because shard 2 holds 6000 of 10000 test samples, the
+  unweighted gate's apparent bias toward it was *aggregate-optimal*. Making routing
+  per-shard fair made it overall worse. `GATING_CLASS_WEIGHTS = False`.
+- **The 19× GAP shrink was not free** — gate validation fell 95.31% → 92.76%. At the
+  post-W18 ceiling each routing point is worth ~0.82 system points, so the shrink traded
+  ~2.4 points of accuracy for 516k parameters in a model that runs once per sample.
+  `GATING_POOL_SIZE = 8`.
+
+Gate augmentation was also split out (`GATING_CROP_PADDING = 0`, `GATING_FLIP_PROB = 0.5`):
+routing is a coarse whole-image decision, so a random crop can remove the very content that
+separates the shards, unlike the specialists where it is a strong regularizer. Flip stays,
+now applied per sample.
+
+Routing recovered to 93.40%, ~1 point below the original 94.41% — attributable to the
+per-sample flip changing the augmentation stream, and the gate early-stopping sooner
+(15s vs 32s).
+
+### W21 verdict: keep the head, keep the gate
+
+The cosine head sharpened gate-free routing substantially — `head_cosine` 58.62% → 75.00%
+— confirming the mechanism. But at 75.00% it remains **18.4 points below the gate**, so it
+cannot replace it. `ROUTING_MODE` stays `'gating'`. The cosine head is retained for its
+recency-bias benefit, which is real and is part of the ceiling gain above.
+
+Two side effects worth noting: `mahalanobis` collapsed (71.59% → 42.19%) because normalized
+features live on a hypersphere where the tied-covariance assumption breaks, and
+`energy_debiased` overtook cosine as the best gate-free score (77.55%).
+
+### Next lever
+
+`bird` and `cat` — the earliest classes in shard 2 — are now *under*-predicted
+(precision 0.76/0.76, recall 0.58/0.44); the pendulum swung. Likely cause is
+`MAX_REPLAY_SAMPLES_PER_CLASS = 1000`: old classes are represented by 1000 of their 4500
+images, seen repeatedly, so they overfit those specific samples. That cap did not bind when
+replay held 20 of 64 batch slots; at 46 of 64 it does. Raising it (2000–3000, or uncapped)
+is the next experiment and needs a full retrain.
 
 ## 6. How to run (manual)
 

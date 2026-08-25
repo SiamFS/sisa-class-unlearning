@@ -13,14 +13,18 @@ import config
 from utils.seeding import seeded_generator
 
 from training.create_model import create_gating_model, save_model_pytorch, DEVICE
-from training.augmentation import build_augmenter
+from training.augmentation import PerSampleAugmenter
 
 def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, excluded_classes=None):
 
     # W19/W22: geometric augmentation is per-sample (a torchvision Compose applied to a
     # batched tensor gives the whole batch one shared decision) and now includes the
     # random crop the gate previously lacked entirely.
-    gating_augmenter = build_augmenter(config.get_augmentation_config('baseline'), config.SEED)
+    gating_augmenter = PerSampleAugmenter(
+        crop_padding=config.GATING_CROP_PADDING,
+        flip_prob=config.GATING_FLIP_PROB,
+        seed=config.SEED,
+    )
     train_transforms = T.Compose([
         T.Normalize(dataset_mean, dataset_std)
     ])
@@ -112,7 +116,12 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
             print(f"   - Applying class weights: {[round(float(w), 4) for w in weights]}")
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = optim.Adam(model.parameters(), lr=config.GATING_LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    # W23: same decoupled-weight-decay fix as the specialists (Adam folds L2 into the
+    # adaptive update; AdamW applies it as actual weight decay).
+    if getattr(config, 'OPTIMIZER', 'adam').lower() == 'adamw':
+        optimizer = optim.AdamW(model.parameters(), lr=config.GATING_LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=config.GATING_LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     
     # Early stopping setup for gating network
     best_val_acc = 0.0
@@ -196,6 +205,9 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         metadata = {
             'best_val_acc': best_val_acc,
             'num_shards': num_shards,
+            # W24: routing resolution is invisible in the weight shapes (the adaptive
+            # pool hides it), so the loader has to read it back from here.
+            'input_size': model.input_size,
             'training_type': 'retrained' if excluded_classes else 'initial',
             'excluded_class_count': len(excluded_classes) if excluded_classes else 0,
             # NOTE: We do NOT store class names, indices, or any class-identifying information
@@ -209,6 +221,9 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         metadata = {
             'best_val_acc': 0.0,
             'num_shards': num_shards,
+            # W24: routing resolution is invisible in the weight shapes (the adaptive
+            # pool hides it), so the loader has to read it back from here.
+            'input_size': model.input_size,
             'training_type': 'retrained' if excluded_classes else 'initial',
             'excluded_class_count': len(excluded_classes) if excluded_classes else 0,
         }

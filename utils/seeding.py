@@ -9,6 +9,14 @@ reproducible given the same seed and inputs.
 import os
 import random
 
+# W23: set before `import torch` below, and therefore before anything can create a
+# cuBLAS handle. Deterministic cuBLAS GEMMs on CUDA >= 10.2 require this variable to
+# be present in the environment at handle-creation time -- setting it later is
+# silently ignored. Doing it at module import (rather than only inside set_seed)
+# means any caller that imports this module at the top of a file is covered, even if
+# it calls set_seed further down.
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
 import numpy as np
 import torch
 
@@ -16,6 +24,17 @@ import torch
 def set_seed(seed: int) -> None:
     """Seed Python, NumPy, and PyTorch (CPU + CUDA) and force deterministic ops."""
     os.environ['PYTHONHASHSEED'] = str(seed)
+
+    # W23: required for deterministic cuBLAS GEMMs on CUDA >= 10.2. Without it,
+    # `use_deterministic_algorithms(warn_only=True)` only *warns* that every matmul
+    # (i.e. every Linear layer, including the cosine head) is non-deterministic, and
+    # runs it anyway -- so identical seeds did not in fact reproduce identical weights.
+    # That silently invalidated W1's acceptance criterion and condition 3 of the
+    # exactness argument in section 4.2. Must be set before the cuBLAS handle is
+    # created, which is why set_seed() has to run before any CUDA work: every entry
+    # point already calls it immediately after importing config.
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

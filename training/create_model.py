@@ -133,8 +133,18 @@ class GatingNetwork(nn.Module):
     Simplified architecture: 2 conv layers + 2 FC layers
     Purpose: Route samples to appropriate shards (NOT classify into classes)
     """
-    def __init__(self, num_shards, in_channels=3, pool_size=None):
+    def __init__(self, num_shards, in_channels=3, pool_size=None, input_size=None):
         super(GatingNetwork, self).__init__()
+
+        # W24: optionally route on a downsampled image. The gate's cost is dominated by
+        # its two conv layers (4.7M of its 6.1M MACs sit in conv2 alone), and conv cost
+        # scales with spatial area -- so halving each side cuts conv FLOPs ~4x, whereas
+        # shrinking the FC layer (GATING_POOL_SIZE) removes 96% of the *parameters* but
+        # only ~8% of the *compute*. Routing is a coarse "which shard" decision, so full
+        # 32x32 detail may not be earning its cost. 0/None = no downsampling.
+        if input_size is None:
+            input_size = getattr(config, 'GATING_INPUT_SIZE', 0) or 0
+        self.input_size = int(input_size)
         # Lightweight conv layers - only 2 layers for routing
         self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
@@ -159,6 +169,11 @@ class GatingNetwork(nn.Module):
         self.fc2 = nn.Linear(128, num_shards)  # Direct output to shards
 
     def forward(self, x):
+        # W24: downsample before the convs, so the saving lands where the cost is.
+        # adaptive_avg_pool2d (rather than a fixed stride) keeps this resolution-agnostic,
+        # matching how the rest of the pipeline avoids hardcoding 32x32.
+        if self.input_size and x.shape[-1] != self.input_size:
+            x = F.adaptive_avg_pool2d(x, (self.input_size, self.input_size))
         # Lightweight forward pass for routing
         x = self.pool(F.relu(self.bn1(self.conv1(x))))
         x = self.pool(F.relu(self.bn2(self.conv2(x))))
@@ -202,7 +217,13 @@ class PyTorchModelManager:
             fc1_weight = checkpoint['model_state_dict'].get('fc1.weight')
             if fc1_weight is not None:
                 gate_pool_size = int(round((fc1_weight.shape[1] / 64) ** 0.5))
-            model = create_gating_model(num_shards=num_shards, pool_size=gate_pool_size)
+            # W24: the routing input size is not recoverable from any weight shape (the
+            # adaptive pool hides it), so it travels in the checkpoint metadata. Absent
+            # metadata means a gate saved before W24, which routed on full-size input.
+            gate_input_size = checkpoint.get('metadata', {}).get('input_size', 0)
+            model = create_gating_model(
+                num_shards=num_shards, pool_size=gate_pool_size, input_size=gate_input_size
+            )
         else:
             state_dict = checkpoint['model_state_dict']
             if num_classes is None:
@@ -237,10 +258,10 @@ def create_sisa_model(num_classes=None, in_channels=None, classifier_type=None):
         in_channels = config.IN_CHANNELS
     return SISAConvNet(num_classes, in_channels, classifier_type=classifier_type).to(DEVICE)
 
-def create_gating_model(num_shards, in_channels=None, pool_size=None):
+def create_gating_model(num_shards, in_channels=None, pool_size=None, input_size=None):
     if in_channels is None:
         in_channels = config.IN_CHANNELS
-    return GatingNetwork(num_shards, in_channels, pool_size=pool_size).to(DEVICE)
+    return GatingNetwork(num_shards, in_channels, pool_size=pool_size, input_size=input_size).to(DEVICE)
 
 def save_model_pytorch(model, filepath, metadata=None):
     manager = PyTorchModelManager(device=DEVICE)
