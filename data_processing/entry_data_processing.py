@@ -235,6 +235,9 @@ os.makedirs(shards_data_dir, exist_ok=True)
 # Save main metadata
 metadata = {
     'num_shards': num_shards,
+    # W28: the residual backbone derives its stage count from input resolution, so
+    # the resolution has to come from the data rather than a config constant.
+    'input_size': int(x_train.shape[-1]),
     'num_slices': max(slices_per_shard),  # legacy scalar = max, for older readers
     'slices_per_shard': slices_per_shard,  # W26: authoritative per-shard slice counts
     'class_names': class_names,

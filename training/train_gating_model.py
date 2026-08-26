@@ -15,7 +15,15 @@ from utils.seeding import seeded_generator
 from training.create_model import create_gating_model, save_model_pytorch, DEVICE
 from training.augmentation import PerSampleAugmenter
 
-def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, excluded_classes=None):
+def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, excluded_classes=None,
+                 save_dir=None):
+    """Train the shard router.
+
+    `save_dir` (W31) redirects the checkpoint away from the project's real
+    models/gating_model.pth. Required by anything that trains a throwaway gate --
+    a hyperparameter trial or the W8 scratch reference -- so a side experiment can
+    never overwrite the deployed router.
+    """
 
     # W19/W22: geometric augmentation is per-sample (a torchvision Compose applied to a
     # batched tensor gives the whole batch one shared decision) and now includes the
@@ -38,7 +46,8 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         num_slices = [num_slices] * num_shards
 
     sisa_data_dir = os.path.join(base_dir, "sisa_data")
-    models_dir = os.path.join(base_dir, "models")
+    models_dir = save_dir if save_dir else os.path.join(base_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
     
     # 1. Build a map from class index to shard index
     class_to_shard_map = {}

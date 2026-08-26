@@ -46,32 +46,51 @@ def _load_system_models(project_name: str, model_name: str, num_shards: int):
     return models
 
 
-def _predictions_and_probs(shard_models, shard_class_indices, class_names, X, eval_transforms, batch_size):
+def _predictions_and_probs(shard_models, shard_class_indices, class_names, X, eval_transforms,
+                            batch_size, gating_model=None):
+    """W31: evaluate through the router the system actually uses.
+
+    This previously called _run_sisa_batch with no gate, i.e. parameter-free confidence
+    routing -- but since W16 the real system routes through the learned gate. Comparing
+    an unlearned system and a scratch system under a routing mechanism neither of them
+    deploys makes every downstream metric (prediction agreement, output-distribution
+    distance, MIA) measure the wrong system.
+
+    The SAME gate is used for both sides. That is deliberate: the gate is retrained
+    excluding the deleted class either way, so holding it fixed isolates the specialist
+    difference, which is exactly what the exactness metrics are about.
+    """
     preds, probs_all = [], []
     with torch.no_grad():
         for i in range(0, len(X), batch_size):
             batch_x = torch.from_numpy(X[i:i + batch_size].astype(np.float32))
             batch_x = eval_transforms(batch_x).to(DEVICE)
-            p, pr = _run_sisa_batch(batch_x, shard_models, class_names, shard_class_indices, threshold=None)
+            p, pr = _run_sisa_batch(batch_x, shard_models, class_names, shard_class_indices,
+                                     threshold=None, gating_model=gating_model)
             preds.extend(p.cpu().numpy())
             probs_all.append(pr.cpu().numpy())
     return np.array(preds), np.concatenate(probs_all, axis=0)
 
 
-def _confidence_scores(shard_models, shard_class_indices, class_names, X, eval_transforms, batch_size):
+def _confidence_scores(shard_models, shard_class_indices, class_names, X, eval_transforms,
+                        batch_size, gating_model=None):
     """Max combined-probability on whatever the system predicts -- the MIA signal.
     Deliberately not loss-against-true-label: the affected shard's dynamic head
     (W6) has no output column for the deleted class at all, so that loss would be
     degenerate (-log(0)) for every sample, member or not."""
     if len(X) == 0:
         return np.array([])
-    _, probs = _predictions_and_probs(shard_models, shard_class_indices, class_names, X, eval_transforms, batch_size)
+    _, probs = _predictions_and_probs(shard_models, shard_class_indices, class_names, X,
+                                       eval_transforms, batch_size, gating_model)
     return probs.max(axis=1)
 
 
-def _compute_mia(shard_models, shard_class_indices, class_names, member_x, nonmember_x, eval_transforms, batch_size):
-    member_conf = _confidence_scores(shard_models, shard_class_indices, class_names, member_x, eval_transforms, batch_size)
-    nonmember_conf = _confidence_scores(shard_models, shard_class_indices, class_names, nonmember_x, eval_transforms, batch_size)
+def _compute_mia(shard_models, shard_class_indices, class_names, member_x, nonmember_x,
+                  eval_transforms, batch_size, gating_model=None):
+    member_conf = _confidence_scores(shard_models, shard_class_indices, class_names, member_x,
+                                      eval_transforms, batch_size, gating_model)
+    nonmember_conf = _confidence_scores(shard_models, shard_class_indices, class_names, nonmember_x,
+                                         eval_transforms, batch_size, gating_model)
     scores = np.concatenate([member_conf, nonmember_conf])
     labels = np.concatenate([np.ones(len(member_conf)), np.zeros(len(nonmember_conf))])
     auc_val = float(roc_auc_score(labels, scores))
@@ -152,9 +171,9 @@ def run_exactness_eval(source_project: str, class_name: str, model_name: str = N
     print(f"   - Parameter distance: L2={param_distance['l2']:.4f}, cosine dist={param_distance['cosine']:.6f} "
           f"(not expected to be ~0 -- see report notes)")
 
-    preds_original, probs_original = _predictions_and_probs(original_models, original_shard_indices, class_names, x_test, eval_transforms, batch_size)
-    preds_unlearned, probs_unlearned = _predictions_and_probs(unlearned_models, unlearned_shard_indices, class_names, x_test, eval_transforms, batch_size)
-    preds_scratch, probs_scratch = _predictions_and_probs(scratch_models, scratch_shard_indices, class_names, x_test, eval_transforms, batch_size)
+    preds_original, probs_original = _predictions_and_probs(original_models, original_shard_indices, class_names, x_test, eval_transforms, batch_size, original_gate)
+    preds_unlearned, probs_unlearned = _predictions_and_probs(unlearned_models, unlearned_shard_indices, class_names, x_test, eval_transforms, batch_size, unlearned_gate)
+    preds_scratch, probs_scratch = _predictions_and_probs(scratch_models, scratch_shard_indices, class_names, x_test, eval_transforms, batch_size, unlearned_gate)
 
     # Metric 2: prediction agreement.
     pred_agreement = float(np.mean(preds_unlearned == preds_scratch))
@@ -169,12 +188,13 @@ def run_exactness_eval(source_project: str, class_name: str, model_name: str = N
     nonmember_mask = (y_test == class_idx)
     nonmember_x = x_test[nonmember_mask]
     mia_results = {}
-    for label, models, shard_idxs in [
-        ('original', original_models, original_shard_indices),
-        ('unlearned', unlearned_models, unlearned_shard_indices),
-        ('scratch', scratch_models, scratch_shard_indices),
+    for label, models, shard_idxs, gate in [
+        ('original', original_models, original_shard_indices, original_gate),
+        ('unlearned', unlearned_models, unlearned_shard_indices, unlearned_gate),
+        ('scratch', scratch_models, scratch_shard_indices, unlearned_gate),
     ]:
-        fpr, tpr, auc_val = _compute_mia(models, shard_idxs, class_names, scratch_result['member_x'], nonmember_x, eval_transforms, batch_size)
+        fpr, tpr, auc_val = _compute_mia(models, shard_idxs, class_names, scratch_result['member_x'],
+                                          nonmember_x, eval_transforms, batch_size, gate)
         mia_results[label] = (fpr, tpr, auc_val)
         print(f"   - MIA AUC ({label}): {auc_val:.4f}")
 

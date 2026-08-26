@@ -159,10 +159,66 @@ DROPOUT_RATE = 0.25  # Reduced dropout for better balance
 DROPOUT_2D_RATE = 0.15  # 2D dropout for conv layers
 GATING_DROPOUT_RATE = 0.2  # Gating network dropout  
 
-# CNN Architecture Parameters
+# CNN Architecture Parameters (SISAConvNet path only -- the ResNet path derives its
+# widths from RESNET_BASE_WIDTH and must not read these; see W28.)
 FC_LAYER_1_INPUT = 2048  # 128 * 4 * 4 (conv output flattened)
 FC_LAYER_1_HIDDEN = 256  # Hidden layer size for classifier
 FC_LAYER_DROPOUT = 0.5   # Dropout rate for FC layers
+
+# ================================================================================
+# W28: BACKBONE SELECTION (architecture ablation)
+# ================================================================================
+# 'convnet' is the default so the measured 83.26% baseline stays reproducible; the
+# ablation is run by flipping this to 'resnet' with everything else held fixed.
+#
+# Why a residual backbone is worth testing -- parameters per training sample WITHIN a
+# shard, which is the quantity that matters, since class-isolated sharding gives each
+# specialist only |C_k| * n / N_C samples:
+#
+#     model                    params    CIFAR-10   CIFAR-100   Tiny-ImageNet
+#     SISAConvNet (current)   621,313          31         219             173
+#     ResNet-20               272,474          13          96               -
+#     ResNet-18 (ImageNet)  11,173,962         497       3,547           3,104
+#
+# ResNet-20 has FEWER parameters than the current CNN while adding residual
+# connections: the current 0.62M sits mostly in Linear(2048, 256), which global
+# average pooling removes entirely.
+MODEL_ARCH = 'resnet'  # 'convnet' | 'resnet'
+
+# W28: depth follows from input resolution rather than being hardcoded, consistent
+# with how NUM_SHARDS, NUM_SLICES_PER_SHARD and MAX_SLICES_PER_SHARD are derived.
+# Stages are added until the feature map reaches RESNET_TARGET_SPATIAL before global
+# average pooling:
+#
+#     n_stages = ceil(log2(input_size / RESNET_TARGET_SPATIAL)) + 1
+#     widths   = [RESNET_BASE_WIDTH * 2**i for i in range(n_stages)]
+#     depth    = 2 * RESNET_BLOCKS_PER_STAGE * n_stages + 2
+#
+#     32x32 -> 3 stages [16, 32, 64]       -> depth 20  (= ResNet-20 exactly)
+#     64x64 -> 4 stages [16, 32, 64, 128]  -> depth 26
+#
+# So at 32x32 this is not a departure from He et al.'s ResNet-20 -- it is that
+# architecture with its resolution assumption made explicit.
+RESNET_BLOCKS_PER_STAGE = 3
+RESNET_BASE_WIDTH = 16
+RESNET_TARGET_SPATIAL = 8
+
+# W28: CIFAR ResNets conventionally use no dropout, and FC_LAYER_DROPOUT=0.5 would be
+# actively destructive here: it is applied to a 2048-dim flattened feature in the
+# ConvNet, but a residual net's pre-classifier feature is only RESNET_BASE_WIDTH *
+# 2**(n_stages-1) wide (64 at 32x32) after global average pooling. Dropping half of 64
+# features is the most likely way a first ResNet run underperforms for reasons that
+# have nothing to do with the architecture.
+RESNET_DROPOUT = 0.0
+
+# W29: the gate uses the same residual family, just shallower -- one architecture with
+# a depth parameter rather than two unrelated networks. Measured at 1 block/stage,
+# base 16: 77,522 params at 32x32 (28% of a ResNet-20 specialist), versus the current
+# GatingNetwork's 544,258, which is 200% of a specialist -- a router twice the size of
+# the model it routes to. Note GATING_INPUT_SIZE/GATING_POOL_SIZE are GatingNetwork-only
+# knobs; a ResNet gate derives its own stages from resolution.
+GATING_BLOCKS_PER_STAGE = 1
+GATING_BASE_WIDTH = 16
 
 # W21: classifier head type.
 #   'linear' -- original nn.Linear head.
@@ -375,6 +431,51 @@ IN_CHANNELS = 3  # Number of input channels (3=RGB, 1=grayscale) for the model f
 BASELINE_CROP_PADDING = 4      # RandomCrop(size, padding=4) -- the CIFAR standard
 BASELINE_HORIZONTAL_FLIP = 0.5
 
+# W30: Cutout (DeVries & Taylor 2017) -- the standard companion regularizer to
+# crop+flip for CIFAR ResNets, and the one this pipeline was missing. Measured on the
+# ResNet-20 run: shard 2 slice 6 ended with a 9.6-point train/val gap (train 0.9766 vs
+# val 0.8807), and after the val-loss minimum at epoch 14 train loss kept falling
+# (-0.059) while val loss rose (+0.014) -- the textbook memorisation signature.
+#
+# Expressed as a FRACTION of the image side rather than a pixel count, so it stays
+# resolution-agnostic like the partition and backbone: 0.5 gives the standard 16px
+# square on 32x32 CIFAR, and the right 32px square on 64x64 Tiny-ImageNet.
+BASELINE_CUTOUT_FRACTION = 0.5
+
+
+def get_input_size(metadata_path=None) -> int:
+    """Input image side length, read from metadata.json (W28).
+
+    The residual backbone derives its stage count from resolution, so this has to come
+    from the data rather than a constant -- mirrors get_num_classes(). Falls back to 32
+    for projects whose metadata predates this field.
+    """
+    import json
+
+    if metadata_path is None:
+        metadata_path = os.path.join(PROJECTS_DIR, PROJECT_NAME, "sisa_data", "metadata.json")
+
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            metadata = json.load(f)
+        return int(metadata['input_size'])
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return 32
+
+
+def resnet_stage_widths(input_size: int, base_width: int = None, target_spatial: int = None):
+    """Channel widths per stage, derived from input resolution (W28).
+
+    Returns e.g. [16, 32, 64] at 32x32 and [16, 32, 64, 128] at 64x64, so the feature
+    map entering global average pooling is always about `target_spatial` on a side.
+    """
+    import math
+
+    base_width = RESNET_BASE_WIDTH if base_width is None else base_width
+    target_spatial = RESNET_TARGET_SPATIAL if target_spatial is None else target_spatial
+    n_downsamples = max(0, math.ceil(math.log2(max(1, input_size) / target_spatial)))
+    return [base_width * (2 ** i) for i in range(n_downsamples + 1)]
+
 
 def resolve_num_shards(num_classes: int) -> int:
     """Resolve NUM_SHARDS, deriving it from the dataset when set to 'auto' (W26).
@@ -460,11 +561,15 @@ def get_augmentation_config(level='baseline', is_unlearning=False):
     multiplier = 0.6 if is_unlearning else 1.0
     # Geometric augmentation is shared by every level; crop padding stays an integer.
     crop_padding = max(1, int(round(BASELINE_CROP_PADDING * multiplier)))
+    # Milder cutout during unlearning retrains, matching the existing `multiplier`
+    # convention for the other augmentation strengths.
+    cutout_fraction = BASELINE_CUTOUT_FRACTION * multiplier
 
     configs = {
         'baseline': {
             'random_crop_padding': crop_padding,
             'random_horizontal_flip': BASELINE_HORIZONTAL_FLIP,
+            'cutout_fraction': cutout_fraction,
             'color_jitter_brightness': 0.0,
             'color_jitter_contrast': 0.0,
             'color_jitter_saturation': 0.0,
@@ -474,6 +579,7 @@ def get_augmentation_config(level='baseline', is_unlearning=False):
         'minimal': {
             'random_crop_padding': crop_padding,
             'random_horizontal_flip': 0.5,
+            'cutout_fraction': cutout_fraction,
             'color_jitter_brightness': 0.05 * multiplier,
             'color_jitter_contrast': 0.05 * multiplier,
             'color_jitter_saturation': 0.02 * multiplier,
@@ -483,6 +589,7 @@ def get_augmentation_config(level='baseline', is_unlearning=False):
         'light': {
             'random_crop_padding': crop_padding,
             'random_horizontal_flip': 0.5,
+            'cutout_fraction': cutout_fraction,
             'color_jitter_brightness': 0.07 * multiplier,
             'color_jitter_contrast': 0.07 * multiplier,
             'color_jitter_saturation': 0.03 * multiplier,
@@ -492,6 +599,7 @@ def get_augmentation_config(level='baseline', is_unlearning=False):
         'moderate': {
             'random_crop_padding': crop_padding,
             'random_horizontal_flip': 0.5,
+            'cutout_fraction': cutout_fraction,
             'color_jitter_brightness': 0.1 * multiplier,
             'color_jitter_contrast': 0.1 * multiplier,
             'color_jitter_saturation': 0.05 * multiplier,

@@ -184,6 +184,153 @@ class GatingNetwork(nn.Module):
         x = self.fc2(x)  # Output: shard probabilities
         return x
 
+class BasicBlock(nn.Module):
+    """Standard two-conv residual block (He et al. 2015), CIFAR variant: 3x3 / 3x3 with
+    a 1x1 projection shortcut only when stride or width changes."""
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Sequential()
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + self.shortcut(x))
+
+
+class SISAResNet(nn.Module):
+    """CIFAR-style residual backbone whose depth is derived from input resolution (W28).
+
+    Stages are added until the feature map reaches `RESNET_TARGET_SPATIAL` before global
+    average pooling, so 32x32 yields widths [16, 32, 64] at depth 20 -- reproducing
+    He et al.'s ResNet-20 exactly -- and 64x64 yields [16, 32, 64, 128] at depth 26.
+    The architecture is therefore a function of the dataset, matching how NUM_SHARDS,
+    NUM_SLICES_PER_SHARD and MAX_SLICES_PER_SHARD are already derived.
+
+    `fc_layer` deliberately mirrors SISAConvNet's six-element shape, padding the
+    positions a residual net does not need with `Identity`. That is what lets every
+    existing contract keep working unchanged:
+
+      * `fc_layer[:5]` is an identity chain, so `penultimate()` returns the GAP output;
+      * `fc_layer.5.weight` exists, so W6's `_resize_model_head` and the loader's
+        class-count inference need no special case;
+      * `Identity` holds no parameters, so the ABSENCE of `fc_layer.1.weight` (the
+        ConvNet's Linear(2048, 256)) identifies the architecture from a checkpoint
+        alone -- no new metadata field, and old checkpoints still load.
+    """
+
+    def __init__(self, num_classes=10, in_channels=3, input_size=None,
+                 blocks_per_stage=None, base_width=None, classifier_type=None,
+                 stage_widths=None):
+        super(SISAResNet, self).__init__()
+        if classifier_type is None:
+            classifier_type = getattr(config, 'CLASSIFIER_TYPE', 'linear')
+        self.classifier_type = classifier_type
+
+        if input_size is None:
+            input_size = config.get_input_size()
+        if blocks_per_stage is None:
+            blocks_per_stage = config.RESNET_BLOCKS_PER_STAGE
+        if base_width is None:
+            base_width = config.RESNET_BASE_WIDTH
+
+        # `stage_widths` is an explicit override used when rebuilding from a checkpoint,
+        # so a saved model reconstructs exactly even if the config has since changed.
+        widths = list(stage_widths) if stage_widths else config.resnet_stage_widths(input_size, base_width)
+        self.input_size = int(input_size)
+        self.blocks_per_stage = int(blocks_per_stage)
+        self.stage_widths = list(widths)
+        self.feature_dim = widths[-1]
+        self.depth = 2 * self.blocks_per_stage * len(widths) + 2
+
+        layers = [
+            nn.Conv2d(in_channels, widths[0], 3, 1, 1, bias=False),
+            nn.BatchNorm2d(widths[0]),
+            nn.ReLU(inplace=True),
+        ]
+        current = widths[0]
+        for stage_idx, width in enumerate(widths):
+            for block_idx in range(self.blocks_per_stage):
+                # Downsample once at the start of every stage after the first.
+                stride = 2 if (block_idx == 0 and stage_idx > 0) else 1
+                layers.append(BasicBlock(current, width, stride))
+                current = width
+        layers.append(nn.AdaptiveAvgPool2d(1))
+        self.conv_layer = nn.Sequential(*layers)
+
+        if classifier_type == 'cosine':
+            final_layer = CosineClassifier(self.feature_dim, num_classes)
+        else:
+            final_layer = nn.Linear(self.feature_dim, num_classes)
+
+        # Positions 0-3 are Identity: see the class docstring for why the shape matters.
+        self.fc_layer = nn.Sequential(
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            nn.Dropout(p=config.RESNET_DROPOUT),
+            final_layer,
+        )
+
+    def penultimate(self, x):
+        """Feature vector fed to the final classifier -- the routing representation (W21)."""
+        x = self.conv_layer(x)
+        x = x.reshape(x.size(0), -1)
+        return self.fc_layer[:5](x)
+
+    def routing_cosine(self, x):
+        """Cosine similarity of each sample to every class vector, in [-1, 1]. Same
+        contract as SISAConvNet.routing_cosine."""
+        features = self.penultimate(x)
+        final_layer = self.fc_layer[5]
+        if isinstance(final_layer, CosineClassifier):
+            return final_layer.cosine(features)
+        return F.normalize(features, p=2, dim=1) @ F.normalize(final_layer.weight, p=2, dim=1).t()
+
+    def forward(self, x):
+        x = self.conv_layer(x)
+        x = x.reshape(x.size(0), -1)
+        return self.fc_layer(x)
+
+
+def _infer_resnet_shape(state_dict):
+    """Recover a SISAResNet's geometry from its own state dict (W28/W29).
+
+    Specialists and the router share the architecture but differ in depth
+    (RESNET_BLOCKS_PER_STAGE vs GATING_BLOCKS_PER_STAGE), and either may have been
+    saved under a config that has since changed. Reading the shape back from the
+    checkpoint makes saved models self-describing, so they always reconstruct exactly.
+
+    Returns (stage_widths, blocks_per_stage, num_classes).
+    """
+    stem = state_dict['conv_layer.0.weight'].shape[0]
+    feature_dim = state_dict['fc_layer.5.weight'].shape[1]
+    num_classes = state_dict['fc_layer.5.weight'].shape[0]
+
+    # Widths double once per stage, from the stem width up to the final feature width.
+    widths, w = [], stem
+    while w < feature_dim:
+        widths.append(w)
+        w *= 2
+    widths.append(feature_dim)
+
+    n_blocks = sum(1 for k in state_dict if k.endswith('.conv1.weight') and k.startswith('conv_layer.'))
+    blocks_per_stage = max(1, n_blocks // len(widths))
+    return widths, blocks_per_stage, num_classes
+
+
 class PyTorchModelManager:
     def __init__(self, device=None):
         self.device = device if device is not None else DEVICE
@@ -210,7 +357,22 @@ class PyTorchModelManager:
         checkpoint = torch.load(filepath, map_location=device)
         
         model_class_name = checkpoint.get('model_class', 'SISAConvNet')
-        if model_class_name == 'GatingNetwork' and num_shards is not None:
+
+        # W29: a residual gate and a residual specialist are both SISAResNet, so the
+        # class name cannot tell them apart -- they differ only in depth. `num_shards`
+        # is the existing signal that a gate is being loaded (callers pass it only for
+        # the router), and the geometry is read back from the checkpoint itself so the
+        # gate rebuilds at ITS depth rather than the specialist's.
+        if model_class_name == 'SISAResNet' and num_shards is not None:
+            sd = checkpoint['model_state_dict']
+            widths, blocks, n_out = _infer_resnet_shape(sd)
+            model = SISAResNet(
+                num_classes=n_out,
+                stage_widths=widths,
+                blocks_per_stage=blocks,
+                classifier_type='linear' if 'fc_layer.5.bias' in sd else 'cosine',
+            ).to(device)
+        elif model_class_name == 'GatingNetwork' and num_shards is not None:
             # W22: infer the checkpoint's own pooling size from fc1's input width, so
             # gates saved before GATING_POOL_SIZE existed still load after the change.
             gate_pool_size = None
@@ -243,7 +405,21 @@ class PyTorchModelManager:
                 checkpoint_classifier = 'cosine'
             else:
                 checkpoint_classifier = getattr(config, 'CLASSIFIER_TYPE', 'linear')
-            model = create_sisa_model(num_classes=num_classes, classifier_type=checkpoint_classifier)
+            # W28: the checkpoint also decides its own backbone. SISAConvNet has
+            # fc_layer.1.weight (its Linear(2048, 256)); SISAResNet pads that position
+            # with Identity, which holds no parameters -- so the key's absence is an
+            # exact architecture discriminator, and a ConvNet checkpoint still loads
+            # while MODEL_ARCH is set to 'resnet'.
+            checkpoint_arch = 'convnet' if 'fc_layer.1.weight' in state_dict else 'resnet'
+            if checkpoint_arch == 'resnet':
+                widths, blocks, _ = _infer_resnet_shape(state_dict)
+                model = SISAResNet(num_classes=num_classes, stage_widths=widths,
+                                   blocks_per_stage=blocks,
+                                   classifier_type=checkpoint_classifier).to(device)
+            else:
+                model = create_sisa_model(num_classes=num_classes,
+                                          classifier_type=checkpoint_classifier,
+                                          arch=checkpoint_arch)
 
         model.load_state_dict(checkpoint['model_state_dict'])
         model.to(device)
@@ -251,16 +427,47 @@ class PyTorchModelManager:
         metadata = checkpoint.get('metadata', {})
         return model, metadata
 
-def create_sisa_model(num_classes=None, in_channels=None, classifier_type=None):
+def create_sisa_model(num_classes=None, in_channels=None, classifier_type=None, arch=None):
+    """Build a specialist. `arch` overrides config.MODEL_ARCH -- used by the loader so a
+    checkpoint's own architecture wins over the current config setting (W28)."""
     if num_classes is None:
         num_classes = config.get_num_classes()
     if in_channels is None:
         in_channels = config.IN_CHANNELS
+    if arch is None:
+        arch = getattr(config, 'MODEL_ARCH', 'convnet')
+
+    if str(arch).lower() == 'resnet':
+        return SISAResNet(num_classes, in_channels, classifier_type=classifier_type).to(DEVICE)
     return SISAConvNet(num_classes, in_channels, classifier_type=classifier_type).to(DEVICE)
 
-def create_gating_model(num_shards, in_channels=None, pool_size=None, input_size=None):
+def create_gating_model(num_shards, in_channels=None, pool_size=None, input_size=None, arch=None):
+    """Build the router.
+
+    W29: under MODEL_ARCH='resnet' the gate is the SAME residual family as the
+    specialists, just shallower (GATING_BLOCKS_PER_STAGE) -- one architecture with a
+    depth parameter rather than two unrelated networks. Measured at 1 block/stage,
+    base 16: 77,522 params at 32x32, versus GatingNetwork's 544,258, which was 200% of
+    a ResNet-20 specialist -- a router twice the size of the model it routes to.
+
+    Note `pool_size`/`input_size` are GatingNetwork-only knobs (W22/W24); a residual
+    gate derives its own stages from resolution.
+    """
     if in_channels is None:
         in_channels = config.IN_CHANNELS
+    if arch is None:
+        arch = getattr(config, 'MODEL_ARCH', 'convnet')
+
+    if str(arch).lower() == 'resnet':
+        return SISAResNet(
+            num_classes=num_shards,
+            in_channels=in_channels,
+            input_size=input_size,
+            blocks_per_stage=config.GATING_BLOCKS_PER_STAGE,
+            base_width=config.GATING_BASE_WIDTH,
+            classifier_type='linear',  # routing is a plain K-way decision
+        ).to(DEVICE)
+
     return GatingNetwork(num_shards, in_channels, pool_size=pool_size, input_size=input_size).to(DEVICE)
 
 def save_model_pytorch(model, filepath, metadata=None):

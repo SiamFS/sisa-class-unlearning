@@ -82,7 +82,9 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     # sample in a batch gets its own random draw -- applying a torchvision Compose to an
     # already-batched tensor gives the whole batch one shared decision. Colour jitter and
     # normalization stay in the Compose (jitter only appears on unbalanced-shard paths).
-    augmenter = build_augmenter(augmentation_config, config.SEED)
+    # W30: cutout fills with the dataset channel mean, so the masked square is neutral
+    # once normalization is applied (augmentation runs before T.Normalize here).
+    augmenter = build_augmenter(augmentation_config, config.SEED, fill_value=dataset_mean)
     augmentations = []
 
     if augmentation_config is None:
@@ -94,6 +96,8 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
             print(f"   - Random crop: padding={augmenter.crop_padding} (per-sample)")
         if augmenter.flip_prob > 0:
             print(f"   - Horizontal flip: {augmenter.flip_prob:.2f} (per-sample)")
+        if augmenter.cutout_fraction > 0:
+            print(f"   - Cutout: {augmenter.cutout_fraction:.2f} of image side (per-sample)")
 
         # Color jitter (only if any parameter > 0)
         color_params = [

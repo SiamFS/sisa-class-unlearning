@@ -29,18 +29,25 @@ class PerSampleAugmenter:
         crop_padding: pixels of reflect padding added before cropping back to the
             original size. 0 disables cropping.
         flip_prob: per-sample probability of a horizontal flip. 0 disables flipping.
+        cutout_fraction: side of the masked square as a fraction of the image side
+            (0.5 = the standard 16px on 32px CIFAR setting). 0 disables cutout.
+        fill_value: what the masked square is filled with -- the dataset channel mean,
+            so the patch is neutral once normalization is applied. Falls back to 0.
         seed: seed for the internal `torch.Generator`.
     """
 
-    def __init__(self, crop_padding: int = 0, flip_prob: float = 0.0, seed: int = 0):
+    def __init__(self, crop_padding: int = 0, flip_prob: float = 0.0, seed: int = 0,
+                 cutout_fraction: float = 0.0, fill_value=None):
         self.crop_padding = int(crop_padding or 0)
         self.flip_prob = float(flip_prob or 0.0)
+        self.cutout_fraction = float(cutout_fraction or 0.0)
+        self.fill_value = fill_value
         self._generator = torch.Generator(device='cpu')
         self._generator.manual_seed(int(seed))
 
     @property
     def enabled(self) -> bool:
-        return self.crop_padding > 0 or self.flip_prob > 0.0
+        return self.crop_padding > 0 or self.flip_prob > 0.0 or self.cutout_fraction > 0.0
 
     def reset(self, seed: int) -> None:
         """Re-seed, so a fresh training run reproduces the same augmentation stream."""
@@ -52,7 +59,43 @@ class PerSampleAugmenter:
 
         batch = self._random_flip(batch)
         batch = self._random_crop(batch)
+        batch = self._cutout(batch)
         return batch
+
+    def _cutout(self, batch: torch.Tensor) -> torch.Tensor:
+        """Cutout / random erasing (DeVries & Taylor 2017): mask one random square per
+        sample. The standard companion regularizer to crop+flip for CIFAR ResNets, and
+        the one this pipeline was missing -- shard 2 showed a 9.6-point train/val gap.
+
+        The square is sized as a FRACTION of the image side so the augmentation stays
+        resolution-agnostic, matching how the partition and backbone are derived. The
+        centre may sit near an edge, so the mask is clipped: patches are allowed to be
+        partially outside the image, which is what the reference implementation does.
+        """
+        if self.cutout_fraction <= 0.0:
+            return batch
+
+        n, c, h, w = batch.shape
+        size = int(round(min(h, w) * self.cutout_fraction))
+        if size <= 0:
+            return batch
+        half = size // 2
+
+        cy = torch.randint(0, h, (n,), generator=self._generator, device='cpu').to(batch.device)
+        cx = torch.randint(0, w, (n,), generator=self._generator, device='cpu').to(batch.device)
+
+        rows = torch.arange(h, device=batch.device).view(1, h, 1)
+        cols = torch.arange(w, device=batch.device).view(1, 1, w)
+        in_rows = (rows >= (cy.view(n, 1, 1) - half)) & (rows < (cy.view(n, 1, 1) - half + size))
+        in_cols = (cols >= (cx.view(n, 1, 1) - half)) & (cols < (cx.view(n, 1, 1) - half + size))
+        mask = (in_rows & in_cols).unsqueeze(1)  # (n, 1, h, w) -> broadcasts over channels
+
+        if self.fill_value is None:
+            fill = torch.zeros(1, c, 1, 1, device=batch.device, dtype=batch.dtype)
+        else:
+            fill = torch.as_tensor(self.fill_value, device=batch.device,
+                                   dtype=batch.dtype).view(1, -1, 1, 1)
+        return torch.where(mask, fill.expand_as(batch), batch)
 
     def _random_flip(self, batch: torch.Tensor) -> torch.Tensor:
         if self.flip_prob <= 0.0:
@@ -90,12 +133,15 @@ class PerSampleAugmenter:
         return padded[batch_idx, chan_idx, rows.view(n, 1, h, 1), cols.view(n, 1, 1, w)]
 
 
-def build_augmenter(augmentation_config: Optional[dict], seed: int) -> PerSampleAugmenter:
+def build_augmenter(augmentation_config: Optional[dict], seed: int,
+                    fill_value=None) -> PerSampleAugmenter:
     """Construct a `PerSampleAugmenter` from an augmentation config dict."""
     if not augmentation_config:
         return PerSampleAugmenter(0, 0.0, seed)
     return PerSampleAugmenter(
         crop_padding=augmentation_config.get('random_crop_padding', 0),
         flip_prob=augmentation_config.get('random_horizontal_flip', 0.0),
+        cutout_fraction=augmentation_config.get('cutout_fraction', 0.0),
+        fill_value=fill_value,
         seed=seed,
     )

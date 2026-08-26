@@ -813,9 +813,14 @@ class SISAUnlearning:
         # shape-based, so a cosine head needs no special handling -- `fc_layer.5.weight`
         # changes width and is reinitialized, while the class-independent scale carries
         # over -- but the replacement model must be built with the same head kind.
+        # W28: preserve the BACKBONE as well as the head type. Same discriminator the
+        # loader uses -- SISAConvNet has fc_layer.1.weight, SISAResNet pads that slot
+        # with a parameterless Identity.
+        old_arch = 'convnet' if 'fc_layer.1.weight' in old_state else 'resnet'
         new_model = create_sisa_model(
             num_classes=target_num_classes,
             classifier_type=getattr(old_model, 'classifier_type', None),
+            arch=old_arch,
         )
         new_state = new_model.state_dict()
         transplanted = {k: v for k, v in old_state.items() if k in new_state and new_state[k].shape == v.shape}

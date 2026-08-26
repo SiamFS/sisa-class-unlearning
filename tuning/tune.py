@@ -3,11 +3,15 @@ nothing else in the codebase imports optuna or this file. Run manually, once,
 on validation data only; take the winning trial's values and freeze them into
 config.py by hand (with a provenance comment referencing best_config.json).
 
-Searches: LEARNING_RATE, WEIGHT_DECAY, LABEL_SMOOTHING, REPLAY_RATIO,
-BATCH_SIZE, FC_LAYER_DROPOUT (the set config.py's own "Config parameter
-guidance" section names as Optuna-tunable). Uses Lane A's simple, seeded
-replay (W4's default) -- never SmartReplayBuffer (removed entirely, and was
-never deterministic).
+Searches: LEARNING_RATE, WEIGHT_DECAY, LABEL_SMOOTHING, BASELINE_CUTOUT_FRACTION,
+and FC_LAYER_DROPOUT (ConvNet backbone only).
+
+W31 removed two dimensions that had become dead or harmful:
+  * REPLAY_RATIO -- under REPLAY_RATIO_MODE='balanced' the ratio is DERIVED per slice
+    as n_old/(n_old+n_new); searching a fixed 0.1-0.5 would optimise the very
+    per-class imbalance W18 removed.
+  * BATCH_SIZE -- MAX_SLICES_PER_SHARD = BATCH_SIZE // MIN_SAMPLES_PER_CLASS_IN_BATCH,
+    so varying it silently invalidates the partition the data was generated with.
 
 Each trial runs the ENTIRE SISA pipeline: every shard, every slice, real
 config.MAX_EPOCHS budget with early stopping, balance-based augmentation --
@@ -15,11 +19,13 @@ mirroring entry_training.py's per-shard/per-slice loop exactly (this file
 does not import entry_training.py, which executes top-level script code on
 import; the loop is duplicated here the same way experiments/scratch_reference.py
 duplicates a trimmed copy of it, rather than risking a shared-module refactor
-of the real training script). The gating network is NOT trained per trial --
-it is diagnostic-only and never affects self-routing predictions or the score
-being optimized, so training it per trial would only burn time for no signal.
-The objective is full-system self-routing accuracy (plots._run_sisa_batch)
-evaluated on the VALIDATION set only -- the test set is never touched here.
+of the real training script).
+
+W31: the gating network IS trained per trial, into a temporary directory. The old
+comment that it was "diagnostic-only" predates W16, which made the gate the real
+router; scoring without it measured ~70% self-routing accuracy for a system that
+actually runs at ~87%. The objective is full-system accuracy through
+config.ROUTING_MODE, evaluated on VALIDATION only -- the test set is never touched.
 
 This is expensive: 2 shards x 5 slices = 10 incremental trainings per trial,
 each with early stopping (patience=config.TRAINING_PATIENCE) against up to
@@ -53,7 +59,11 @@ from optuna.samplers import TPESampler
 import config
 from utils.seeding import set_seed
 from training.train_model import train_model, _run_sisa_batch
-from training.replay_buffer import add_to_replay_buffer
+from training.replay_buffer import add_to_replay_buffer, compute_replay_ratio
+from training.train_gating_model import train_gating
+from training.create_model import load_model_pytorch
+from plots import fit_ensemble_params
+import tempfile, shutil
 from plots import load_shard_class_indices
 from utils.run_logging import setup_run_logging
 
@@ -64,6 +74,9 @@ def _load_project(project_name: str):
         metadata = json.load(f)
     num_shards = metadata['num_shards']
     num_slices = metadata['num_slices']
+    # W31: shards can hold different slice counts (S_k = |C_k|). A single scalar would
+    # make shard 1 loop over slices it does not have.
+    slices_per_shard = metadata.get('slices_per_shard') or [num_slices] * num_shards
     class_names = metadata['class_names']
     dataset_mean = metadata['normalization_mean']
     dataset_std = metadata['normalization_std']
@@ -77,7 +90,8 @@ def _load_project(project_name: str):
         np.load(os.path.join(sisa_data_dir, "validation_data/x_validation.npy")),
         np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy")),
     )
-    return sisa_data_dir, num_shards, num_slices, class_names, dataset_mean, dataset_std, shard_metadatas, validation_data
+    return (sisa_data_dir, num_shards, slices_per_shard, class_names, dataset_mean,
+            dataset_std, shard_metadatas, validation_data)
 
 
 def _load_slice(sisa_data_dir: str, shard_idx: int, slice_idx: int):
@@ -127,7 +141,8 @@ def _augmentation_for_shard(sisa_data_dir: str, shard_idx: int, num_slices: int)
     std_dev = float(np.std(percentages))
 
     if balance_ratio >= 0.95 and std_dev <= 1.5:
-        return None
+        # W19: "balanced" no longer means "no augmentation" -- mirror entry_training.py.
+        return config.get_augmentation_config('baseline')
     elif balance_ratio >= 0.85 and std_dev <= 2.5:
         return config.get_augmentation_config('minimal')
     elif balance_ratio >= 0.75 and std_dev <= 4.0:
@@ -137,7 +152,7 @@ def _augmentation_for_shard(sisa_data_dir: str, shard_idx: int, num_slices: int)
 
 
 def make_objective(project_name: str, epochs: int):
-    (sisa_data_dir, num_shards, num_slices, class_names, dataset_mean, dataset_std,
+    (sisa_data_dir, num_shards, slices_per_shard, class_names, dataset_mean, dataset_std,
      shard_metadatas, validation_data) = _load_project(project_name)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -145,7 +160,7 @@ def make_objective(project_name: str, epochs: int):
     shard_class_indices = load_shard_class_indices(sisa_data_dir, num_shards)
     slice_classes_cache = {}
     augmentation_by_shard = [
-        _augmentation_for_shard(sisa_data_dir, i, num_slices) for i in range(num_shards)
+        _augmentation_for_shard(sisa_data_dir, i, slices_per_shard[i]) for i in range(num_shards)
     ]
     x_val, y_val = validation_data
 
@@ -155,9 +170,18 @@ def make_objective(project_name: str, epochs: int):
         lr = trial.suggest_float('LEARNING_RATE', 1e-4, 5e-3, log=True)
         weight_decay = trial.suggest_float('WEIGHT_DECAY', 1e-5, 1e-2, log=True)
         label_smoothing = trial.suggest_float('LABEL_SMOOTHING', 0.0, 0.3)
-        replay_ratio = trial.suggest_float('REPLAY_RATIO', 0.1, 0.5)
-        batch_size = trial.suggest_categorical('BATCH_SIZE', [32, 64, 128])
-        fc_dropout = trial.suggest_float('FC_LAYER_DROPOUT', 0.2, 0.6)
+        # W31: REPLAY_RATIO is dead under REPLAY_RATIO_MODE='balanced' -- the ratio is
+        # DERIVED per slice as n_old/(n_old+n_new). Searching a fixed 0.1-0.5 would
+        # optimise the exact per-class imbalance W18 removed.
+        # BATCH_SIZE is also excluded: MAX_SLICES_PER_SHARD = BATCH_SIZE //
+        # MIN_SAMPLES_PER_CLASS_IN_BATCH, so changing it silently invalidates the
+        # partition the data was generated with.
+        batch_size = config.BATCH_SIZE
+        cutout_fraction = trial.suggest_float('BASELINE_CUTOUT_FRACTION', 0.0, 0.6)
+        # W28: FC_LAYER_DROPOUT is SISAConvNet-only -- the residual path uses
+        # RESNET_DROPOUT, so tuning it there would optimise a value with no effect.
+        _is_resnet = str(getattr(config, 'MODEL_ARCH', 'convnet')).lower() == 'resnet'
+        fc_dropout = config.FC_LAYER_DROPOUT if _is_resnet else trial.suggest_float('FC_LAYER_DROPOUT', 0.2, 0.6)
 
         # train_model / create_sisa_model read several knobs directly off the
         # config module rather than accepting them as arguments -- set them
@@ -166,10 +190,15 @@ def make_objective(project_name: str, epochs: int):
             'WEIGHT_DECAY': config.WEIGHT_DECAY,
             'LABEL_SMOOTHING': config.LABEL_SMOOTHING,
             'FC_LAYER_DROPOUT': config.FC_LAYER_DROPOUT,
+            'BASELINE_CUTOUT_FRACTION': config.BASELINE_CUTOUT_FRACTION,
         }
         config.WEIGHT_DECAY = weight_decay
         config.LABEL_SMOOTHING = label_smoothing
         config.FC_LAYER_DROPOUT = fc_dropout
+        config.BASELINE_CUTOUT_FRACTION = cutout_fraction
+        # Augmentation dicts are built from config at call time, so rebuild after the set.
+        trial_augmentation = [_augmentation_for_shard(sisa_data_dir, i, slices_per_shard[i])
+                              for i in range(num_shards)]
 
         trial_start = time.time()
         try:
@@ -179,7 +208,7 @@ def make_objective(project_name: str, epochs: int):
                 replay_buffer, replay_seen_counts = {}, {}
                 replay_rng = np.random.default_rng(config.SEED)
 
-                for j in range(num_slices):
+                for j in range(slices_per_shard[i]):
                     x_slice, y_slice = _load_slice(sisa_data_dir, i, j)
                     if x_slice is None or len(x_slice) == 0:
                         continue
@@ -191,26 +220,54 @@ def make_objective(project_name: str, epochs: int):
                         x_slice, y_slice, model=current_model,
                         epochs=epochs, batch_size=batch_size, lr=lr,
                         validation_data=val_data, active_classes=known_classes,
-                        replay_buffer=replay_buffer, replay_ratio=replay_ratio,
+                        replay_buffer=replay_buffer,
+                        replay_ratio=compute_replay_ratio(replay_buffer, y_slice),
                         dataset_mean=dataset_mean, dataset_std=dataset_std,
                         training_type='incremental' if current_model is not None else 'fresh',
-                        augmentation_config=augmentation_by_shard[i], device=device,
+                        augmentation_config=trial_augmentation[i], device=device,
                     )
                     add_to_replay_buffer(replay_buffer, x_slice, y_slice, replay_rng,
                                           config.MAX_REPLAY_SAMPLES_PER_CLASS, replay_seen_counts)
 
                 shard_models.append(current_model)
 
-            # Full-system self-routing accuracy on VALIDATION data only (never test).
+            # W31: score through the ROUTER THE SYSTEM ACTUALLY USES.
+            # This previously called _run_sisa_batch with no gate and no routing mode,
+            # i.e. parameter-free confidence self-routing -- which measures ~70% while
+            # the real system runs at ~87% via the ensemble. Optimising that objective
+            # tunes for a routing mechanism the pipeline does not use.
+            #
+            # The gate is trained per trial (its quality depends on the trial's own
+            # hyperparameters) into a TEMPORARY directory, so a search can never
+            # overwrite the project's deployed models/gating_model.pth.
             for m in shard_models:
                 if m is not None:
                     m.eval()
+
+            gating_model = None
+            gate_tmp = tempfile.mkdtemp(prefix='tune_gate_')
+            try:
+                gate_result = train_gating(
+                    num_shards=num_shards, base_dir=os.path.dirname(sisa_data_dir),
+                    num_slices=slices_per_shard, dataset_mean=dataset_mean,
+                    dataset_std=dataset_std, save_dir=gate_tmp,
+                )
+                if gate_result:
+                    gating_model, _ = load_model_pytorch(gate_result[0], num_shards=num_shards)
+                    gating_model.eval()
+                    if str(getattr(config, 'ROUTING_MODE', 'gating')) == 'ensemble':
+                        fit_ensemble_params(shard_models, gating_model, shard_class_indices,
+                                            class_names, x_val, y_val, eval_transforms)
+            finally:
+                shutil.rmtree(gate_tmp, ignore_errors=True)
+
             all_preds = []
             with torch.no_grad():
                 for k in range(0, len(x_val), config.BATCH_SIZE):
                     batch_x = torch.from_numpy(x_val[k:k + config.BATCH_SIZE]).float()
                     batch_x = eval_transforms(batch_x).to(device)
-                    preds, _ = _run_sisa_batch(batch_x, shard_models, class_names, shard_class_indices)
+                    preds, _ = _run_sisa_batch(batch_x, shard_models, class_names,
+                                                shard_class_indices, gating_model=gating_model)
                     all_preds.extend(preds.cpu().numpy())
             accuracy = float(np.mean(np.array(all_preds) == y_val))
         finally:

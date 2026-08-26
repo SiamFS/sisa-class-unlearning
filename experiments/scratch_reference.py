@@ -27,7 +27,7 @@ import config
 from utils.seeding import set_seed
 from training.create_model import save_model_pytorch, DEVICE
 from training.train_model import train_model
-from training.replay_buffer import add_to_replay_buffer
+from training.replay_buffer import add_to_replay_buffer, compute_replay_ratio
 from unlearning.sisa_unlearning import SISAUnlearning
 
 
@@ -151,10 +151,18 @@ def train_shard_from_scratch(scratch_project: str, model_name: str, shard_idx: i
             epochs=config.MAX_EPOCHS, batch_size=config.BATCH_SIZE, lr=config.LEARNING_RATE,
             validation_data=(x_val_f, y_val_f), active_classes=known_classes,
             head_classes=head_classes,
-            replay_buffer=replay_buffer, replay_ratio=config.REPLAY_RATIO,
+            # W31: the scratch reference MUST train under the SAME recipe as the real
+            # pipeline, or the exactness comparison measures a recipe difference rather
+            # than the effect of unlearning. Two mismatches were present:
+            #   * a STATIC config.REPLAY_RATIO (0.3) while training and unlearning both
+            #     derive the ratio per slice (W18);
+            #   * augmentation_config=None while balanced shards get baseline crop/flip/
+            #     cutout (W19/W30).
+            replay_buffer=replay_buffer,
+            replay_ratio=compute_replay_ratio(replay_buffer, y_slice),
             dataset_mean=dataset_mean, dataset_std=dataset_std,
             training_type='fresh' if current_model is None else 'incremental',
-            augmentation_config=None, device=DEVICE,
+            augmentation_config=config.get_augmentation_config('baseline'), device=DEVICE,
         )
         shard_histories.append(history)
 
@@ -197,7 +205,9 @@ def build_scratch_reference(source_project: str, class_name: str, model_name: st
 
     scratch_model, pure_train_time, histories = train_shard_from_scratch(
         scratch_project, model_name, shard_idx,
-        metadata['normalization_mean'], metadata['normalization_std'], metadata['num_slices'],
+        metadata['normalization_mean'], metadata['normalization_std'],
+        # W31: this shard's own slice count -- shards differ under S_k = |C_k|.
+        (metadata.get('slices_per_shard') or [metadata['num_slices']] * metadata['num_shards'])[shard_idx],
     )
 
     return {
