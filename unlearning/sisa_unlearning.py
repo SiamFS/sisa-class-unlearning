@@ -69,11 +69,6 @@ class SISAUnlearning:
         else:
             self.num_slices = self.metadata.get('num_slices', 0)
 
-    def slices_for_shard(self, shard_idx: int) -> int:
-        """Slice count for one shard (W26); falls back to the global count."""
-        if self.slices_per_shard and shard_idx < len(self.slices_per_shard):
-            return self.slices_per_shard[shard_idx]
-        return self.num_slices
         self.validation_data = self._load_validation_data()
         self.forgotten_samples_x = None
         self.forgotten_samples_y = None
@@ -91,6 +86,18 @@ class SISAUnlearning:
         self.eval_transforms = T.Compose([
             T.Normalize(self.dataset_mean, self.dataset_std)
         ])
+
+    def slices_for_shard(self, shard_idx: int) -> int:
+        """Slice count for one shard (W26); falls back to the global count.
+
+        `self.num_slices` is the MAXIMUM across shards, which keeps every existing
+        `range(self.num_slices)` loop correct (a slice a shorter shard doesn't have
+        simply loads as None, and those loops already guard on that). Only genuinely
+        per-shard questions -- "is this the last slice?" -- need this.
+        """
+        if self.slices_per_shard and shard_idx < len(self.slices_per_shard):
+            return self.slices_per_shard[shard_idx]
+        return self.num_slices
 
     def _load_metadata(self) -> Dict:
         metadata_path = os.path.join(self.data_dir, "metadata.json")

@@ -8,6 +8,7 @@ reproducible given the same seed and inputs.
 """
 import os
 import random
+import sys
 
 # W23: set before `import torch` below, and therefore before anything can create a
 # cuBLAS handle. Deterministic cuBLAS GEMMs on CUDA >= 10.2 require this variable to
@@ -16,6 +17,21 @@ import random
 # means any caller that imports this module at the top of a file is covered, even if
 # it calls set_seed further down.
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
+# W31: make stdout/stderr tolerant of non-ASCII at the process level.
+#
+# 25 print() lines across the codebase contain emoji or box-drawing characters, and
+# Windows consoles default to cp1252, which cannot encode them -- so a run would die
+# with UnicodeEncodeError partway through, mid-unlearning. run_logging's tee already
+# handled this, but only for entry points that set logging up; anything calling the
+# library directly (experiments/, a notebook, a test) still crashed. Reconfiguring
+# here covers every caller, because every entry point imports this module -- directly
+# or transitively -- before it prints anything.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass  # already wrapped, or a stream that doesn't support reconfigure
 
 import numpy as np
 import torch

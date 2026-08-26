@@ -199,13 +199,38 @@ the 94.63% baseline at K=2; the gate retrains cleanly on unlearning.
 
 ## 7. TODO
 
-- [ ] **W28a** `BasicBlock` + `SISAResNet` in `training/create_model.py`
-- [ ] **W28b** config: `MODEL_ARCH`, `RESNET_*`, `get_input_size()`
-- [ ] **W28c** `create_sisa_model` dispatch; `load_model_complete` architecture detection
-- [ ] **W28d** record `input_size` in metadata during data processing
-- [ ] **W28e** `tuning/tune.py` skips `FC_LAYER_DROPOUT` under `MODEL_ARCH='resnet'`
-- [ ] **W29a** ResNet gate + `GATING_BLOCKS_PER_STAGE` / `GATING_BASE_WIDTH`
-- [ ] **W29b** verify gate checkpoint round-trip and unlearning retrain
+- [x] **W28a** `BasicBlock` + `SISAResNet` in `training/create_model.py`
+- [x] **W28b** config: `MODEL_ARCH`, `RESNET_*`, `get_input_size()`
+- [x] **W28c** `create_sisa_model` dispatch; `load_model_complete` architecture detection
+- [x] **W28d** record `input_size` in metadata during data processing
+- [x] **W28e** `tuning/tune.py` skips `FC_LAYER_DROPOUT` under `MODEL_ARCH='resnet'`
+- [x] **W29a** ResNet gate + `GATING_BLOCKS_PER_STAGE` / `GATING_BASE_WIDTH`
+- [x] **W29b** verify gate checkpoint round-trip and unlearning retrain
+
+## 7b. Measured result
+
+| | ConvNet baseline | ResNet-20 | + Cutout (W30) |
+|---|---|---|---|
+| **System accuracy** | 83.26% | 86.62% | **87.76%** |
+| Oracle ceiling | 87.53% | 90.55% | **91.63%** |
+| Gate routing | 94.63% | 95.54% | 95.54% |
+| Mean train/val gap | -- | +0.043 | **-0.004** |
+| Max train/val gap | -- | +0.096 | **+0.004** |
+| Pure training time | 434s | 1,827s | 1,330s |
+
+W30 (cutout) closed the overfitting entirely -- every slice improved, the worst case
+(shard 2 slice 6) went from a 9.6-point gap to zero -- while ADDING 1.13 points and
+cutting 31% of training time, since the augmented task plateaus earlier.
+
+Verified not a bug: validation accuracy sits ABOVE training accuracy in the curves.
+Evaluating the same model on the same training images with augmentation off gives
+0.9874 (shard 1) and 0.9536 (shard 2) against validation 0.9675 / 0.8833 -- the model
+does fit its training data better. The inversion is (a) training being scored on
+cropped/flipped/cutout images while validation is clean, and (b) training accuracy
+being a running average taken while weights still update, versus an end-of-epoch
+validation snapshot.
+
+**Remaining gap is entirely routing**: 91.63% ceiling vs 87.76% system = 3.87 points.
 
 ---
 

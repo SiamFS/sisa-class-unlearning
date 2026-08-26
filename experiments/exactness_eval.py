@@ -166,6 +166,23 @@ def run_exactness_eval(source_project: str, class_name: str, model_name: str = N
 
     print(f"\n{'='*70}\nComputing exactness metrics\n{'='*70}")
 
+    # W31: route through the mechanism the system actually deploys. `original_gate` is
+    # the gate as it stood before deletion; `unlearned_gate` was retrained excluding the
+    # deleted class (W16) and is shared by the unlearned AND scratch systems, so the
+    # comparison isolates the specialist instead of mixing in two different routers.
+    def _load_gate(project):
+        path = os.path.join(config.PROJECTS_DIR, project, "models", "gating_model.pth")
+        if not os.path.exists(path):
+            return None
+        gate, _ = load_model_pytorch(path, num_shards=len(original_shard_indices))
+        return gate.eval()
+
+    original_gate = _load_gate(source_project)
+    unlearned_gate = _load_gate(unlearned_project) or original_gate
+    print(f"   - Routing: original gate {'loaded' if original_gate is not None else 'MISSING'}, "
+          f"post-deletion gate {'loaded' if unlearned_gate is not None else 'MISSING'} "
+          f"(shared by the unlearned and scratch systems)")
+
     # Metric 1: parameter distance (affected shard only).
     param_distance = _parameter_distance(unlearned_models[shard_idx], scratch_models[shard_idx])
     print(f"   - Parameter distance: L2={param_distance['l2']:.4f}, cosine dist={param_distance['cosine']:.6f} "

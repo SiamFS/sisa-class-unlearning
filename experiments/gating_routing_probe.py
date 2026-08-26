@@ -38,7 +38,7 @@ import torchvision.transforms as T
 import config
 from utils.seeding import set_seed
 from training.train_model import train_model
-from training.replay_buffer import add_to_replay_buffer
+from training.replay_buffer import add_to_replay_buffer, compute_replay_ratio
 from training.create_model import load_model_pytorch
 from plots import load_shard_class_indices, _run_sisa_batch, _scatter_local_to_global
 from tuning.tune import (
@@ -80,7 +80,11 @@ def train_all_shards(project_name: str, epochs: int):
                 x_slice, y_slice, model=current_model,
                 epochs=epochs, batch_size=config.BATCH_SIZE, lr=config.LEARNING_RATE,
                 validation_data=val_data, active_classes=known_classes,
-                replay_buffer=replay_buffer, replay_ratio=config.REPLAY_RATIO,
+                # W31: derive the ratio like every live path does. A static
+                # config.REPLAY_RATIO is dead under REPLAY_RATIO_MODE='balanced'
+                # and reintroduces the per-class imbalance W18 removed.
+                replay_buffer=replay_buffer,
+                replay_ratio=compute_replay_ratio(replay_buffer, y_slice),
                 dataset_mean=dataset_mean, dataset_std=dataset_std,
                 training_type='incremental' if current_model is not None else 'fresh',
                 augmentation_config=augmentation_by_shard[i], device=DEVICE,

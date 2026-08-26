@@ -12,5 +12,6 @@
   "epochs_per_trial": 100,
   "project_name": "cifar10_sisa_pytorch",
   "seed": 42,
-  "timestamp": "2026-08-25T00:26:39.606513"
+  "timestamp": "2026-08-25T00:26:39.606513",
+  "STALE": "DO NOT FREEZE THESE VALUES. Measured 2026-08-25, before W16 (gating router), W18 (balanced replay), W23 (AdamW + LR annealing + accuracy-monitored early stopping), W28 (residual backbone) and W30 (cutout). Three of the six parameters no longer exist as tunable knobs: REPLAY_RATIO is derived per slice under REPLAY_RATIO_MODE='balanced'; BATCH_SIZE is coupled to MAX_SLICES_PER_SHARD and cannot be varied independently; FC_LAYER_DROPOUT applies only to the ConvNet backbone. best_value=0.6266 was also scored against gate-free self-routing, which the system has not used since W16 -- the same configuration now measures 0.8776. Re-run tuning/tune.py (fixed in W31) before using."
 }
