@@ -614,8 +614,12 @@ def create_slice_analysis_visualization(
 				class_dist[cls] = count
 			slice_class_distributions.append(class_dist)
 
+		# W26: shards may hold different slice counts (S_k = |C_k|), so the slice count
+		# has to come from THIS shard, not from shard 0.
+		shard_slices = len(shard["slices"])
+
 		ax1 = axes[shard_idx, 0]
-		slice_labels = [f"Slice {i}" for i in range(num_slices)]
+		slice_labels = [f"Slice {i}" for i in range(shard_slices)]
 		bars = ax1.bar(slice_labels, slice_sizes, alpha=0.8, color=f"C{shard_idx}")
 		ax1.set_ylabel("Sample Count")
 		ax1.set_title(f"Shard {shard_idx + 1}: Slice Sizes")
@@ -631,15 +635,15 @@ def create_slice_analysis_visualization(
 		ax2.set_xlabel("Slice Index")
 		ax2.set_ylabel("Classes")
 		ax2.set_title(f"Shard {shard_idx + 1}: Class Distribution per Slice")
-		ax2.set_xticks(range(num_slices))
-		ax2.set_xticklabels([f"S{i}" for i in range(num_slices)])
+		ax2.set_xticks(range(shard_slices))
+		ax2.set_xticklabels([f"S{i}" for i in range(shard_slices)])
 		ax2.set_yticks(range(len(class_names)))
 		ax2.set_yticklabels(class_names)
 
 		plt.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
 
 		for i in range(len(class_names)):
-			for j in range(num_slices):
+			for j in range(shard_slices):
 				count = int(slice_distributions[i, j])
 				if count > 0:
 					ax2.text(
@@ -668,7 +672,14 @@ def create_sisa_architecture_visualization(
 	"""Create SISA architecture overview visualization."""
 
 	num_shards = len(shards_data)
-	num_slices = len(shards_data[0]["slices"])
+	# W26: shards can hold different slice counts (S_k = |C_k|). `num_slices` is only a
+	# layout fallback; every per-shard measurement below uses that shard's own count,
+	# so a shard is neither under-drawn nor indexed past its end.
+	slices_by_shard = [len(shard["slices"]) for shard in shards_data]
+	num_slices = max(slices_by_shard) if slices_by_shard else 0
+	max_slice_size = max(
+		(len(sl["y"]) for shard in shards_data for sl in shard["slices"]), default=1
+	) or 1
 
 	fig, ax = plt.subplots(1, 1, figsize=(14, 8))
 
@@ -681,13 +692,14 @@ def create_sisa_architecture_visualization(
 
 	y_positions = []
 	for shard_idx in range(num_shards):
+		shard_slices = slices_by_shard[shard_idx]
 		shard_y = shard_idx * (num_slices * (slice_height + slice_spacing) + shard_spacing)
 		y_positions.append(shard_y)
 
 		shard_rect = plt.Rectangle(
 			(0, shard_y),
 			shard_width,
-			num_slices * (slice_height + slice_spacing) - slice_spacing,
+			shard_slices * (slice_height + slice_spacing) - slice_spacing,
 			fill=False,
 			edgecolor=colors[shard_idx],
 			linewidth=3,
@@ -696,7 +708,7 @@ def create_sisa_architecture_visualization(
 
 		ax.text(
 			-0.3,
-			shard_y + (num_slices * (slice_height + slice_spacing)) / 2,
+			shard_y + (shard_slices * (slice_height + slice_spacing)) / 2,
 			f"Shard {shard_idx + 1}",
 			ha="center",
 			va="center",
@@ -705,11 +717,10 @@ def create_sisa_architecture_visualization(
 			rotation=90,
 		)
 
-		for slice_idx in range(num_slices):
+		for slice_idx in range(shard_slices):
 			slice_y = shard_y + slice_idx * (slice_height + slice_spacing)
 
 			slice_size = len(shards_data[shard_idx]["slices"][slice_idx]["y"])
-			max_slice_size = max(len(shard["slices"][s]["y"]) for shard in shards_data for s in range(num_slices))
 			alpha = 0.3 + 0.7 * (slice_size / max_slice_size)
 
 			slice_rect = plt.Rectangle(
@@ -735,7 +746,7 @@ def create_sisa_architecture_visualization(
 
 	arrow_x = shard_width + 0.5
 	for shard_idx in range(num_shards):
-		shard_center_y = y_positions[shard_idx] + (num_slices * (slice_height + slice_spacing)) / 2
+		shard_center_y = y_positions[shard_idx] + (slices_by_shard[shard_idx] * (slice_height + slice_spacing)) / 2
 		ax.annotate(
 			"",
 			xy=(arrow_x + 1, shard_center_y),
@@ -2391,9 +2402,21 @@ def create_efficiency_comparison_chart(scratch_time: float, unlearn_time: float,
     ax.set_title(f"Retraining Efficiency -- deleted class '{class_name}'", fontweight='bold')
 
     empirical_speedup = scratch_time / unlearn_time if unlearn_time > 0 else float('inf')
-    theoretical_speedup = (num_shards + 1) * num_slices / 2
+    # W27: the old `(num_shards + 1) * num_slices / 2` gave 7.5x at K=2, S=5 -- more than
+    # double what this architecture can actually deliver, so it plotted a ceiling the
+    # design could never approach. With one class per slice, deletion restarts at the
+    # deleted class's first slice, giving an expected retrain fraction of 1/(2K) from
+    # sharding plus 1/(2*num_classes) from slicing:
+    #
+    #     speedup = 1 / ( 1/(2K) + 1/(2*num_classes) )
+    #
+    # This excludes the router retrain, so it remains an upper bound -- including the
+    # gate would lower it further.
+    num_classes = config.get_num_classes()
+    theoretical_speedup = 1.0 / (1.0 / (2 * num_shards) + 1.0 / (2 * num_classes))
     ax.text(0.5, -0.18,
-            f'Empirical speedup: {empirical_speedup:.2f}x   |   Theoretical ceiling (R+1)·S/2: {theoretical_speedup:.2f}x',
+            f'Empirical speedup: {empirical_speedup:.2f}x   |   '
+            f'Theoretical ceiling 1/(1/2K + 1/2C), gate excluded: {theoretical_speedup:.2f}x',
             transform=ax.transAxes, ha='center', fontsize=9, style='italic')
 
     plt.tight_layout()

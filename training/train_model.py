@@ -130,7 +130,10 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
             x_val = np.empty((0, *x_val_full.shape[1:]))
             y_val_remapped = np.empty(0, dtype=np.int64)
     else:
-        x_train, x_val, y_train, y_val_original = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+        # W26: was a hardcoded literal 42 -- the same stray-seed reproducibility bug
+        # W4 fixed in the replay buffer and W22 fixed in the gate's split.
+        x_train, x_val, y_train, y_val_original = train_test_split(
+            X, y, test_size=0.2, random_state=config.SEED, stratify=y)
         X, y = x_train, y_train
         label_map = {original_label: new_label for new_label, original_label in enumerate(sorted(active_classes))}
         y_val_remapped = np.array([label_map[label] for label in y_val_original])

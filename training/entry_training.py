@@ -53,6 +53,8 @@ with open(sisa_metadata_path, 'r') as f:
     metadata = json.load(f)
 num_shards = metadata['num_shards']
 num_slices = metadata['num_slices']
+# W26: authoritative per-shard slice counts; older projects only have the scalar.
+slices_per_shard = metadata.get('slices_per_shard') or [num_slices] * num_shards
 class_names = metadata['class_names']
 
 if 'normalization_mean' in metadata and 'normalization_std' in metadata:
@@ -339,7 +341,7 @@ if __name__ == "__main__":
     gating_model_path, pure_gating_training_time = train_gating(
         num_shards=num_shards,
         base_dir=base_dir,
-        num_slices=num_slices,
+        num_slices=slices_per_shard,
         dataset_mean=DATASET_MEAN,
         dataset_std=DATASET_STD
     )
@@ -396,7 +398,7 @@ if __name__ == "__main__":
             continue
         else:
             validation_data = (np.load(os.path.join(sisa_data_dir, "validation_data/x_validation.npy")), np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy")))
-            for j in range(num_slices):
+            for j in range(slices_per_shard[i]):
                 print(f"\n--- Training Slice {j + 1} of Shard {i+1} ---")
                 x_slice, y_slice = load_slice(i, j)
                 if x_slice is None or len(x_slice) == 0: 
@@ -453,16 +455,14 @@ if __name__ == "__main__":
                 save_model_pytorch(current_model, slice_checkpoint_path, metadata=slice_metadata)
                 print(f"   - Saved checkpoint: {os.path.basename(slice_checkpoint_path)}")
                 
-                # Incremental test evaluation for this slice (ML standard)
-                test_data = (np.load(os.path.join(sisa_data_dir, "test_data/x_test.npy")), 
-                           np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy")))
-                # Prepare shard models for gating evaluation
-                shard_models_for_eval = [None] * config.NUM_SHARDS  # Initialize with None for all shards
-                # REMOVED: slice-level evaluation violates SISA architecture
-                # Slices are internal data partitions - only final shard model should be evaluated
+                # W27: the test set used to be loaded here, on EVERY slice, for a variable
+                # only the last-slice visualisation block below reads -- re-reading the
+                # 117 MB test arrays once per slice for nothing. It is loaded there now.
+                # (Slice-level evaluation itself was removed earlier: slices are internal
+                # data partitions, so only the final shard model is evaluated.)
                 
                 # Generate visualizations for the last slice of each shard
-                if j == num_slices - 1:  # Last slice
+                if j == slices_per_shard[i] - 1:  # Last slice
                     print(f"   - Generating visualizations for final slice of Shard {i+1}...")
                     
                     # Create training visualizations (loss/accuracy curves)
@@ -472,7 +472,8 @@ if __name__ == "__main__":
                         )
                     
                     if current_model is not None:
-                        x_test_full, y_test_full = test_data
+                        x_test_full = np.load(os.path.join(sisa_data_dir, "test_data/x_test.npy"))
+                        y_test_full = np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy"))
                         create_shard_confusion_matrix(
                             current_model,
                             x_test_full,

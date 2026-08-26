@@ -32,6 +32,11 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         T.Normalize(dataset_mean, dataset_std)
     ])
     
+    # W26: num_slices may be a per-shard list (shards can differ in slice count) or a
+    # legacy scalar. Normalise to a list so the reconstruction loop works for both.
+    if isinstance(num_slices, int):
+        num_slices = [num_slices] * num_shards
+
     sisa_data_dir = os.path.join(base_dir, "sisa_data")
     models_dir = os.path.join(base_dir, "models")
     
@@ -52,7 +57,7 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
     all_x_data = []
     all_y_data = []
     for shard_idx in range(num_shards):
-        for slice_idx in range(num_slices):
+        for slice_idx in range(num_slices[shard_idx]):
             slice_x_path = os.path.join(sisa_data_dir, f"shards/shard_{shard_idx+1}/slice_{slice_idx}_x.npy")
             if os.path.exists(slice_x_path):
                 x_data = np.load(slice_x_path)

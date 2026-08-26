@@ -14,8 +14,38 @@ SEED = 42  # Global seed for all RNGs (Python, NumPy, PyTorch). Required for the
 # ================================================================================
 # SISA ARCHITECTURE PARAMETERS
 # ================================================================================
+# W26: both accept an int (manual) or 'auto' (derived from the dataset).
+#
+#   NUM_SLICES_PER_SHARD = 'auto'  ->  S_k = |C_k|, one class per slice, PER SHARD.
+#     This is provably optimal for class unlearning: deletion always restarts at a
+#     class's FIRST slice, so splitting a class across more slices leaves the retrain
+#     point unmoved while adding incremental steps (and forgetting); making slices
+#     coarser makes classes share a slice, so deleting one drags the other along.
+#     Measured cost of the old global S=5 against 4- and 6-class shards: bird and cat
+#     both start in slice 1, so deleting either retrains 100% of shard 2 -- 13% of the
+#     available speedup lost to an arbitrary constant.
+#
+#   NUM_SHARDS = 'auto'  ->  K = ceil(NUM_CLASSES / MAX_SLICES_PER_SHARD).
+#     Each constraint on K is a lower bound and smaller K makes routing easier, so the
+#     smallest feasible K is chosen. Manual K remains the default because K is the
+#     variable the efficiency-vs-accuracy study sweeps -- deriving it would hide the
+#     very tradeoff being measured. 'auto' is for applying the method to a new dataset.
 NUM_SHARDS = 2
-NUM_SLICES_PER_SHARD = 5
+NUM_SLICES_PER_SHARD = 'auto'
+
+# W26: how many classes a shard may hold, i.e. how many sequential slices it trains
+# through. NOT a free guess -- it is set by what a training batch can actually keep
+# balanced. With one class per slice, the j-th slice must split the batch across j
+# classes, so each gets BATCH_SIZE/j samples; below MIN_SAMPLES_PER_CLASS_IN_BATCH the
+# gradient and BatchNorm statistics for a class get too thin to be reliable:
+#
+#     MAX_SLICES_PER_SHARD = BATCH_SIZE // MIN_SAMPLES_PER_CLASS_IN_BATCH
+#
+# Raising it means fewer, larger shards -- which also raises replay overhead, since
+# training cost scales as (S+1)/2 versus a single joint model. Lowering it means more
+# shards: cheaper training AND faster unlearning, with harder routing as the only cost.
+MIN_SAMPLES_PER_CLASS_IN_BATCH = 8
+MAX_SLICES_PER_SHARD = 8  # = BATCH_SIZE // MIN_SAMPLES_PER_CLASS_IN_BATCH (64 // 8)
 # ================================================================================
 # CONFIDENCE THRESHOLDS (self-routing deployment options -- see plan W5: not part
 # of the exactness claim; CONFIDENCE_THRESHOLD is opt-in only, e.g. search.py's CLI)
@@ -104,7 +134,15 @@ MAX_REPLAY_SAMPLES_PER_CLASS = 5000
 # class split instead: n_old / (n_old + n_new). This is a pure function of data
 # composition -- no RNG -- so determinism and the exactness proof are unaffected.
 REPLAY_RATIO_MODE = 'balanced'  # 'balanced' | 'static'
-REPLAY_RATIO_MAX = 0.8  # Cap so the current slice always keeps a meaningful share of each batch
+
+# W26: raised from 0.8. Equal per-class batch share at a shard's j-th slice needs
+# replay_ratio = (j-1)/j, so a 0.8 cap can only balance 5 slices -- at 6 it binds and
+# per-class imbalance starts creeping back (1.15x at 6 classes, 1.62x at 8, 4.4x at 20),
+# which is the same defect that produced the original task-recency bias. 0.875 supports
+# 8 classes per shard, matching MAX_SLICES_PER_SHARD below.
+#
+# The cap must satisfy:  REPLAY_RATIO_MAX >= (MAX_SLICES_PER_SHARD - 1) / MAX_SLICES_PER_SHARD
+REPLAY_RATIO_MAX = 0.875
 
 
 
@@ -275,13 +313,25 @@ GATING_FLIP_PROB = 0.5
 UNLEARNING_PATIENCE = 10
 UNLEARNING_MIN_DELTA = 0.001  # ACCURACY units, matching TRAINING_MIN_DELTA
 UNLEARNING_MIN_EPOCHS = 10
-# Unlearning Training Settings - GDPR COMPLIANT
-UNLEARNING_LEARNING_RATE = 0.0004  # Reduced from 0.0005 for better stability
+# Unlearning Training Settings
+#
+# W27: the retrain MUST use the same optimisation hyperparameters as ordinary training.
+# Exactness is defined as
+#     Unlearn( Train(D u Dc), Dc )  ==  Train(D \ Dc)
+# so the retrain on the left has to run the SAME `Train` as the from-scratch reference
+# on the right. These previously differed (LR 0.0004 vs 0.0008, label smoothing 0.05 vs
+# 0.15) while experiments/scratch_reference.py built its reference with the *training*
+# values -- so the two sides ran different algorithms and could never agree on weights,
+# which would have shown up as a failed W8 comparison misread as GPU nondeterminism.
+# Derived from the training values so they cannot drift apart again.
+UNLEARNING_LEARNING_RATE = LEARNING_RATE
 UNLEARNING_REPLAY_RATIO = 0.3  # Keep at 0.3 to prevent catastrophic forgetting of remaining classes
-UNLEARNING_LABEL_SMOOTHING = 0.05  # GDPR COMPLIANCE: 0.05 enables exact unlearning (target: ~10% random guessing)
-                                    # This matches "trained from scratch without deleted data" requirement
-                                    # Result: Model shows NO evidence of training on deleted data (random performance)
-                                    # For suppression unlearning (0% accuracy), set to 0.0
+# W27: must equal LABEL_SMOOTHING for the same reason as the learning rate above.
+# The previous comment claimed 0.05 "enables exact unlearning" -- that reasoning was
+# backwards: a smoothing value that DIFFERS from training is precisely what makes the
+# retrained model unequal to a from-scratch one. Exactness comes from retraining on
+# class-clean data with the same algorithm, not from a particular smoothing value.
+UNLEARNING_LABEL_SMOOTHING = LABEL_SMOOTHING
 
 # Unlearning Success Threshold
 UNLEARNING_SUCCESS_THRESHOLD = 0.45 
@@ -324,6 +374,74 @@ IN_CHANNELS = 3  # Number of input channels (3=RGB, 1=grayscale) for the model f
 # was entirely absent from every level below.
 BASELINE_CROP_PADDING = 4      # RandomCrop(size, padding=4) -- the CIFAR standard
 BASELINE_HORIZONTAL_FLIP = 0.5
+
+
+def resolve_num_shards(num_classes: int) -> int:
+    """Resolve NUM_SHARDS, deriving it from the dataset when set to 'auto' (W26).
+
+    K = ceil(num_classes / MAX_SLICES_PER_SHARD), clamped to [2, num_classes // 2].
+    The upper clamp keeps at least 2 classes per shard: below that, slicing does
+    nothing and the architecture degenerates into ARCANE's one-model-per-class.
+    """
+    configured = NUM_SHARDS
+    if isinstance(configured, int):
+        return configured
+    if str(configured).lower() != 'auto':
+        raise ValueError(f"NUM_SHARDS must be an int or 'auto', got {configured!r}")
+
+    import math
+    k_max = max(2, num_classes // 2)
+    k = max(2, math.ceil(num_classes / MAX_SLICES_PER_SHARD))
+    if k > k_max:
+        raise ValueError(
+            f"Derived NUM_SHARDS={k} exceeds the maximum {k_max} for {num_classes} classes. "
+            f"Raise MAX_SLICES_PER_SHARD (currently {MAX_SLICES_PER_SHARD})."
+        )
+    return k
+
+
+def resolve_slices_for_shard(shard_class_count: int) -> int:
+    """Resolve this shard's slice count, deriving it when NUM_SLICES_PER_SHARD is
+    'auto' (W26): one class per slice, so S_k = |C_k|."""
+    configured = NUM_SLICES_PER_SHARD
+    if isinstance(configured, int):
+        return configured
+    if str(configured).lower() != 'auto':
+        raise ValueError(f"NUM_SLICES_PER_SHARD must be an int or 'auto', got {configured!r}")
+    return max(1, shard_class_count)
+
+
+def validate_partition(shard_class_counts) -> list:
+    """Check a partition against the replay budget. Returns a list of warnings.
+
+    The two settings are coupled and silently break each other if they drift:
+    equal per-class batch share at a shard's j-th slice requires a replay ratio of
+    (j-1)/j, so REPLAY_RATIO_MAX bounds how many classes a shard can hold before
+    per-class imbalance -- the original cause of task-recency bias -- returns.
+    """
+    warnings = []
+    largest = max(shard_class_counts) if shard_class_counts else 0
+
+    required_ratio = (largest - 1) / largest if largest > 1 else 0.0
+    if required_ratio > REPLAY_RATIO_MAX + 1e-9:
+        warnings.append(
+            f"Largest shard holds {largest} classes, needing replay ratio "
+            f"{required_ratio:.3f} for equal per-class batch share, but REPLAY_RATIO_MAX "
+            f"is {REPLAY_RATIO_MAX}. The newest class will be over-represented by "
+            f"{(BATCH_SIZE * (1 - REPLAY_RATIO_MAX)) / (BATCH_SIZE / largest):.2f}x."
+        )
+    if largest > MAX_SLICES_PER_SHARD:
+        warnings.append(
+            f"Largest shard holds {largest} classes, above MAX_SLICES_PER_SHARD="
+            f"{MAX_SLICES_PER_SHARD}; each class gets ~{BATCH_SIZE // largest} samples per "
+            f"batch, below MIN_SAMPLES_PER_CLASS_IN_BATCH={MIN_SAMPLES_PER_CLASS_IN_BATCH}."
+        )
+    if any(c < 2 for c in shard_class_counts):
+        warnings.append(
+            f"A shard holds fewer than 2 classes {list(shard_class_counts)}; slicing cannot "
+            f"help there, since deleting its only class retrains the whole shard."
+        )
+    return warnings
 
 
 def get_augmentation_config(level='baseline', is_unlearning=False):

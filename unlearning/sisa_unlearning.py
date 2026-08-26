@@ -57,7 +57,23 @@ class SISAUnlearning:
         self.metadata = self._load_metadata()
         self.class_names = self.metadata.get('class_names', [])
         self.num_shards = self.metadata.get('num_shards', 0)
-        self.num_slices = self.metadata.get('num_slices', 0)
+        # W26: shards may hold different slice counts (S_k = |C_k| under
+        # NUM_SLICES_PER_SHARD='auto'). `num_slices` is kept as the MAXIMUM so every
+        # existing `range(self.num_slices)` loop still covers the longest shard --
+        # `_load_slice_data` returns None for a slice a shorter shard doesn't have, and
+        # every one of those loops already guards on that. Only genuinely per-shard
+        # questions ("is this the last slice?") need `slices_for_shard`.
+        self.slices_per_shard = self.metadata.get('slices_per_shard') or []
+        if self.slices_per_shard:
+            self.num_slices = max(self.slices_per_shard)
+        else:
+            self.num_slices = self.metadata.get('num_slices', 0)
+
+    def slices_for_shard(self, shard_idx: int) -> int:
+        """Slice count for one shard (W26); falls back to the global count."""
+        if self.slices_per_shard and shard_idx < len(self.slices_per_shard):
+            return self.slices_per_shard[shard_idx]
+        return self.num_slices
         self.validation_data = self._load_validation_data()
         self.forgotten_samples_x = None
         self.forgotten_samples_y = None
@@ -988,7 +1004,7 @@ class SISAUnlearning:
                 shard_histories.append(history)
             
             # Generate visualizations for the last slice of unlearning
-            if slice_idx == self.num_slices - 1:  # Last slice
+            if slice_idx == self.slices_for_shard(shard_idx) - 1:  # Last slice (W26: per shard)
                 print(f"   - Generating unlearning visualizations for final slice of Shard {shard_idx+1}...")
                 
                 # Create training visualizations (loss/accuracy curves)
@@ -1072,7 +1088,7 @@ class SISAUnlearning:
             train_gating(
                 num_shards=self.num_shards,
                 base_dir=self.base_dir,
-                num_slices=self.num_slices,
+                num_slices=self.slices_per_shard or self.num_slices,
                 dataset_mean=self.dataset_mean,
                 dataset_std=self.dataset_std,
                 excluded_classes=self.get_unlearned_classes(),

@@ -37,14 +37,16 @@ DatasetClass = get_dataset_class(config.DATASET)
 
 # Define command-line arguments with config.py defaults
 parser = argparse.ArgumentParser(description='SISA Framework Sequential Data Processing')
-parser.add_argument('--num-shards', type=int, default=config.NUM_SHARDS, help='Number of shards')
-parser.add_argument('--num-slices', type=int, default=config.NUM_SLICES_PER_SHARD, help='Number of slices per shard')
+# W26: both may be 'auto' in config; CLI overrides stay integers.
+parser.add_argument('--num-shards', type=int, default=None, help="Number of shards (default: config, may be 'auto')")
+parser.add_argument('--num-slices', type=int, default=None, help="Slices per shard (default: config, may be 'auto' => one class per slice)")
 
 args = parser.parse_args()
 
 project_name = config.PROJECT_NAME
+# W26: NUM_SHARDS may be 'auto', which needs the class count -- resolved after load_dataset().
 num_shards = args.num_shards
-num_slices = args.num_slices
+num_slices = args.num_slices if args.num_slices is not None else config.NUM_SLICES_PER_SHARD
 base_dir = os.path.join(config.PROJECTS_DIR, project_name)
 data_info_dir = os.path.join(base_dir, "data_info")
 os.makedirs(base_dir, exist_ok=True)
@@ -59,8 +61,8 @@ print("=" * 80)
 print(f"Processing started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print("=" * 80)
 
-print(f"   - Number of Shards: {num_shards}")
-print(f"   - Number of Slices per Shard: {num_slices}")
+print(f"   - Number of Shards: {num_shards if num_shards is not None else config.NUM_SHARDS}")
+print(f"   - Slices per Shard: {num_slices}")
 
 def load_dataset():
     """Load config.DATASET using the canonical split: the official train set
@@ -113,8 +115,7 @@ def create_data_visualizations():
     shards_data = []
     for shard_idx in range(num_shards):
         slices_data = []
-        for slice_idx in range(num_slices):
-            if slice_idx < len(shard_slices_list[shard_idx]):
+        for slice_idx in range(len(shard_slices_list[shard_idx])):
                 slices_data.append({
                     'x': shard_slices_list[shard_idx][slice_idx],
                     'y': y_slices_list[shard_idx][slice_idx],
@@ -151,6 +152,12 @@ def create_data_visualizations():
 # Load data
 x_train, y_train, split_info, x_test, y_test, x_val, y_val, class_names = load_dataset()
 
+# W26: resolve 'auto' shard count now that the class list is known.
+if num_shards is None:
+    num_shards = config.resolve_num_shards(len(class_names))
+    print(f"   - Resolved NUM_SHARDS={num_shards} from {len(class_names)} classes "
+          f"(MAX_SLICES_PER_SHARD={config.MAX_SLICES_PER_SHARD})")
+
 # --- NEW: Dynamically calculate normalization statistics from the training data ---
 print("\nCalculating normalization statistics from the training set...")
 x_train_tensor = torch.from_numpy(x_train)
@@ -184,10 +191,23 @@ y_slices_list = []
 shard_indices_list = []
 slice_class_dists_list = [] 
 
+# W26: slice count is resolved PER SHARD. With NUM_SLICES_PER_SHARD='auto' this is
+# S_k = |C_k| -- one class per slice -- which is the optimum for class unlearning:
+# deletion restarts at a class's first slice, so a class sharing a slice with another
+# drags it along (bird and cat both starting in slice 1 meant deleting either retrained
+# all of shard 2). A global constant cannot do this when shards differ in class count.
+slices_per_shard = [config.resolve_slices_for_shard(len(np.unique(y_shards[i])))
+                    for i in range(len(shards))]
+shard_class_counts = [len(np.unique(y_shards[i])) for i in range(len(shards))]
+print(f"\nSlice allocation ({'derived' if not isinstance(config.NUM_SLICES_PER_SHARD, int) else 'manual'}): "
+      f"{[f'shard {i+1}: {c} classes -> {s} slices' for i, (c, s) in enumerate(zip(shard_class_counts, slices_per_shard))]}")
+for _w in config.validate_partition(shard_class_counts):
+    print(f"   - WARNING: {_w}")
+
 for i, shard in enumerate(shards):
     print(f"\nProcessing Shard {i+1}/{num_shards}...")
     slices, y_slice, slice_indices, slice_dists = create_slices(
-        shard, y_shards[i], num_slices, index_shards[i], class_names
+        shard, y_shards[i], slices_per_shard[i], index_shards[i], class_names
     )
     shard_slices_list.append(slices)
     y_slices_list.append(y_slice)
@@ -215,7 +235,8 @@ os.makedirs(shards_data_dir, exist_ok=True)
 # Save main metadata
 metadata = {
     'num_shards': num_shards,
-    'num_slices': num_slices,
+    'num_slices': max(slices_per_shard),  # legacy scalar = max, for older readers
+    'slices_per_shard': slices_per_shard,  # W26: authoritative per-shard slice counts
     'class_names': class_names,
     'split_info': split_info,
     'sharding_strategy': split_info.get('sharding_strategy', 'class_isolation'),
@@ -275,8 +296,7 @@ for shard_idx in range(num_shards):
     with open(f'{shard_dir}/metadata.json', 'w') as f:
         json.dump(shard_metadata, f, indent=2)
 
-    for slice_idx in range(num_slices):
-        if slice_idx < len(shard_slices_list[shard_idx]):
+    for slice_idx in range(len(shard_slices_list[shard_idx])):
             np.save(f'{shard_dir}/slice_{slice_idx}_x.npy', shard_slices_list[shard_idx][slice_idx])
             np.save(f'{shard_dir}/slice_{slice_idx}_y.npy', y_slices_list[shard_idx][slice_idx])
             np.save(f'{shard_dir}/slice_{slice_idx}_idx.npy', shard_indices_list[shard_idx][slice_idx])
@@ -292,7 +312,7 @@ print("Data Processing Completed")
 print("=" * 60)
 print(f"Project directory: {base_dir}")
 print(f"Reports and visualizations saved to: {data_info_dir}")
-print(f"Configuration: {num_shards} shards × {num_slices} slices")
+print(f"Configuration: {num_shards} shards, slices per shard: {slices_per_shard}")
 print("Strategy: Class Isolation sharding and Class-Sequential slicing")
 print(f"NPY data saved to: {sisa_data_dir}")
 print(f"Save time: {save_time:.2f} seconds ({total_slices_saved} slices)")
