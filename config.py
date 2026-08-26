@@ -11,6 +11,16 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # ================================================================================
 SEED = 42  # Global seed for all RNGs (Python, NumPy, PyTorch). Required for the exactness proof.
 
+# W35: how to handle an op with no deterministic implementation.
+#   True  -> torch raises. A run either is bit-reproducible or fails loudly.
+#   False -> torch warns and runs the non-deterministic kernel anyway.
+# The exactness argument (section 4.2, condition 3) claims the unlearned model EQUALS
+# a from-scratch model given the same seed and inputs. `warn_only=True` let that claim
+# degrade to a warning buried in stdout -- exactly the silent failure W23 already had
+# to fix once for cuBLAS. For a paper making a reproducibility claim, a hard error is
+# the correct default. Set False only to diagnose which op is at fault.
+STRICT_DETERMINISM = True
+
 # ================================================================================
 # SISA ARCHITECTURE PARAMETERS
 # ================================================================================
@@ -25,12 +35,15 @@ SEED = 42  # Global seed for all RNGs (Python, NumPy, PyTorch). Required for the
 #     both start in slice 1, so deleting either retrains 100% of shard 2 -- 13% of the
 #     available speedup lost to an arbitrary constant.
 #
-#   NUM_SHARDS = 'auto'  ->  K = ceil(NUM_CLASSES / MAX_SLICES_PER_SHARD).
-#     Each constraint on K is a lower bound and smaller K makes routing easier, so the
-#     smallest feasible K is chosen. Manual K remains the default because K is the
-#     variable the efficiency-vs-accuracy study sweeps -- deriving it would hide the
-#     very tradeoff being measured. 'auto' is for applying the method to a new dataset.
-NUM_SHARDS = 2
+#   NUM_SHARDS = 'auto'  ->  K = ceil(NUM_CLASSES / MAX_SLICES_PER_SHARD), clamped to
+#     [2, NUM_CLASSES // 2]. Each constraint on K is a lower bound and smaller K makes
+#     routing easier, so the smallest feasible K is chosen. This is the default so the
+#     method applies to a new dataset without hand-tuning: CIFAR-10 -> 2, CIFAR-100 ->
+#     13, Tiny-ImageNet -> 25. For CIFAR-10 it derives exactly the K=2 that was
+#     previously hardcoded, so this is not a behaviour change for the current project.
+#     Set an explicit int to override -- required when sweeping K for the
+#     efficiency-vs-accuracy study, since deriving it would hide the tradeoff measured.
+NUM_SHARDS = 'auto'
 NUM_SLICES_PER_SHARD = 'auto'
 
 # W26: how many classes a shard may hold, i.e. how many sequential slices it trains
@@ -144,19 +157,9 @@ REPLAY_RATIO_MODE = 'balanced'  # 'balanced' | 'static'
 # The cap must satisfy:  REPLAY_RATIO_MAX >= (MAX_SLICES_PER_SHARD - 1) / MAX_SLICES_PER_SHARD
 REPLAY_RATIO_MAX = 0.875
 
-
-
 LABEL_SMOOTHING = 0.15 # Increased from 0.05 to 0.15 - reduces suppression of unseen neurons for better unlearning AUC
 
-# Color Jitter Augmentation
-COLOR_JITTER_BRIGHTNESS = 0.2  
-COLOR_JITTER_CONTRAST = 0.2    
-COLOR_JITTER_SATURATION = 0.2 
-COLOR_JITTER_HUE = 0.1  
-
 # Regularization Parameters
-DROPOUT_RATE = 0.25  # Reduced dropout for better balance
-DROPOUT_2D_RATE = 0.15  # 2D dropout for conv layers
 GATING_DROPOUT_RATE = 0.2  # Gating network dropout  
 
 # CNN Architecture Parameters (SISAConvNet path only -- the ResNet path derives its
@@ -246,7 +249,12 @@ COSINE_SCALE_LEARNABLE = True
 #                classes. Nothing extra to unlearn (the affected shard's retrain
 #                rebuilds its own routing signal; unaffected shards never saw the class).
 #   'confidence' -- original masked-softmax self-routing fallback.
-ROUTING_MODE = 'ensemble'
+# W34: 'gating' rather than 'ensemble'. Measured on the 87.76% run, the log-linear
+# pool bought +0.04 combined accuracy (87.71% -> 87.75%, i.e. 4 test images in 10,000)
+# for +72% inference cost -- it calls routing_cosine AND forward on every shard, so each
+# specialist's conv trunk runs twice. The fitted blend weight was alpha=0.95, meaning it
+# was already 95% gate, which is consistent with there being almost nothing left to gain.
+ROUTING_MODE = 'gating'
 
 # Gating Network Architecture - Simplified lightweight routing network
 # Note: Architecture is now hardcoded in create_model.py for simplicity
@@ -280,7 +288,6 @@ def get_dataset_normalization(metadata_path=None):
             raise KeyError("Normalization values not found in metadata")
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as e:
         raise Exception(f"Could not load dataset normalization from {metadata_path}: {e}") from e
-
 
 def get_num_classes(metadata_path=None):
     """
@@ -381,7 +388,6 @@ UNLEARNING_MIN_EPOCHS = 10
 # which would have shown up as a failed W8 comparison misread as GPU nondeterminism.
 # Derived from the training values so they cannot drift apart again.
 UNLEARNING_LEARNING_RATE = LEARNING_RATE
-UNLEARNING_REPLAY_RATIO = 0.3  # Keep at 0.3 to prevent catastrophic forgetting of remaining classes
 # W27: must equal LABEL_SMOOTHING for the same reason as the learning rate above.
 # The previous comment claimed 0.05 "enables exact unlearning" -- that reasoning was
 # backwards: a smoothing value that DIFFERS from training is precisely what makes the
@@ -392,12 +398,10 @@ UNLEARNING_LABEL_SMOOTHING = LABEL_SMOOTHING
 # Unlearning Success Threshold
 UNLEARNING_SUCCESS_THRESHOLD = 0.45 
 
-
 # ================================================================================
 # SEARCH AND VISUALIZATION PARAMETERS
 # ================================================================================
 DEFAULT_SEARCH_SAMPLES = 16  
-VISUALIZATION_GRID_SIZE = 4 
 
 # Plotting Parameters
 PLOT_TIGHT_LAYOUT_RECT = [0, 0, 1, 0.96] 
@@ -442,7 +446,6 @@ BASELINE_HORIZONTAL_FLIP = 0.5
 # square on 32x32 CIFAR, and the right 32px square on 64x64 Tiny-ImageNet.
 BASELINE_CUTOUT_FRACTION = 0.5
 
-
 def get_input_size(metadata_path=None) -> int:
     """Input image side length, read from metadata.json (W28).
 
@@ -462,7 +465,6 @@ def get_input_size(metadata_path=None) -> int:
     except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return 32
 
-
 def resnet_stage_widths(input_size: int, base_width: int = None, target_spatial: int = None):
     """Channel widths per stage, derived from input resolution (W28).
 
@@ -475,7 +477,6 @@ def resnet_stage_widths(input_size: int, base_width: int = None, target_spatial:
     target_spatial = RESNET_TARGET_SPATIAL if target_spatial is None else target_spatial
     n_downsamples = max(0, math.ceil(math.log2(max(1, input_size) / target_spatial)))
     return [base_width * (2 ** i) for i in range(n_downsamples + 1)]
-
 
 def resolve_num_shards(num_classes: int) -> int:
     """Resolve NUM_SHARDS, deriving it from the dataset when set to 'auto' (W26).
@@ -500,7 +501,6 @@ def resolve_num_shards(num_classes: int) -> int:
         )
     return k
 
-
 def resolve_slices_for_shard(shard_class_count: int) -> int:
     """Resolve this shard's slice count, deriving it when NUM_SLICES_PER_SHARD is
     'auto' (W26): one class per slice, so S_k = |C_k|."""
@@ -510,7 +510,6 @@ def resolve_slices_for_shard(shard_class_count: int) -> int:
     if str(configured).lower() != 'auto':
         raise ValueError(f"NUM_SLICES_PER_SHARD must be an int or 'auto', got {configured!r}")
     return max(1, shard_class_count)
-
 
 def validate_partition(shard_class_counts) -> list:
     """Check a partition against the replay budget. Returns a list of warnings.
@@ -543,7 +542,6 @@ def validate_partition(shard_class_counts) -> list:
             f"help there, since deleting its only class retrains the whole shard."
         )
     return warnings
-
 
 def get_augmentation_config(level='baseline', is_unlearning=False):
     """

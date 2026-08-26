@@ -90,36 +90,3 @@ class SISAEarlyStopping:
             return True
         return False
 
-# Configuration function - uses values from config.py
-def get_optimal_early_stopping_config(data_size=None, training_type='fresh'):
-    """
-    Get early stopping configuration from config.py based on training type.
-    
-    Args:
-        data_size: Size of training data (unused, kept for API compatibility)
-        training_type: Type of training ('fresh', 'incremental', 'unlearning')
-    
-    Returns:
-        dict: Early stopping configuration matching config.py values
-    """
-    import config
-    
-    if training_type == 'unlearning':
-        patience = config.UNLEARNING_PATIENCE
-        min_delta = config.UNLEARNING_MIN_DELTA
-        min_epochs = getattr(config, 'UNLEARNING_MIN_EPOCHS', 0)
-    else:
-        patience = config.TRAINING_PATIENCE
-        min_delta = config.TRAINING_MIN_DELTA
-        min_epochs = getattr(config, 'TRAINING_MIN_EPOCHS', 0)
-
-    monitor = getattr(config, 'EARLY_STOPPING_MONITOR', 'val_loss')
-    return {
-        'patience': patience,
-        'min_delta': min_delta,
-        'monitor': monitor,
-        'mode': 'max' if monitor == 'val_accuracy' else 'min',
-        'restore_best_weights': True,
-        'verbose': True,
-        'min_epochs': min_epochs,
-    }

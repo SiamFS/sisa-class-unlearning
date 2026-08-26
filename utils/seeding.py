@@ -58,7 +58,15 @@ def set_seed(seed: int) -> None:
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
+    # W35: warn_only comes from config.STRICT_DETERMINISM (default True = raise).
+    # A non-deterministic op must not be allowed to silently invalidate the exactness
+    # claim; failing loudly is the whole point of asserting determinism at all.
+    try:
+        import config as _config
+        _warn_only = not getattr(_config, 'STRICT_DETERMINISM', True)
+    except ImportError:
+        _warn_only = False
+    torch.use_deterministic_algorithms(True, warn_only=_warn_only)
 
 
 def seeded_generator(seed: int) -> torch.Generator:

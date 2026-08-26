@@ -33,6 +33,7 @@ from plots import (
     create_overall_sisa_training_curves,
     load_shard_class_indices,
     fit_ensemble_params,
+    routing_comparison,
 )
 from training.create_model import save_model_pytorch, load_model_pytorch, DEVICE
 from training.train_gating_model import train_gating
@@ -119,23 +120,6 @@ def get_cumulative_classes_up_to_slice(shard_idx, slice_idx):
     
     return sorted(list(cumulative_classes))
 
-def get_incremental_validation_data(shard_idx, slice_idx, shard_metadatas, validation_data):
-
-    x_val, y_val = validation_data
-    
-    # Get classes that should be known at this slice (cumulative)
-    known_classes = get_cumulative_classes_up_to_slice(shard_idx, slice_idx)
-    
-    # Create mask for validation samples belonging to known classes
-    val_mask = np.isin(y_val, known_classes)
-    
-    # Filter validation data
-    x_val_filtered = x_val[val_mask]
-    y_val_filtered = y_val[val_mask]
-    
-    print(f"   Incremental validation: {len(known_classes)} classes, {len(x_val_filtered)} samples")
-    
-    return x_val_filtered, y_val_filtered
 
 def get_true_label_validation_data(shard_idx, cumulative_classes, validation_data):
 
@@ -435,6 +419,20 @@ if __name__ == "__main__":
                     lr=config.LEARNING_RATE,  # From global config
                     validation_data=incremental_validation_data,  # Use incremental validation
                     active_classes=known_classes,  # Use incremental classes, not all shard classes
+                    # W33: size the head to the classes this shard actually OWNS, instead of
+                    # falling through to the global class count. Training previously built a
+                    # 10-wide head for a shard owning 4 or 6 classes, leaving 6 / 4 outputs
+                    # that never receive a positive example. Two costs:
+                    #   * LABEL_SMOOTHING spreads over all 10 columns, so 67% of shard 1's
+                    #     smoothing mass (0.100 of 0.15) trained it to put probability on
+                    #     bird/cat/deer/dog/frog/horse -- classes it has no data for;
+                    #   * head width was inconsistent across training (10), unlearning (W6
+                    #     resizes to |C_k|) and the W8 scratch reference (|C_k| from the start),
+                    #     making W6's resize a 10->5 jump rather than 6->5.
+                    # `active_classes` still means "seen so far" and drives validation column
+                    # selection; head_classes is the fixed owned set, exactly as the unlearning
+                    # path and scratch_reference already use it.
+                    head_classes=active_classes,
                     replay_buffer=replay_buffer,
                     replay_ratio=current_replay_ratio,  # Use dynamic ratio
                     dataset_mean=DATASET_MEAN,
@@ -519,6 +517,15 @@ if __name__ == "__main__":
         all_shard_final_models, shard_class_indices, class_names, gating_model=gating_model
     )
 
+    # W32: log every routing mechanism on these same models, so the gated vs gate-free
+    # trade is recorded per-run instead of requiring a separate probe.
+    routing_table = routing_comparison(
+        all_shard_final_models, shard_class_indices, class_names,
+        x_test=np.load(os.path.join(sisa_data_dir, "test_data/x_test.npy")),
+        y_test=np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy")),
+        normalize=eval_transforms, gating_model=gating_model,
+    )
+
     # End timing for base model training (AFTER final evaluation, BEFORE visualizations)
     base_model_training_end_time = time.time()
     base_model_training_time = base_model_training_end_time - base_model_training_start_time
@@ -590,6 +597,8 @@ if __name__ == "__main__":
     # W7: persist every reported number as structured JSON -- unlearning reads
     # this instead of scraping training.txt.
     training_metrics = {
+        # W32: routing comparison for every mechanism, so gated vs gate-free is on record.
+        "routing_comparison": routing_table,
         "final_accuracy": float(classified_accuracy),
         "gating_training_time_with_io": float(gating_training_time),
         "gating_training_time_pure": float(pure_gating_training_time),

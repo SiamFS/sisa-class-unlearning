@@ -23,6 +23,7 @@ from training.train_model import (
     train_model,
 )
 from plots import (
+    routing_comparison,
     create_training_visualizations,
     create_confusion_matrix,
     create_shard_confusion_matrix,
@@ -1116,6 +1117,24 @@ class SISAUnlearning:
         classified_accuracy, overall_accuracy, unlearning_report = self.evaluate_with_self_routing(
             shard_models, shard_class_indices, self.class_names, gating_model=gating_model
         )
+
+        # W32: report every routing mechanism AFTER unlearning too, not just after
+        # training. The gated-vs-gate-free trade is the architectural decision this
+        # project is making, and post-deletion is exactly where it matters most --
+        # the gate is the one component that had to be retrained to stay exact, so
+        # what gate-free routing costs on the unlearned system is the number that
+        # says whether that retrain was worth keeping.
+        try:
+            x_test = np.load(os.path.join(self.test_data_dir, "x_test.npy"))
+            y_test = np.load(os.path.join(self.test_data_dir, "y_test.npy"))
+            self.routing_comparison_result = routing_comparison(
+                shard_models, shard_class_indices, self.class_names,
+                x_test=x_test, y_test=y_test, normalize=self.eval_transforms,
+                gating_model=gating_model,
+            )
+        except Exception as e:
+            print(f"   - Routing comparison skipped: {type(e).__name__}: {e}")
+            self.routing_comparison_result = {}
 
         return shard_models, classified_accuracy, overall_accuracy, unlearning_report
 

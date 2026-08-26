@@ -210,6 +210,109 @@ def _run_sisa_batch(
     return final_preds, combined_probabilities
 
 
+#: W32 -- canonical names for the routing mechanisms, for logs and the paper.
+#  Every entry is (config.ROUTING_MODE value, needs the gate?, published name).
+ROUTING_METHODS = [
+    # Hendrycks & Gimpel (ICLR 2017) Maximum Softmax Probability, applied per shard with
+    # the logits masked to that shard's owned classes; the shard with the highest MSP wins.
+    ('confidence', False, 'MSP self-routing (max softmax probability)'),
+    # NOTE: cosine-prototype routing (config.ROUTING_MODE='cosine') is deliberately NOT
+    # listed here. It remains a selectable routing mode, but it measured 40.20% routing
+    # against MSP's 79.73% on the same models, so reporting it every run only adds a
+    # losing row and one extra full pass over the test set.
+    # Mixture-of-experts style learned router: a separate network trained on all shards'
+    # data that predicts the shard index directly.
+    ('gating',     True,  'Learned gating network (MoE-style router)'),
+    # Weighted LOG-LINEAR OPINION POOL of the two posteriors above:
+    #     s_k = alpha * log P_gate(k|x) + (1 - alpha) * log P_cos(k|x)
+    # i.e. a weighted geometric mean of the distributions (a product-of-experts pool),
+    # with alpha and the cosine temperature fitted on validation.
+    ('ensemble',   True,  'Log-linear opinion pool (gate + cosine)'),
+]
+
+
+def routing_comparison(shard_models, shard_class_indices, class_names,
+                       x_test, y_test, normalize, gating_model=None, batch_size=None):
+    """Score EVERY available routing mechanism on the same trained models (W32).
+
+    Gated and gate-free routing are the two architectures this project chooses between:
+    the gate is more accurate but is a component that sees every class and must be
+    retrained on each deletion, while gate-free routing has nothing to unlearn and is
+    exact by construction. Comparing them used to require running
+    experiments/gate_free_routing_probe.py separately, so the comparison only existed
+    for runs where someone remembered. Reporting all of them on every training and
+    unlearning run makes the trade-off part of the record.
+
+    Costs a few extra forward passes over the test set -- no training, no plots.
+    Returns {method_name: {'routing_accuracy', 'combined_accuracy', 'mode', 'uses_gate'}}.
+    """
+    batch_size = batch_size or config.BATCH_SIZE
+    num_classes = len(class_names)
+    class_to_shard = {c: k for k, owned in enumerate(shard_class_indices) for c in owned}
+    # Samples whose class no longer belongs to any shard (deleted) have no correct route.
+    routable = np.array([int(c) in class_to_shard for c in y_test])
+    true_shard = np.array([class_to_shard.get(int(c), -1) for c in y_test])
+
+    for m in shard_models:
+        if m is not None:
+            m.eval()
+
+    results = {}
+    with torch.no_grad():
+        for mode, needs_gate, name in ROUTING_METHODS:
+            if needs_gate and gating_model is None:
+                continue
+            if mode == 'ensemble' and getattr(gating_model, 'ensemble_alpha', None) is None:
+                continue  # blend weights were never fitted
+
+            preds = []
+            for i in range(0, len(x_test), batch_size):
+                batch = torch.from_numpy(x_test[i:i + batch_size].astype(np.float32))
+                batch = normalize(batch).to(DEVICE)
+                p, _ = _run_sisa_batch(batch, shard_models, class_names, shard_class_indices,
+                                        gating_model=(gating_model if needs_gate else None),
+                                        routing_mode=mode)
+                preds.extend(p.cpu().numpy())
+            preds = np.array(preds)
+            # A sample is routed correctly iff its prediction lands in the owning shard.
+            routed = np.array([class_to_shard.get(int(c), -1) for c in preds])
+            results[name] = {
+                'mode': mode,
+                'uses_gate': needs_gate,
+                'routing_accuracy': float((routed[routable] == true_shard[routable]).mean()) if routable.any() else 0.0,
+                'combined_accuracy': float((preds == y_test).mean()),
+            }
+
+    # Report only the BEST gate-free method plus each gated one. Every gate-free score
+    # is still returned (and written to the run's metrics JSON) -- the log just does not
+    # need a row per losing variant, since the decision is gated vs gate-free, not which
+    # gate-free score happens to win today.
+    free_items = [(n, r) for n, r in results.items() if not r['uses_gate']]
+    gated_items = [(n, r) for n, r in results.items() if r['uses_gate']]
+    best_free = max(free_items, key=lambda kv: kv[1]['combined_accuracy']) if free_items else None
+
+    rows = []
+    if best_free:
+        rows.append((f"{best_free[0]} [gate-free]", best_free[1]))
+    rows += gated_items
+
+    width = max([len(n) for n, _ in rows] + [30]) + 2
+    print("\n" + "=" * (width + 20))
+    print("ROUTING COMPARISON -- same models, every available mechanism")
+    print("=" * (width + 20))
+    print(f"{'method':<{width}}{'routing':>9}{'combined':>11}")
+    print("-" * (width + 20))
+    for name, r in rows:
+        print(f"{name:<{width}}{r['routing_accuracy']*100:>8.2f}%{r['combined_accuracy']*100:>10.2f}%")
+    print("-" * (width + 20))
+    if best_free and gated_items:
+        best_gated = max(gated_items, key=lambda kv: kv[1]['combined_accuracy'])
+        print(f"Cost of removing the gate: "
+              f"{(best_gated[1]['combined_accuracy'] - best_free[1]['combined_accuracy']) * 100:+.2f} points")
+    print("=" * (width + 20))
+    return results
+
+
 def _route_via_cosine(
     batch_x_normalized: torch.Tensor,
     shard_models: List[torch.nn.Module],
@@ -391,24 +494,51 @@ def _route_via_gating(
     Validated in experiments/gating_routing_probe.py before being wired in here.
     """
     batch_size = batch_x_normalized.size(0)
+    device = batch_x_normalized.device
 
     with torch.no_grad():
         gating_logits = gating_model(batch_x_normalized)
+
+    # Never route to a shard that has no model or owns no classes (possible after a
+    # deletion empties one) -- those columns are masked out before the argmax.
+    usable = [i for i, m in enumerate(shard_models)
+              if m is not None and i < len(shard_class_indices) and shard_class_indices[i]]
+    if not usable:
+        return torch.zeros(batch_size, num_classes, device=device)
+    if len(usable) < gating_logits.shape[1]:
+        mask = torch.full_like(gating_logits, -float('inf'))
+        mask[:, usable] = 0.0
+        gating_logits = gating_logits + mask
+
     predicted_shard = gating_logits.argmax(dim=1)  # (batch,)
 
-    per_shard_probs = []
-    for shard_idx, model in enumerate(shard_models):
-        owned = shard_class_indices[shard_idx] if shard_idx < len(shard_class_indices) else []
-        owned_sorted = sorted(owned)
+    # W34: run each specialist ONLY on the samples the gate actually routed to it.
+    #
+    # This previously evaluated EVERY specialist on the FULL batch and then kept just
+    # the winning shard's row, so specialist compute scaled as O(K) per sample -- the
+    # whole point of having a router is to avoid exactly that. Measured at K=2 this
+    # wasted ~43% of inference; at K=25 it would have been ~25x. Total specialist work
+    # is now one forward pass per sample regardless of K, which is the O(1) inference
+    # property that distinguishes this design from ARCANE's exhaustive one-class
+    # ensemble (which must evaluate all N_C sub-models per input).
+    combined = torch.zeros(batch_size, num_classes, device=device)
+    for shard_idx in usable:
+        sample_mask = predicted_shard == shard_idx
+        if not bool(sample_mask.any()):
+            continue  # nothing routed here in this batch -- skip the forward entirely
+
+        owned_sorted = sorted(shard_class_indices[shard_idx])
         with torch.no_grad():
-            specialist_logits = model(batch_x_normalized)
+            specialist_logits = shard_models[shard_idx](batch_x_normalized[sample_mask])
+
         is_reduced_head = specialist_logits.shape[1] != num_classes
         owned_logits = specialist_logits if is_reduced_head else specialist_logits[:, owned_sorted]
         local_probs = torch.softmax(owned_logits / config.PRIMARY_SPECIALIST_TEMPERATURE, dim=1)
-        per_shard_probs.append(_scatter_local_to_global(local_probs, owned_sorted, num_classes, DEVICE))
+        combined[sample_mask] = _scatter_local_to_global(
+            local_probs, owned_sorted, num_classes, device
+        )
 
-    stacked_probs = torch.stack(per_shard_probs, dim=0)  # (num_shards, batch, num_classes)
-    return stacked_probs[predicted_shard, torch.arange(batch_size, device=DEVICE)]
+    return combined
 
 
 SISA_METADATA_PATH = os.path.join(config.PROJECTS_DIR, config.PROJECT_NAME, "sisa_data", "metadata.json")
@@ -893,17 +1023,6 @@ def _resolve_device(device: Optional[torch.device], model: torch.nn.Module) -> t
 		return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def _resolve_device_from_models(device: Optional[torch.device], models: Sequence[Optional[torch.nn.Module]]) -> torch.device:
-	if device is not None:
-		return torch.device(device)
-	for model in models:
-		if model is None:
-			continue
-		try:
-			return next(model.parameters()).device
-		except (StopIteration, AttributeError):
-			continue
-	return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def create_training_visualizations(history, shard_idx, slice_idx, save_dir, training_type="training"):
@@ -2429,6 +2548,8 @@ def create_efficiency_comparison_chart(scratch_time: float, unlearn_time: float,
 
 
 __all__ = [
+	"routing_comparison",
+	"ROUTING_METHODS",
 	"create_data_processing_visualizations",
 	"create_overall_dataset_visualization",
 	"create_shard_distribution_visualization",

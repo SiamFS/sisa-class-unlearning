@@ -39,19 +39,35 @@ from utils.seeding import set_seed
 from training.create_model import load_model_pytorch, DEVICE
 
 
-def _evaluate(model, x, y, allowed_classes, normalize, batch_size=512):
-    """Predict over `x`, restricted to `allowed_classes`. Returns predictions."""
-    allowed = torch.tensor(sorted(allowed_classes), device=DEVICE, dtype=torch.long)
+def _evaluate(model, x, y, allowed_classes, normalize, head_classes=None, batch_size=512):
+    """Predict over `x`, restricted to `allowed_classes` (global class ids).
+
+    W33: the head may be GLOBAL width (one column per dataset class) or SHARD width
+    (one column per owned class, ordered by `sorted(head_classes)`). The columns to
+    select differ between the two, and getting it wrong fails silently rather than
+    raising -- a shard-width head indexed with global ids returns whichever classes
+    happen to sit at those local positions, producing plausible but wrong numbers.
+    """
+    allowed_sorted = sorted(allowed_classes)
+    allowed = torch.tensor(allowed_sorted, device=DEVICE, dtype=torch.long)
+
     preds = []
     for start in range(0, len(x), batch_size):
         chunk = torch.from_numpy(x[start:start + batch_size].astype(np.float32))
         chunk = normalize(chunk).to(DEVICE)
         with torch.no_grad():
             logits = model(chunk)
-        # Global-width head: mask to the classes known so far. A reduced head would
-        # already be local-indexed, but no unlearning has run on these checkpoints.
-        if logits.shape[1] != len(allowed):
+
+        if head_classes is not None and logits.shape[1] == len(head_classes):
+            # Shard-width head: translate global ids to this head's local column order.
+            head_sorted = sorted(head_classes)
+            local = torch.tensor([head_sorted.index(c) for c in allowed_sorted],
+                                 device=DEVICE, dtype=torch.long)
+            logits = logits[:, local]
+        elif logits.shape[1] != len(allowed):
+            # Global-width head: the global ids ARE the column indices.
             logits = logits[:, allowed]
+
         preds.append(allowed[logits.argmax(dim=1)].cpu().numpy())
     return np.concatenate(preds)
 
@@ -118,7 +134,10 @@ def main():
 
             known = cumulative[sl]
             mask = np.isin(y_test, known)
-            preds = _evaluate(model, x_test[mask], y_test[mask], known, normalize)
+            # W33: `ordered` is this shard's full owned set, i.e. the head's column order
+            # when the head is shard-width. Harmless for a global-width head.
+            preds = _evaluate(model, x_test[mask], y_test[mask], known, normalize,
+                              head_classes=ordered)
             truth = y_test[mask]
 
             for c in known:
