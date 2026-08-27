@@ -1,8 +1,6 @@
 import numpy as np
 import torch
-import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional
-import json
+from typing import Dict, Tuple
 
 
 class SmartReplayBuffer:    
@@ -80,17 +78,15 @@ class SmartReplayBuffer:
             outputs = model(batch_x)
             losses = criterion(outputs, batch_y)
             
-            # Compute gradient norms as importance scores
-            batch_importance = []
-            for j, loss in enumerate(losses):
-                # Gradient w.r.t input
-                grad = torch.autograd.grad(loss, batch_x[j:j+1], retain_graph=True, allow_unused=True)[0]
-                if grad is not None:
-                    importance = torch.norm(grad).item()
-                else:
-                    importance = 0.0  # Default importance for unused tensors
-                batch_importance.append(importance)
-            
+            # Differentiate against the leaf `batch_x`; indexing it would create a
+            # non-leaf tensor outside the graph and yield None. eval() mode keeps
+            # samples independent, so row j of the batch gradient is loss_j's gradient.
+            grads = torch.autograd.grad(losses.sum(), batch_x, allow_unused=True)[0]
+            if grads is not None:
+                batch_importance = grads.reshape(grads.size(0), -1).norm(dim=1).detach().cpu().numpy().tolist()
+            else:
+                batch_importance = [0.0] * len(batch_y)  # Default for unused tensors
+
             importance_scores.extend(batch_importance)
         
         return np.array(importance_scores)
@@ -115,11 +111,28 @@ class SmartReplayBuffer:
             # Reservoir sampling with importance weighting
             self._reservoir_sample_with_importance(label, class_x, class_y, class_importance)
     
+    def _combined_scores(self, importance: np.ndarray, slice_added: np.ndarray) -> np.ndarray:
+        """Blend gradient importance with temporal decay on a common [0, 1] scale.
+
+        Raw gradient norms (~1e-2) would otherwise be dominated ~20x by the temporal
+        term, making importance weighting inert.
+        """
+        temporal = self.decay_rate ** (self.current_slice - slice_added)
+
+        imp_min, imp_max = importance.min(), importance.max()
+        span = imp_max - imp_min
+        if span > 1e-12:
+            importance_norm = (importance - imp_min) / span
+        else:
+            importance_norm = np.full_like(importance, 0.5, dtype=float)
+
+        return self.importance_weight * importance_norm + self.temporal_weight * temporal
+
     def _reservoir_sample_with_importance(self, label: int, new_x: np.ndarray,
                                         new_y: np.ndarray, new_importance: np.ndarray):
         """Intelligent reservoir sampling based on importance scores."""
         current_buffer = self.buffer[label]
-        
+
         # Combine old and new samples
         all_x = np.vstack([current_buffer['X'], new_x])
         all_y = np.concatenate([current_buffer['y'], new_y])
@@ -128,12 +141,9 @@ class SmartReplayBuffer:
             current_buffer['slice_added'],
             np.full(len(new_x), self.current_slice)
         ])
-        
-        # Compute combined scores (importance + temporal decay)
-        temporal_scores = self.decay_rate ** (self.current_slice - all_slice_added)
-        combined_scores = (self.importance_weight * all_importance + 
-                          self.temporal_weight * temporal_scores)
-        
+
+        combined_scores = self._combined_scores(all_importance, all_slice_added)
+
         # Sample top samples based on combined scores
         top_indices = np.argsort(combined_scores)[-self.max_samples_per_class:]
         
@@ -176,13 +186,15 @@ class SmartReplayBuffer:
             
             if class_n_samples > 0:
                 # Smart sampling based on combined importance + temporal scores
-                temporal_scores = self.decay_rate ** (self.current_slice - class_data['slice_added'])
-                combined_scores = (self.importance_weight * class_data['importance'] + 
-                                 self.temporal_weight * temporal_scores)
-                
-                # Softmax for probability distribution
-                probabilities = F.softmax(torch.from_numpy(combined_scores), dim=0).numpy()
-                
+                combined_scores = self._combined_scores(
+                    class_data['importance'], class_data['slice_added']
+                )
+
+                # Normalise directly: softmax over [0, 1] scores is almost flat and
+                # collapses sampling to uniform.
+                weights = np.clip(combined_scores, 1e-12, None)
+                probabilities = weights / weights.sum()
+
                 # Sample indices
                 sampled_indices = np.random.choice(
                     len(class_data['X']), 
@@ -211,20 +223,6 @@ class SmartReplayBuffer:
             }
         }
         return stats
-    
-    def save_buffer(self, filepath: str):
-        """Save buffer state (metadata only, not raw data)."""
-        metadata = {
-            'current_slice': self.current_slice,
-            'decay_rate': self.decay_rate,
-            'importance_weight': self.importance_weight,
-            'temporal_weight': self.temporal_weight,
-            'max_samples_per_class': self.max_samples_per_class,
-            'buffer_stats': self.get_buffer_stats()
-        }
-        
-        with open(filepath, 'w') as f:
-            json.dump(metadata, f, indent=2)
     
     def __len__(self) -> int:
         """Total number of samples in buffer."""

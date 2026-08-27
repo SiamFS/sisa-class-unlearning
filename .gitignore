@@ -1,0 +1,32 @@
+# Virtual environment (created by setup_env.py)
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Downloaded datasets (config.DATA_DIR)
+data/
+
+# Generated run artifacts: shards, slices, models, figures, metrics.
+# config.PROJECTS_DIR resolves to ../projects by default, i.e. OUTSIDE this repo.
+# This rule covers the case where PROJECTS_DIR is pointed inside the repo instead.
+projects/
+
+# Run logs written to the working directory by the entry points
+training.txt
+unlearning.txt
+data_processing.txt
+
+# Metrics written by the training run (normally inside projects/)
+training_metrics.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

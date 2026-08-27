@@ -4,9 +4,8 @@ import json
 import argparse
 import numpy as np
 import torch
-import torch.nn as nn
 import matplotlib.pyplot as plt
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List
 import torchvision.transforms as T
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
@@ -22,7 +21,7 @@ class SISASearchTool:
         print(f"Initializing SISA Search Tool for project: '{project_name}' with model: '{model_name}'")
         self.project_name = project_name
         self.model_name = model_name
-        self.base_dir = f"../{config.PROJECTS_DIR}/{self.project_name}"
+        self.base_dir = config.get_project_dir(self.project_name)
         self.models_dir = os.path.join(self.base_dir, "models")
         self.data_dir = os.path.join(self.base_dir, "sisa_data")
         self.reports_dir = os.path.join(self.base_dir, "data_info")
@@ -35,8 +34,10 @@ class SISASearchTool:
             self.class_names = self.metadata['class_names']
             print(f"Loaded {len(self.class_names)} class names from metadata: {self.class_names}")
         else:
-            print("Warning: Class names not found in metadata. Using CIFAR-10 defaults.")
-            self.class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+            raise KeyError(
+                f"'class_names' missing from {os.path.join(self.data_dir, 'metadata.json')}. "
+                f"Run data processing first."
+            )
         
         # Load normalization stats dynamically from metadata
         if 'normalization_mean' in self.metadata and 'normalization_std' in self.metadata:
@@ -114,7 +115,15 @@ class SISASearchTool:
         return shard_classes
 
     def _load_unlearned_classes(self) -> List[int]:
-        """Load the list of unlearned class indices"""
+        """Load the list of unlearned class indices.
+
+        The unlearning pipeline records these in sisa_data/metadata.json; an older
+        models/unlearned_classes.json file is still honoured if one is present.
+        """
+        unlearned_classes = self.metadata.get('unlearned_classes', [])
+        if unlearned_classes:
+            return unlearned_classes
+
         unlearned_classes_file = os.path.join(self.models_dir, "unlearned_classes.json")
         if os.path.exists(unlearned_classes_file):
             with open(unlearned_classes_file, 'r') as f:
@@ -271,100 +280,6 @@ class SISASearchTool:
         
         return predictions, confidences
 
-    def _predict_with_gating(self, samples, shard_models, gating_model, threshold):
-        """Make predictions using an improved gating network approach with ensemble fallback"""
-        predictions = []
-        confidences = []
-        detailed_results = []
-        
-        with torch.no_grad():
-            for idx, sample in enumerate(samples):
-                # Convert single sample to batch format
-                batch_x = torch.from_numpy(sample).unsqueeze(0).float()
-                batch_x_normalized = self.eval_transforms(batch_x).to(DEVICE)
-                
-                # Get gating prediction
-                gating_logits = gating_model(batch_x_normalized)
-                gating_probs = torch.softmax(gating_logits, dim=1)
-                shard_pred = gating_logits.argmax(dim=1).item()
-                
-                # Get specialist predictions for all shards
-                specialist_outputs = [torch.softmax(model(batch_x_normalized), dim=1) for model in shard_models]
-                
-                # Analyze what each shard predicts
-                shard_predictions = []
-                shard_confidences = []
-                for shard_idx, shard_output in enumerate(specialist_outputs):
-                    conf, pred = torch.max(shard_output[0], dim=0)
-                    shard_predictions.append(pred.item())
-                    shard_confidences.append(conf.item())
-                
-                # IMPROVED DECISION LOGIC:
-                # 1. Check if gating selection is confident AND the selected shard is confident
-                gating_confidence = gating_probs[0, shard_pred].item()
-                selected_shard_confidence = shard_confidences[shard_pred]
-                
-                # Store detailed analysis
-                detailed_info = {
-                    'sample_idx': idx + 1,
-                    'gating_selected_shard': shard_pred + 1,
-                    'gating_confidence': gating_confidence,
-                    'gating_weights': gating_probs[0].cpu().numpy().tolist(),
-                    'shard_predictions': [(self.class_names[pred], f"{conf:.3f}") for pred, conf in zip(shard_predictions, shard_confidences)],
-                }
-                
-                final_prediction = None
-                final_confidence = 0.0
-                method_used = "unknown"
-                
-                # Find the most confident shard (but only consider valid class predictions)
-                best_shard = -1
-                best_confidence = 0.0
-                
-                # Check each shard and only consider predictions for classes they were trained on
-                for shard_idx, (pred_class, confidence) in enumerate(zip(shard_predictions, shard_confidences)):
-                    # Only consider this shard if it predicts a class it was trained on
-                    if pred_class in self.shard_classes.get(shard_idx, []):
-                        if confidence > best_confidence:
-                            best_shard = shard_idx
-                            best_confidence = confidence
-                
-                # Strategy 1: Use best shard if it's significantly more confident AND predicting valid class
-                if (best_shard != -1 and 
-                    best_confidence >= threshold and 
-                    best_confidence > selected_shard_confidence + config.CONFIDENCE_BOOST_THRESHOLD and
-                    shard_predictions[best_shard] in self.shard_classes.get(best_shard, [])):
-                    
-                    final_prediction = shard_predictions[best_shard]
-                    final_confidence = best_confidence
-                    method_used = "best_shard"
-                    detailed_info['override_shard'] = best_shard + 1
-                    detailed_info['override_reason'] = f"Better confidence: {best_confidence:.3f} vs {selected_shard_confidence:.3f} (valid class)"
-                
-                # Strategy 2: Use gating if selected shard is confident enough AND predicting valid class
-                elif (selected_shard_confidence >= threshold and 
-                      shard_predictions[shard_pred] in self.shard_classes.get(shard_pred, [])):
-                    final_prediction = shard_predictions[shard_pred]
-                    final_confidence = selected_shard_confidence
-                    method_used = "gating"
-                
-                # If gating confidence is too low, mark as uncertain but still use selected shard
-                else:
-                    final_prediction = shard_predictions[shard_pred]
-                    final_confidence = selected_shard_confidence
-                    method_used = "gating_uncertain"
-                
-                # Store results
-                predictions.append(final_prediction)
-                confidences.append(final_confidence)
-                
-                detailed_info['final_method'] = method_used
-                detailed_info['final_prediction'] = self.class_names[final_prediction] if final_prediction != -1 else 'UNKNOWN'
-                detailed_info['final_confidence'] = final_confidence
-                detailed_results.append(detailed_info)
-        
-        return predictions, confidences, detailed_results
-
     def _create_prediction_visualization(self, samples, true_labels, predictions, confidences, class_name):
         """Create a 4x4 grid visualization similar to unlearning verification"""
         
@@ -432,7 +347,7 @@ def main():
         search_tool.search_class_predictions(args.class_name, args.samples, args.threshold)
         
         print("\nAnalysis completed")
-        print(f"Check the generated visualization in: ../projects/{args.project}/data_info/")
+        print(f"Check the generated visualization in: {os.path.join(config.get_project_dir(args.project), 'data_info')}")
         
     except Exception as e:
         print(f"\nAn error occurred: {e}")

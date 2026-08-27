@@ -1,0 +1,6 @@
+# torch and torchvision are installed separately by setup_env.py
+# (it picks the right CUDA build for your GPU, or falls back to CPU-only)
+numpy
+matplotlib
+scikit-learn
+seaborn

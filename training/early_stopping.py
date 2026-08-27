@@ -1,7 +1,3 @@
-import torch
-import numpy as np
-from datetime import datetime
-import warnings
 
 class SISAEarlyStopping:
     def __init__(self, 
@@ -72,31 +68,3 @@ class SISAEarlyStopping:
         return False
 
 # Configuration function - uses values from config.py
-def get_optimal_early_stopping_config(data_size=None, training_type='fresh'):
-    """
-    Get early stopping configuration from config.py based on training type.
-    
-    Args:
-        data_size: Size of training data (unused, kept for API compatibility)
-        training_type: Type of training ('fresh', 'incremental', 'unlearning')
-    
-    Returns:
-        dict: Early stopping configuration matching config.py values
-    """
-    import config
-    
-    if training_type == 'unlearning':
-        patience = config.UNLEARNING_PATIENCE
-        min_delta = config.UNLEARNING_MIN_DELTA
-    else:
-        patience = config.TRAINING_PATIENCE
-        min_delta = config.TRAINING_MIN_DELTA
-    
-    return {
-        'patience': patience,
-        'min_delta': min_delta,
-        'monitor': 'val_loss',
-        'mode': 'min',
-        'restore_best_weights': True,
-        'verbose': True
-    }

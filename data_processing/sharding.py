@@ -5,9 +5,19 @@ def create_shards_with_indices(X, y, part_number, class_names=None):
 
     if part_number <= 0:
         raise ValueError("part_number must be positive")
-    
+
+    # More shards than classes would leave shards empty, which shifts every later
+    # shard index and fails later as an IndexError.
+    num_classes = len(np.unique(y))
+    if part_number > num_classes:
+        raise ValueError(
+            f"NUM_SHARDS ({part_number}) cannot exceed the number of classes "
+            f"({num_classes}) under the class-isolation strategy: each shard must "
+            f"receive at least one whole class. Reduce NUM_SHARDS to {num_classes} or fewer."
+        )
+
     print(f"Creating {part_number} shards with class-isolation strategy...")
-    
+
     train_indices = np.arange(len(X))
 
     return _create_class_isolated_shards(X, y, train_indices, part_number, class_names)
@@ -15,7 +25,6 @@ def create_shards_with_indices(X, y, part_number, class_names=None):
 def _create_class_isolated_shards(X, y, indices, part_number, class_names):
 
     # Mathematical parameters from data_process.txt analysis
-    ALPHA = 5.0  # Imbalance threshold multiplier
     BETA = 0.6   # Max shard fraction per class
     GAMMA = 0.5  # Minimum split efficiency factor
     MAX_IMBALANCE_RATIO = 3.0  # Maximum acceptable shard imbalance

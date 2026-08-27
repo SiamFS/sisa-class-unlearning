@@ -12,6 +12,7 @@ import torchvision.transforms as T
 import config
 
 from training.create_model import create_gating_model, save_model_pytorch, DEVICE
+from training.early_stopping import SISAEarlyStopping
 
 def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, excluded_classes=None):
 
@@ -62,7 +63,8 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
     
     if not all_x_data:
         print("   - ERROR: No training data available after filtering")
-        return None
+        # Callers unpack (path, pure_training_time); a bare None raises TypeError.
+        return None, 0.0
         
     x_train_full = np.concatenate(all_x_data)
     y_train_full = np.concatenate(all_y_data)
@@ -92,14 +94,19 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=config.GATING_LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
     
-    # Early stopping setup for gating network
-    best_val_acc = 0.0
-    best_model_state = None
+    # Early stopping: identical mechanism to the shard models (SISAEarlyStopping on
+    # val_loss with best-weight restore), so gating and shard training are comparable.
     epochs = config.GATING_MAX_EPOCHS
-    patience = config.GATING_EARLY_STOPPING_PATIENCE  # Use config parameter for early stopping
-    patience_counter = 0
-    min_improvement = 0.001  # Minimum improvement threshold
-    
+    early_stopping = SISAEarlyStopping(
+        patience=config.GATING_EARLY_STOPPING_PATIENCE,
+        min_delta=config.GATING_MIN_DELTA,
+        monitor='val_loss',
+        mode='min',
+        restore_best_weights=True,
+        verbose=True
+    )
+    best_val_acc = 0.0
+
     # START: Track pure gating training time
     import time
     pure_gating_start = time.time()
@@ -147,48 +154,32 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         avg_val_loss = val_loss / len(val_loader)
         
         print(f"   - Epoch {epoch+1}/{epochs}: Train Loss={avg_train_loss:.4f}, Train Acc={train_acc:.4f}, Val Loss={avg_val_loss:.4f}, Val Acc={val_acc:.4f}")
-        
-        # Enhanced early stopping for gating network
-        if val_acc > best_val_acc + min_improvement:
-            best_val_acc = val_acc
-            best_model_state = model.state_dict().copy()
-            patience_counter = 0  # Reset patience counter
-            print(f"   - New best validation accuracy: {best_val_acc:.4f}")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"   - Early stopping triggered at epoch {epoch+1} (no improvement for {patience} epochs)")
-                break
-    
+
+        best_val_acc = max(best_val_acc, val_acc)
+
+        if early_stopping(avg_val_loss, model, epoch):
+            print(f"   - Early stopping triggered at epoch {epoch+1}")
+            break
+
+    early_stopping.restore_best_model(model)
+
     # END: Track pure gating training time
     pure_gating_end = time.time()
     pure_gating_time = pure_gating_end - pure_gating_start
     print(f"   - Pure Gating Network Training Time: {pure_gating_time:.2f} seconds")
     
-    # Save only the best model at the end
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        save_path = os.path.join(models_dir, "gating_model.pth")
-        # PRIVACY: Metadata only contains shard count, NOT class information
-        metadata = {
-            'best_val_acc': best_val_acc,
-            'num_shards': num_shards,
-            'training_type': 'retrained' if excluded_classes else 'initial',
-            'excluded_class_count': len(excluded_classes) if excluded_classes else 0,
-            # NOTE: We do NOT store class names, indices, or any class-identifying information
-            # The gating network is a pure shard router with NO knowledge of classes
-        }
-        save_model_pytorch(model, save_path, metadata=metadata)
-        print(f"   - Saved final best Gating Network model (Val Acc: {best_val_acc:.4f})")
-    else:
-        print("   - No improvement found, saving final model state")
-        save_path = os.path.join(models_dir, "gating_model.pth")
-        metadata = {
-            'best_val_acc': 0.0,
-            'num_shards': num_shards,
-            'training_type': 'retrained' if excluded_classes else 'initial',
-            'excluded_class_count': len(excluded_classes) if excluded_classes else 0,
-        }
-        save_model_pytorch(model, save_path, metadata=metadata)
-            
-    return os.path.join(models_dir, "gating_model.pth"), pure_gating_time
+    # Save the best model (weights already restored by early stopping)
+    save_path = os.path.join(models_dir, "gating_model.pth")
+    # PRIVACY: Metadata only contains shard count, NOT class information
+    metadata = {
+        'best_val_acc': best_val_acc,
+        'num_shards': num_shards,
+        'training_type': 'retrained' if excluded_classes else 'initial',
+        'excluded_class_count': len(excluded_classes) if excluded_classes else 0,
+        # NOTE: We do NOT store class names, indices, or any class-identifying information
+        # The gating network is a pure shard router with NO knowledge of classes
+    }
+    save_model_pytorch(model, save_path, metadata=metadata)
+    print(f"   - Saved final best Gating Network model (Val Acc: {best_val_acc:.4f})")
+
+    return save_path, pure_gating_time

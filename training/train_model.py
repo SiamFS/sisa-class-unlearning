@@ -1,16 +1,8 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torchvision.transforms as T
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_curve, auc, confusion_matrix, classification_report, precision_recall_fscore_support, accuracy_score
-from sklearn.preprocessing import label_binarize
-import matplotlib.pyplot as plt
-import seaborn as sns
-import os
-import sys
-from typing import List, Optional
 
 # Import global configuration
 import config
@@ -21,27 +13,19 @@ from training.early_stopping import SISAEarlyStopping
 from plots import (
     _normalize_probabilities_tensor,
     _apply_temperature_tensor, 
-    _apply_temperature_numpy,
     _run_sisa_batch
 )
 
-TRUE_LABEL_TITLE = 'True Label'
-PREDICTED_LABEL_TITLE = 'Predicted Label'
-SISA_METADATA_PATH = f"../{config.PROJECTS_DIR}/{config.PROJECT_NAME}/sisa_data/metadata.json"
 
 
 def _filter_data_by_class(X, y, active_classes):
-    """Filters a dataset to only include samples from active_classes."""
+    """Filter a dataset to active_classes, keeping labels in the original space so
+    validation scores the same objective training optimises."""
     if active_classes is None:
-        return X, y, None
-    
+        return X, y
+
     mask = np.isin(y, active_classes)
-    label_map = {original_label: new_label for new_label, original_label in enumerate(sorted(active_classes))}
-    
-    y_filtered = y[mask]
-    y_remapped = np.array([label_map[label] for label in y_filtered])
-    
-    return X[mask], y_remapped, label_map
+    return X[mask], y[mask]
 
 def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BATCH_SIZE, lr=config.LEARNING_RATE, 
                   validation_data=None, active_classes=None, replay_buffer=None, replay_ratio=0.2,
@@ -96,29 +80,27 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     
     if validation_data:
         x_val_full, y_val_full = validation_data
-        x_val, y_val_remapped, label_map = _filter_data_by_class(x_val_full, y_val_full, active_classes)
+        x_val, y_val = _filter_data_by_class(x_val_full, y_val_full, active_classes)
         print(f"   - Validating on {len(x_val)} samples from {len(active_classes)} active classes.")
         if len(x_val) == 0:
-            print(f"   âš ï¸  WARNING: No validation samples found for specialist classes {active_classes}")
-            print(f"   ðŸ“Š Available classes in validation: {sorted(np.unique(y_val_full))}")
+            print(f"   WARNING: No validation samples found for specialist classes {active_classes}")
+            print(f"   Available classes in validation: {sorted(np.unique(y_val_full))}")
             # Create empty validation tensors to avoid errors
             x_val = np.empty((0, *x_val_full.shape[1:]))
-            y_val_remapped = np.empty(0, dtype=np.int64)
+            y_val = np.empty(0, dtype=np.int64)
     else:
-        x_train, x_val, y_train, y_val_original = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+        x_train, x_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
         X, y = x_train, y_train
-        label_map = {original_label: new_label for new_label, original_label in enumerate(sorted(active_classes))}
-        y_val_remapped = np.array([label_map[label] for label in y_val_original])
         print(f"   - Created internal validation set with {len(x_val)} samples.")
 
     x_train_t = torch.from_numpy(X.astype(np.float32))
     y_train_t = torch.from_numpy(y.astype(np.int64)).long()
-    
+
     x_val_t = torch.from_numpy(x_val.astype(np.float32))
-    y_val_t = torch.from_numpy(y_val_remapped.astype(np.int64)).long()
+    y_val_t = torch.from_numpy(y_val.astype(np.int64)).long()
     
     if model is None:
-        model = create_sisa_model(num_classes=10)
+        model = create_sisa_model()
         if training_type == 'fresh':
             pass  # Already set as parameter default
     # Note: training_type is now passed as parameter, no need to reassign
@@ -142,8 +124,8 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
         verbose=True
     )
 
-    # Simple loss and optimization - Adam handles adaptive learning rates
-    # CRITICAL: Use 0.0 label smoothing during unlearning to allow deleted class neurons to die
+    # Same label smoothing for training and unlearning (see config) so the
+    # before/after comparison is not confounded by the objective changing.
     label_smoothing_value = config.UNLEARNING_LABEL_SMOOTHING if training_type == 'unlearning' else config.LABEL_SMOOTHING
     print(f"   - Using label smoothing: {label_smoothing_value:.3f} ({'unlearning mode' if training_type == 'unlearning' else 'normal training'})")
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing_value)
@@ -165,24 +147,29 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
 
     rng = np.random.default_rng(42)  # Fixed seed for reproducibility
     
+    # Replay supplements each batch: striding by main_batch_size keeps every sample
+    # seen once per epoch, with replay_batch_size samples appended on top.
+    use_replay = bool(replay_buffer) and replay_ratio > 0
+    if use_replay:
+        main_batch_size = max(1, int(batch_size * (1 - replay_ratio)))
+        replay_batch_size = batch_size - main_batch_size
+    else:
+        main_batch_size = batch_size
+        replay_batch_size = 0
+
     for epoch in range(epochs):
         model.train()
-        running_loss, correct, total = 0.0, 0, 0
+        running_loss, correct, total, num_batches = 0.0, 0, 0, 0
         indices = rng.permutation(len(X))
 
-        for i in range(0, len(X), batch_size):
-            batch_indices = indices[i:i+batch_size]
-            
-            if replay_buffer and replay_ratio > 0:
-                main_batch_size = int(batch_size * (1 - replay_ratio))
-                replay_batch_size = batch_size - main_batch_size
-                
-                actual_main_indices = batch_indices[:main_batch_size]
-                if len(actual_main_indices) == 0: continue
+        for i in range(0, len(X), main_batch_size):
+            batch_indices = indices[i:i+main_batch_size]
+            if len(batch_indices) == 0: continue
 
-                main_x = x_train_t[actual_main_indices]
-                main_y = y_train_t[actual_main_indices]
-                
+            if use_replay:
+                main_x = x_train_t[batch_indices]
+                main_y = y_train_t[batch_indices]
+
                 # Choose replay strategy
                 if use_smart_replay and hasattr(replay_buffer, 'sample_for_replay'):
                     # Smart replay buffer
@@ -239,16 +226,17 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
             optimizer.step()
 
             running_loss += loss.item()
+            num_batches += 1
             _, predicted = torch.max(output.data, 1)
             total += batch_y.size(0)
             correct += (predicted == batch_y).sum().item()
 
-        epoch_loss = running_loss / (len(X) / batch_size) if len(X) > 0 else 0
+        epoch_loss = running_loss / num_batches if num_batches > 0 else 0
         epoch_acc = correct / total if total > 0 else 0
 
         model.eval()
-        val_loss, val_correct, val_total = 0.0, 0, 0
-        
+        val_loss, val_correct, val_total, val_batches = 0.0, 0, 0, 0
+
         if len(x_val_t) > 0:
             with torch.no_grad():
                 for i in range(0, len(x_val_t), batch_size):
@@ -257,20 +245,19 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
 
                     batch_x_val = val_transforms(batch_x_val).to(DEVICE)
                     batch_y_val = batch_y_val.to(DEVICE)
-                    
-                    output_full = model(batch_x_val)
-                    
-                    # Specialist-only validation (filtered to active classes)
-                    active_class_indices = torch.tensor(sorted(active_classes), device=DEVICE)
-                    output_filtered = output_full[:, active_class_indices]
 
-                    loss = criterion(output_filtered, batch_y_val)
+                    # Same objective the optimizer minimises: full cross-entropy on
+                    # original labels, argmax over all classes as at inference time.
+                    output = model(batch_x_val)
+
+                    loss = criterion(output, batch_y_val)
                     val_loss += loss.item()
-                    _, predicted_filtered = torch.max(output_filtered.data, 1)
+                    val_batches += 1
+                    _, predicted = torch.max(output.data, 1)
                     val_total += batch_y_val.size(0)
-                    val_correct += (predicted_filtered == batch_y_val).sum().item()
+                    val_correct += (predicted == batch_y_val).sum().item()
 
-        val_epoch_loss = val_loss / (len(x_val_t) / batch_size) if len(x_val_t) > 0 else 0
+        val_epoch_loss = val_loss / val_batches if val_batches > 0 else 0
         val_epoch_acc = val_correct / val_total if val_total > 0 else 0
         
         # No lr_scheduler needed - Adam handles adaptive learning rates

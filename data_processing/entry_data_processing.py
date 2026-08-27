@@ -27,6 +27,10 @@ from plots import create_data_processing_visualizations, visualize_sample_images
 class Logger:
     def __init__(self, filename):
         self.terminal = sys.stdout
+        try:
+            self.terminal.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, OSError):
+            pass
         self.log = open(filename, 'w', encoding='utf-8')
 
     def write(self, message):
@@ -38,7 +42,7 @@ class Logger:
         pass
 
 # Initialize automatic logging
-sys.stdout = Logger('data_processing.txt')
+sys.stdout = Logger(str(PROJECT_ROOT / 'data_processing.txt'))
 
 # Add header with timestamp
 print("=" * 80)
@@ -50,8 +54,25 @@ print("=" * 80)
 sys.path.append('..')
 import config
 
+# Seed every RNG so the run is reproducible
+config.set_seed()
+
 # Get class names from dataset (configurable for different datasets)
-class_names = torchvision.datasets.CIFAR10(root=config.DATA_DIR, train=True, download=True).classes
+def _resolve_dataset_class():
+    """Resolve the torchvision dataset class selected by config.DATASET_NAME."""
+    try:
+        dataset_attr = config.SUPPORTED_DATASETS[config.DATASET_NAME]
+    except KeyError as e:
+        raise ValueError(
+            f"Unsupported DATASET_NAME '{config.DATASET_NAME}'. "
+            f"Supported datasets: {sorted(config.SUPPORTED_DATASETS)}. "
+            f"Add an entry to config.SUPPORTED_DATASETS to use another one."
+        ) from e
+    return getattr(torchvision.datasets, dataset_attr)
+
+
+DatasetClass = _resolve_dataset_class()
+class_names = DatasetClass(root=config.get_data_dir(), train=True, download=True).classes
 
 # Define command-line arguments with config.py defaults
 parser = argparse.ArgumentParser(description='SISA Framework Sequential Data Processing')
@@ -63,7 +84,7 @@ args = parser.parse_args()
 project_name = config.PROJECT_NAME
 num_shards = args.num_shards
 num_slices = args.num_slices
-base_dir = f"../{config.PROJECTS_DIR}/{project_name}"
+base_dir = config.get_project_dir(project_name)
 data_info_dir = f"{base_dir}/data_info"
 os.makedirs(base_dir, exist_ok=True)
 os.makedirs(data_info_dir, exist_ok=True)
@@ -72,36 +93,33 @@ os.makedirs(data_info_dir, exist_ok=True)
 print(f"   - Number of Shards: {num_shards}")
 print(f"   - Number of Slices per Shard: {num_slices}")
 
-def load_cifar10_data():
-    """Load CIFAR-10 data and implement a 70-10-20 split (train-validation-test)."""
-    cifar10_train = torchvision.datasets.CIFAR10(root=config.DATA_DIR, train=True, download=True)
-    cifar10_test = torchvision.datasets.CIFAR10(root=config.DATA_DIR, train=False, download=True)
+def load_dataset():
+    """Load the configured dataset using its official train/test split. The official
+    test set is held out untouched (never merged or reshuffled); validation is carved
+    out of the official training pool only, preserving ~70-10-20 proportions."""
+    dataset_train = DatasetClass(root=config.get_data_dir(), train=True, download=True)
+    dataset_test = DatasetClass(root=config.get_data_dir(), train=False, download=True)
 
-    x_train_val = cifar10_train.data
-    y_train_val = np.array(cifar10_train.targets)
-    x_test = cifar10_test.data
-    y_test = np.array(cifar10_test.targets)
-
-    # Combine for unified processing and splitting
-    x_combined = np.concatenate([x_train_val, x_test], axis=0)
-    y_combined = np.concatenate([y_train_val, y_test], axis=0)
+    x_train_val = dataset_train.data
+    y_train_val = np.array(dataset_train.targets)
+    x_test = dataset_test.data
+    y_test = np.array(dataset_test.targets)
 
     # Convert to PyTorch format (C, H, W) and normalize to [0, 1]
-    x_combined = np.transpose(x_combined, (0, 3, 1, 2)).astype(np.float32) / 255.0
-    
+    x_train_val = np.transpose(x_train_val, (0, 3, 1, 2)).astype(np.float32) / 255.0
+    x_test = np.transpose(x_test, (0, 3, 1, 2)).astype(np.float32) / 255.0
+
     print(f"Loaded {config.DATASET_NAME} with preprocessing:")
-    print(f"   - Combined data shape: {x_combined.shape}")
-    print(f"   - Data range: [{x_combined.min():.2f}, {x_combined.max():.2f}]")
+    print(f"   - Official training pool shape: {x_train_val.shape}")
+    print(f"   - Official test set shape (held out, untouched): {x_test.shape}")
+    print(f"   - Data range: [{x_train_val.min():.2f}, {x_train_val.max():.2f}]")
 
-    # Implement 70-10-20 split (train-validation-test)
-    x_train, x_temp, y_train, y_temp = train_test_split(
-        x_combined, y_combined, test_size=0.3, random_state=42, stratify=y_combined
-    )
-    x_val, x_test, y_val, y_test = train_test_split(
-        x_temp, y_temp, test_size=(2/3), random_state=42, stratify=y_temp
+    # Carve validation out of the official training pool only (test set stays canonical)
+    x_train, x_val, y_train, y_val = train_test_split(
+        x_train_val, y_train_val, test_size=0.12, random_state=42, stratify=y_train_val
     )
 
-    total_samples = len(x_combined)
+    total_samples = len(x_train_val) + len(x_test)
     print("Data split completed:")
     print(f"   - Train: {len(x_train):,} samples ({len(x_train)/total_samples:.1%})")
     print(f"   - Validation: {len(x_val):,} samples ({len(x_val)/total_samples:.1%})")
@@ -160,7 +178,7 @@ def create_data_visualizations():
 # --- Main Execution ---
 
 # Load data
-x_train, y_train, split_info, x_test, y_test, x_val, y_val = load_cifar10_data()
+x_train, y_train, split_info, x_test, y_test, x_val, y_val = load_dataset()
 
 # --- NEW: Dynamically calculate normalization statistics from the training data ---
 print("\nCalculating normalization statistics from the training set...")
@@ -235,6 +253,8 @@ metadata = {
     # --- Normalization stats for consistent preprocessing ---
     'normalization_mean': train_mean,
     'normalization_std': train_std,
+    'input_shape': [int(d) for d in x_train.shape[1:]],
+    'random_seed': config.RANDOM_SEED,
     # --- Shard load balancing info ---
     'shard_info': {
         f'shard_{i+1}': {

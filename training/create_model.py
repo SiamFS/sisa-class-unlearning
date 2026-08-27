@@ -8,17 +8,34 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import config
 from datetime import datetime
-from pathlib import Path
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# --- Simplified SISACIFAR10Net to prevent overfitting ---
-class SISACIFAR10Net(nn.Module):
-    def __init__(self, num_classes=10):
-        super(SISACIFAR10Net, self).__init__()
+def _infer_flat_features(conv_layer, input_shape):
+    """Size the first FC layer from a dummy forward pass, so the architecture is
+    independent of image resolution and channel count. eval() lets BatchNorm take n=1."""
+    was_training = conv_layer.training
+    conv_layer.eval()
+    with torch.no_grad():
+        dummy = torch.zeros(1, *input_shape)
+        num_features = conv_layer(dummy).reshape(1, -1).size(1)
+    conv_layer.train(was_training)
+    return num_features
+
+
+# --- Simplified SISANet to prevent overfitting ---
+class SISANet(nn.Module):
+    def __init__(self, num_classes=None, input_shape=None):
+        super(SISANet, self).__init__()
+        if num_classes is None:
+            num_classes = config.get_num_classes()
+        if input_shape is None:
+            input_shape = config.get_input_shape()
+        in_channels = input_shape[0]
+
         # Much simpler conv layers
         self.conv_layer = nn.Sequential(
-            nn.Conv2d(in_channels=3, out_channels=32, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels=in_channels, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),  # 16x16
@@ -34,9 +51,10 @@ class SISACIFAR10Net(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2),  # 4x4
         )
         # Configurable classifier using config parameters
+        flat_features = _infer_flat_features(self.conv_layer, input_shape)
         self.fc_layer = nn.Sequential(
             nn.Dropout(p=config.FC_LAYER_DROPOUT),
-            nn.Linear(config.FC_LAYER_1_INPUT, config.FC_LAYER_1_HIDDEN),
+            nn.Linear(flat_features, config.FC_LAYER_1_HIDDEN),
             nn.BatchNorm1d(config.FC_LAYER_1_HIDDEN),
             nn.ReLU(inplace=True),
             nn.Dropout(p=config.FC_LAYER_DROPOUT),
@@ -55,25 +73,34 @@ class GatingNetwork(nn.Module):
     Simplified architecture: 2 conv layers + 2 FC layers
     Purpose: Route samples to appropriate shards (NOT classify into classes)
     """
-    def __init__(self, num_shards):
+    def __init__(self, num_shards, input_shape=None):
         super(GatingNetwork, self).__init__()
+        if input_shape is None:
+            input_shape = config.get_input_shape()
+        in_channels = input_shape[0]
+
         # Lightweight conv layers - only 2 layers for routing
-        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(32)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
-        
+
         # Simplified FC layers - only 2 layers for routing decision
-        self.fc1 = nn.Linear(64 * 8 * 8, 128)  # After 2 pooling: 32->16->8
+        self._flat_features = _infer_flat_features(
+            nn.Sequential(self.conv1, self.bn1, nn.ReLU(), self.pool,
+                          self.conv2, self.bn2, nn.ReLU(), self.pool),
+            input_shape,
+        )
+        self.fc1 = nn.Linear(self._flat_features, 128)
         self.dropout = nn.Dropout(config.GATING_DROPOUT_RATE)
         self.fc2 = nn.Linear(128, num_shards)  # Direct output to shards
 
     def forward(self, x):
         # Lightweight forward pass for routing
-        x = self.pool(F.relu(self.bn1(self.conv1(x))))  # 32x32 -> 16x16
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))  # 16x16 -> 8x8  
-        x = x.reshape(-1, 64 * 8 * 8)  # Flatten
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))  # e.g. 32x32 -> 16x16
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))  # e.g. 16x16 -> 8x8
+        x = x.reshape(-1, self._flat_features)  # Flatten
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)  # Output: shard probabilities
@@ -100,11 +127,11 @@ class PyTorchModelManager:
         print(f" Model saved: {filepath}")
         return filepath
     
-    def load_model_complete(self, filepath, num_classes=10, device=None, num_shards=None):
+    def load_model_complete(self, filepath, num_classes=None, device=None, num_shards=None):
         device = device if device is not None else self.device
         checkpoint = torch.load(filepath, map_location=device)
-        
-        model_class_name = checkpoint.get('model_class', 'SISACIFAR10Net')
+
+        model_class_name = checkpoint.get('model_class', 'SISANet')
         if model_class_name == 'GatingNetwork' and num_shards is not None:
              model = create_gating_model(num_shards=num_shards)
         else:
@@ -116,17 +143,20 @@ class PyTorchModelManager:
         metadata = checkpoint.get('metadata', {})
         return model, metadata
 
-def create_sisa_model(num_classes=10):
-    return SISACIFAR10Net(num_classes).to(DEVICE)
+# Backwards-compatible alias for checkpoints saved under the previous class name
+SISACIFAR10Net = SISANet
 
-def create_gating_model(num_shards):
-    return GatingNetwork(num_shards).to(DEVICE)
+def create_sisa_model(num_classes=None, input_shape=None):
+    return SISANet(num_classes, input_shape).to(DEVICE)
+
+def create_gating_model(num_shards, input_shape=None):
+    return GatingNetwork(num_shards, input_shape).to(DEVICE)
 
 def save_model_pytorch(model, filepath, metadata=None):
     manager = PyTorchModelManager(device=DEVICE)
     return manager.save_model_complete(model=model, filepath=filepath, metadata=metadata)
 
-def load_model_pytorch(filepath, device=None, num_classes=10, num_shards=None):
+def load_model_pytorch(filepath, device=None, num_classes=None, num_shards=None):
     device = device if device is not None else DEVICE
     manager = PyTorchModelManager(device=device)
     return manager.load_model_complete(filepath, device=device, num_classes=num_classes, num_shards=num_shards)
