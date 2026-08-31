@@ -96,7 +96,7 @@ print(f"   - Number of Slices per Shard: {num_slices}")
 def load_dataset():
     """Load the configured dataset using its official train/test split. The official
     test set is held out untouched (never merged or reshuffled); validation is carved
-    out of the official training pool only, preserving ~70-10-20 proportions."""
+    out of the official training pool only, as a 90-10 split of that pool."""
     dataset_train = DatasetClass(root=config.get_data_dir(), train=True, download=True)
     dataset_test = DatasetClass(root=config.get_data_dir(), train=False, download=True)
 
@@ -116,7 +116,7 @@ def load_dataset():
 
     # Carve validation out of the official training pool only (test set stays canonical)
     x_train, x_val, y_train, y_val = train_test_split(
-        x_train_val, y_train_val, test_size=0.12, random_state=42, stratify=y_train_val
+        x_train_val, y_train_val, test_size=0.10, random_state=42, stratify=y_train_val
     )
 
     total_samples = len(x_train_val) + len(x_test)

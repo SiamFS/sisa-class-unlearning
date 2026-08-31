@@ -109,7 +109,8 @@ Optional: `--num-shards N`, `--num-slices N` (default to the `config.py` values)
 
 CIFAR-10's **official test set is held out untouched** (10,000 images, never merged or
 reshuffled). Validation is carved out of the official 50,000-image training pool only,
-giving 44,000 / 6,000 / 10,000 train / validation / test. Normalisation statistics are
+as a stratified 90-10 split of that pool, giving 45,000 / 5,000 / 10,000 train /
+validation / test. Normalisation statistics are
 computed from the training split alone and stored in `metadata.json`.
 
 ### 2. Training
