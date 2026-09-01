@@ -396,7 +396,51 @@ UNLEARNING_LEARNING_RATE = LEARNING_RATE
 UNLEARNING_LABEL_SMOOTHING = LABEL_SMOOTHING
 
 # Unlearning Success Threshold
-UNLEARNING_SUCCESS_THRESHOLD = 0.45 
+UNLEARNING_SUCCESS_THRESHOLD = 0.45
+
+# --------------------------------------------------------------------------------
+# W34: Unlearning run isolation ("test mode")
+# --------------------------------------------------------------------------------
+# Unlearning normally mutates the project IN PLACE -- it rewrites the shard slices,
+# overwrites models/, and updates the metadata. That is correct for a real deletion
+# (the whole point is that the data is gone), but it means the trained baseline is
+# consumed by the first run: comparing two unlearning configurations, or re-running
+# after a bug fix, costs a full retrain of the whole system.
+#
+# With test mode on, each run instead clones the project to its own timestamped
+# directory and unlearns there, leaving the baseline pristine and reusable. The clone
+# hard-links its .npy files (utils/project_io.clone_file), so it costs ~19 MB and a
+# fraction of a second rather than a full copy of sisa_data.
+#
+# Off by default: the in-place behaviour is the real deletion semantics, and a run that
+# silently redirected its output would be the wrong default for an unlearning system.
+# Enable here, or per invocation with `--test-mode` (and `--no-test-mode` to override
+# this setting back off).
+UNLEARNING_TEST_MODE = False
+
+# Directory name for a test-mode run:
+#   {project}_{prefix}_{classes}_{timestamp}
+# e.g. cifar10_sisa_pytorch_unlearn_cat_20260902_011432
+# The timestamp keeps every run side by side so two runs can be compared directly;
+# nothing prunes them, so delete old ones yourself when you are done with them.
+UNLEARNING_TEST_MODE_PREFIX = 'unlearn'
+
+# --------------------------------------------------------------------------------
+# W34: Router (gating network) retraining after unlearning
+# --------------------------------------------------------------------------------
+# TRUE IS THE ONLY SETTING THAT PRESERVES THE EXACTNESS CLAIM.
+#
+# The gate is trained on images from every class, including the deleted one, so a gate
+# carried over unchanged is by inspection not reproducible from D \ Dc -- it fails the
+# Cao & Yang / Bourtoule definition of exact unlearning even though (per
+# GATE_RETRAINING_ANALYSIS.md) no attack recovers anything from it. Exactness is a
+# lineage property, not an attack-resistance property.
+#
+# Set False ONLY to produce the skip-the-retrain ablation that GATE_RETRAINING_ANALYSIS.md
+# argues about -- e.g. to measure how much of the post-unlearning accuracy and of the
+# unlearning wall-clock the router retrain actually accounts for. Results produced with
+# this off must not be reported as exact unlearning. The run prints a warning saying so.
+UNLEARNING_RETRAIN_GATE = True
 
 # ================================================================================
 # SEARCH AND VISUALIZATION PARAMETERS
@@ -555,12 +599,24 @@ def get_augmentation_config(level='baseline', is_unlearning=False):
     Returns:
         dict: Augmentation configuration (NO random erasing)
     """
-    # Base multiplier for unlearning (more conservative)
-    multiplier = 0.6 if is_unlearning else 1.0
+    # W34: `is_unlearning` MUST NOT change augmentation strength -- it only labels the
+    # returned config's `reason` for the logs.
+    #
+    # This used to be `0.6 if is_unlearning else 1.0`, which gave the unlearning retrain
+    # crop_padding=2 / cutout=0.3 while ordinary training AND experiments/scratch_reference.py
+    # both used crop_padding=4 / cutout=0.5. That is exactly the defect W27 fixed for the
+    # learning rate and label smoothing, missed here. Exactness is defined as
+    #     Unlearn( Train(D u Dc), Dc )  ==  Train(D \ Dc)
+    # so the retrain on the left must run the SAME `Train` as the scratch reference on
+    # the right. With the strengths differing, exactness_eval.py's parameter distance,
+    # prediction agreement and output KL all measured an augmentation-recipe gap on top
+    # of any real unlearning effect.
+    #
+    # Kept as a literal 1.0 rather than deleted so the intent is explicit: the retrain
+    # deliberately runs at full training strength. Do not reintroduce a multiplier here.
+    multiplier = 1.0
     # Geometric augmentation is shared by every level; crop padding stays an integer.
     crop_padding = max(1, int(round(BASELINE_CROP_PADDING * multiplier)))
-    # Milder cutout during unlearning retrains, matching the existing `multiplier`
-    # convention for the other augmentation strengths.
     cutout_fraction = BASELINE_CUTOUT_FRACTION * multiplier
 
     configs = {

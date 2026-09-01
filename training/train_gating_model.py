@@ -11,6 +11,7 @@ import torchvision.transforms as T
 # Import global configuration
 import config
 from utils.seeding import seeded_generator
+from utils.data_io import load_images
 
 from training.create_model import create_gating_model, save_model_pytorch, DEVICE
 from training.augmentation import PerSampleAugmenter
@@ -69,7 +70,7 @@ def train_gating(num_shards, base_dir, num_slices, dataset_mean, dataset_std, ex
         for slice_idx in range(num_slices[shard_idx]):
             slice_x_path = os.path.join(sisa_data_dir, f"shards/shard_{shard_idx+1}/slice_{slice_idx}_x.npy")
             if os.path.exists(slice_x_path):
-                x_data = np.load(slice_x_path)
+                x_data = load_images(slice_x_path)
                 y_data = np.load(slice_x_path.replace('_x.npy', '_y.npy'))
                 
                 # CRITICAL FIX: Filter out excluded/unlearned classes

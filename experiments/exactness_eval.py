@@ -22,6 +22,7 @@ import torchvision.transforms as T
 from sklearn.metrics import roc_auc_score, roc_curve
 
 import config
+from utils.data_io import load_images
 from training.create_model import load_model_pytorch, DEVICE
 from unlearning.sisa_unlearning import SISAUnlearning
 from plots import (
@@ -161,7 +162,7 @@ def run_exactness_eval(source_project: str, class_name: str, model_name: str = N
     # apply to the scratch system too.
     scratch_shard_indices = list(unlearned_shard_indices)
 
-    x_test = np.load(os.path.join(config.PROJECTS_DIR, source_project, "sisa_data", "test_data", "x_test.npy"))
+    x_test = load_images(os.path.join(config.PROJECTS_DIR, source_project, "sisa_data", "test_data", "x_test.npy"))
     y_test = np.load(os.path.join(config.PROJECTS_DIR, source_project, "sisa_data", "test_data", "y_test.npy"))
 
     print(f"\n{'='*70}\nComputing exactness metrics\n{'='*70}")

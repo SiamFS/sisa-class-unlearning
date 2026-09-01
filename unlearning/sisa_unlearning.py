@@ -3,6 +3,7 @@ import os
 import json
 import argparse
 import time
+from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,6 +17,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 # Import global configuration
 import config
 from utils.seeding import set_seed
+from utils.data_io import load_images, save_images
+from utils.project_io import clone_project
 
 set_seed(config.SEED)
 
@@ -25,7 +28,6 @@ from training.train_model import (
 from plots import (
     routing_comparison,
     create_training_visualizations,
-    create_confusion_matrix,
     create_shard_confusion_matrix,
     create_overall_sisa_confusion_matrix,
     create_overall_sisa_roc_curve,
@@ -112,7 +114,7 @@ class SISAUnlearning:
         y_val_path = os.path.join(self.data_dir, "validation_data/y_validation.npy")
         if os.path.exists(x_val_path) and os.path.exists(y_val_path):
             print("Global validation data loaded.")
-            return (np.load(x_val_path), np.load(y_val_path))
+            return (load_images(x_val_path), np.load(y_val_path))
         return None
 
     def _load_slice_data(self, shard_idx: int, slice_idx: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -120,7 +122,7 @@ class SISAUnlearning:
         x_path = os.path.join(shard_path, f"slice_{slice_idx}_x.npy")
         y_path = os.path.join(shard_path, f"slice_{slice_idx}_y.npy")
         if os.path.exists(x_path):
-            X, y = np.load(x_path), np.load(y_path)
+            X, y = load_images(x_path), np.load(y_path)
             if X.size == 0: return None, None
             return X, y
         return None, None
@@ -128,8 +130,27 @@ class SISAUnlearning:
     def _save_slice_data(self, shard_idx: int, slice_idx: int, X: np.ndarray, y: np.ndarray):
         shard_path = os.path.join(self.data_dir, f"shards/shard_{shard_idx+1}")
         os.makedirs(shard_path, exist_ok=True)
-        np.save(os.path.join(shard_path, f"slice_{slice_idx}_x.npy"), X)
-        np.save(os.path.join(shard_path, f"slice_{slice_idx}_y.npy"), y)
+        # Write to a temp file and os.replace() it in, rather than np.save-ing over the
+        # existing path. Two reasons:
+        #   * np.save opens 'wb', which truncates -- a crash mid-write leaves a
+        #     half-written slice that np.load can no longer read. A slice is ~55 MB, so
+        #     that window is not small.
+        #   * os.replace installs a NEW inode at the path, which BREAKS hard links
+        #     instead of writing through them. experiments/scratch_reference.py clones a
+        #     project by hard-linking its .npy files, and this is the only writer that
+        #     touches a slice inside such a clone. An in-place truncate here would reach
+        #     straight through the link and corrupt the pristine SOURCE project.
+        # If you add another .npy writer that can run against a cloned project, it must
+        # preserve this replace-don't-truncate invariant.
+        for name, arr in ((f"slice_{slice_idx}_x.npy", X), (f"slice_{slice_idx}_y.npy", y)):
+            final_path = os.path.join(shard_path, name)
+            # Temp name still ends in .npy so np.save doesn't append a second suffix.
+            tmp_path = f"{final_path}.tmp{os.getpid()}.npy"
+            # save_images re-encodes the float32 pixels back to uint8 (W34) so a slice
+            # rewritten by unlearning stays in the same compact format data processing
+            # wrote it in; labels pass through untouched.
+            save_images(tmp_path, arr)
+            os.replace(tmp_path, final_path)
 
     def _save_forgotten_class_samples(self, class_to_unlearn: int, num_samples=16):
         # Initialize if first call (single unlearn), otherwise append (batch unlearn)
@@ -310,9 +331,6 @@ class SISAUnlearning:
         self.data_removal_time = 0
         self.retraining_time = 0
 
-        # Backup test set before any modifications
-        self._backup_test_set_if_needed()
-        
         self._save_forgotten_class_samples(class_idx)
         
         # Display training baseline metrics at the start of unlearning
@@ -537,9 +555,6 @@ class SISAUnlearning:
         self.forgotten_samples_x = []
         self.forgotten_samples_y = []
 
-        # Backup test set before any modifications
-        self._backup_test_set_if_needed()
-        
         # Save forgotten samples for all classes
         print("\n" + "="*60)
         print("Step 0: Saving sample images from classes to be forgotten...")
@@ -1096,18 +1111,31 @@ class SISAUnlearning:
         gating_path = os.path.join(self.models_dir, "gating_model.pth")
         self.gating_retrain_time = 0.0
         if os.path.exists(gating_path):
-            print("\n--- Retraining gating network to exclude all unlearned classes ---")
-            gate_retrain_start = time.time()
-            train_gating(
-                num_shards=self.num_shards,
-                base_dir=self.base_dir,
-                num_slices=self.slices_per_shard or self.num_slices,
-                dataset_mean=self.dataset_mean,
-                dataset_std=self.dataset_std,
-                excluded_classes=self.get_unlearned_classes(),
-            )
-            self.gating_retrain_time = time.time() - gate_retrain_start
-            print(f"Gating Retrain Time: {self.gating_retrain_time:.2f} seconds")
+            # W34: the retrain is skippable ONLY as an ablation. See
+            # config.UNLEARNING_RETRAIN_GATE and GATE_RETRAINING_ANALYSIS.md -- a gate
+            # carried over unchanged was trained on the deleted class's images, so the
+            # system it routes is no longer reproducible from D \ Dc.
+            if getattr(config, 'UNLEARNING_RETRAIN_GATE', True):
+                print("\n--- Retraining gating network to exclude all unlearned classes ---")
+                gate_retrain_start = time.time()
+                train_gating(
+                    num_shards=self.num_shards,
+                    base_dir=self.base_dir,
+                    num_slices=self.slices_per_shard or self.num_slices,
+                    dataset_mean=self.dataset_mean,
+                    dataset_std=self.dataset_std,
+                    excluded_classes=self.get_unlearned_classes(),
+                )
+                self.gating_retrain_time = time.time() - gate_retrain_start
+                print(f"Gating Retrain Time: {self.gating_retrain_time:.2f} seconds")
+            else:
+                print("\n" + "!" * 78)
+                print("!! ABLATION: router retrain SKIPPED (config.UNLEARNING_RETRAIN_GATE = False)")
+                print("!! The gate still carries weights trained on "
+                      f"'{', '.join(self.class_names[c] for c in self.get_unlearned_classes())}' images.")
+                print("!! This run is NOT exact unlearning and must not be reported as such.")
+                print("!" * 78)
+            # Loaded either way -- an un-retrained gate is still the router this run uses.
             gating_model, _ = load_model_pytorch(gating_path, num_shards=self.num_shards)
             gating_model.eval()
         else:
@@ -1125,7 +1153,7 @@ class SISAUnlearning:
         # what gate-free routing costs on the unlearned system is the number that
         # says whether that retrain was worth keeping.
         try:
-            x_test = np.load(os.path.join(self.test_data_dir, "x_test.npy"))
+            x_test = load_images(os.path.join(self.test_data_dir, "x_test.npy"))
             y_test = np.load(os.path.join(self.test_data_dir, "y_test.npy"))
             self.routing_comparison_result = routing_comparison(
                 shard_models, shard_class_indices, self.class_names,
@@ -1149,7 +1177,7 @@ class SISAUnlearning:
             print("\n" + "="*20 + " Self-Routing Evaluation (raw, no confidence threshold) " + "="*20)
         else:
             print("\n" + "="*20 + f" DEPLOYMENT-ONLY Evaluation with Confidence Threshold={threshold:.2f} (NOT exactness evidence) " + "="*20)
-        x_test = np.load(os.path.join(self.test_data_dir, "x_test.npy"))
+        x_test = load_images(os.path.join(self.test_data_dir, "x_test.npy"))
         y_test = np.load(os.path.join(self.test_data_dir, "y_test.npy"))
 
         for model in shard_models:
@@ -1509,19 +1537,13 @@ class SISAUnlearning:
         # Get unlearned classes from metadata
         unlearned_classes = self.get_unlearned_classes()
         
-        # ROC curves - ALL classes including deleted (to show they have poor performance)
-        print("   Creating ROC curves with ALL classes (including deleted)...")
-        create_overall_sisa_roc_curve(
-            shard_models,
-            shard_class_indices,
-            x_test,
-            y_test,
-            class_names,
-            self.reports_dir,
-            'with_deleted_classes',
-            unlearned_classes=None,  # Don't filter - show ALL classes
-            precomputed=raw_eval_precomputed,
-        )
+        # W34: no ROC here. After unlearning the deleted class has no output column
+        # anywhere (_resize_model_head drops it; _scatter_local_to_global leaves unowned
+        # columns at 0), so its score vector is identically zero and roc_curve returns
+        # AUC = 0.5000 -- the value ANY constant score gives. A perfectly unlearned
+        # model, a never-trained-on-it model and a model with a missing column are
+        # indistinguishable on that plot, so it was evidence of nothing. The confusion
+        # matrix below IS evidence: the deleted class's row collapses to zero recall.
 
         # Confusion matrix - ALL classes including deleted
         print("   Creating confusion matrix with ALL classes (including deleted)...")
@@ -1537,55 +1559,12 @@ class SISAUnlearning:
             precomputed=raw_eval_precomputed,
         )
         
-        # ============================================================================
-        # GENERATE PLOTS FOR ACTIVE CLASSES ONLY (Clean Performance Metrics)
-        # ============================================================================
-        print("\n" + "=" * 50)
-        print("CREATING VISUALIZATIONS FOR UNLEARNING EVALUATION (ACTIVE CLASSES)")
-        print("=" * 50)
-        
-        create_overall_sisa_roc_curve(
-            shard_models,
-            shard_class_indices,
-            x_test,
-            y_test,
-            class_names,
-            self.reports_dir,
-            'unlearning_evaluation',
-            unlearned_classes=unlearned_classes,  # Exclude deleted classes
-            precomputed=raw_eval_precomputed,
-        )
+        # W34: the 'unlearning_evaluation' ROC / confusion matrix / training curves that
+        # used to be regenerated here were byte-identical to the 'active_classes_only'
+        # figures produced above -- same unlearned_classes (both from the cached
+        # get_unlearned_classes()), same `precomputed` inference pass, same branch inside
+        # each plot function. Only the filename differed.
 
-        # Create overall confusion matrix showing only active classes
-        print("\n" + "=" * 50)
-        print("CREATING OVERALL SISA SYSTEM CONFUSION MATRIX (AFTER UNLEARNING)")
-        print("=" * 50)
-
-        create_overall_sisa_confusion_matrix(
-            shard_models,
-            shard_class_indices,
-            x_test,
-            y_test,
-            class_names,
-            self.reports_dir,
-            'unlearning_evaluation',
-            unlearned_classes=unlearned_classes,  # Exclude unlearned classes
-            precomputed=raw_eval_precomputed,
-        )
-        
-        # Generate updated training curves showing unlearning impact
-        print("\n" + "=" * 50)
-        print("CREATING OVERALL SISA SYSTEM TRAINING CURVES (AFTER UNLEARNING)")
-        print("=" * 50)
-        
-        # Create training curves from unlearning histories
-        if hasattr(self, 'unlearning_histories') and self.unlearning_histories:
-            create_overall_sisa_training_curves(
-                self.unlearning_histories,
-                self.reports_dir,
-                'unlearning_evaluation'
-            )
-        
         # Return gating accuracy and classification report (true SISA approach)
         return gating_accuracy, gating_accuracy, report_dict
 
@@ -1694,19 +1673,6 @@ class SISAUnlearning:
             plt.close()
             
             print(f"     - Saved: {os.path.basename(save_path)}")
-
-    def _backup_test_set_if_needed(self):
-        """Create backup of original test set if it doesn't exist"""
-        x_test_path = os.path.join(self.test_data_dir, "x_test.npy")
-        y_test_path = os.path.join(self.test_data_dir, "y_test.npy")
-        x_backup_path = os.path.join(self.test_data_dir, "x_test_original.npy")
-        y_backup_path = os.path.join(self.test_data_dir, "y_test_original.npy")
-        
-        if not os.path.exists(x_backup_path) and os.path.exists(x_test_path):
-            import shutil
-            shutil.copy2(x_test_path, x_backup_path)
-            shutil.copy2(y_test_path, y_backup_path)
-            print("   - Created backup of original test set")
 
     def _permanently_remove_class_from_test_set(self, class_to_remove: int):
         """
@@ -1923,21 +1889,16 @@ class SISAUnlearning:
         x_test_current_path = os.path.join(self.data_dir, "test_data/x_test.npy")
         y_test_current_path = os.path.join(self.data_dir, "test_data/y_test.npy")
         
-        # Fallback to original/backup files if current files are already modified
-        if not (os.path.exists(x_test_current_path) and os.path.exists(y_test_current_path)):
-            x_test_current_path = os.path.join(self.data_dir, "test_data/x_test_original.npy")
-            y_test_current_path = os.path.join(self.data_dir, "test_data/y_test_original.npy")
-            
-        # Final fallback to backup files
-        if not (os.path.exists(x_test_current_path) and os.path.exists(y_test_current_path)):
-            x_test_current_path = os.path.join(self.data_dir, "test_data/x_test_backup.npy")
-            y_test_current_path = os.path.join(self.data_dir, "test_data/y_test_backup.npy")
-        
+        # W34: the _original/_backup fallbacks that used to sit here were dead. They
+        # guarded against x_test.npy having been modified, but the only writer that
+        # would have done so (_permanently_remove_class_from_test_set) is disabled and
+        # has no call sites, so the test set is never touched. The backup that fed them
+        # was a ~30 MB copy written on every unlearning run and read by nothing.
         if not (os.path.exists(x_test_current_path) and os.path.exists(y_test_current_path)):
             print("   Warning: Test data not found. Cannot evaluate deleted class performance.")
             return
             
-        x_test_full = np.load(x_test_current_path)
+        x_test_full = load_images(x_test_current_path)
         y_test_full = np.load(y_test_current_path)
         
         # Split data: deleted class vs remaining classes
@@ -2124,8 +2085,29 @@ Examples:
     parser.add_argument('--index', type=int, help='Index of specific sample to forget')
     parser.add_argument('--project-name', type=str, default='cifar10_sisa_pytorch', help='Project name')
     parser.add_argument('--model-name', type=str, default='custom_cnn', help='Model architecture name')
+    # W34: run against a throwaway clone instead of mutating the trained baseline.
+    # Defaults to config.UNLEARNING_TEST_MODE; these two override it either way.
+    parser.add_argument('--test-mode', dest='test_mode', action='store_true', default=None,
+                        help='Unlearn on a timestamped CLONE, leaving the baseline project untouched.')
+    parser.add_argument('--no-test-mode', dest='test_mode', action='store_false',
+                        help='Force in-place unlearning even if config.UNLEARNING_TEST_MODE is on.')
 
     args = parser.parse_args()
+
+    # W34: resolve test mode and clone BEFORE logging is set up, so the run's log lands
+    # in the directory the run actually writes to.
+    test_mode = getattr(config, 'UNLEARNING_TEST_MODE', False) if args.test_mode is None else args.test_mode
+    source_project = args.project_name
+    if test_mode:
+        if not args.class_name:
+            print("Error: test mode requires --class-name (the run directory is named after the classes).")
+            sys.exit(1)
+        prefix = getattr(config, 'UNLEARNING_TEST_MODE_PREFIX', 'unlearn')
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.project_name = f"{source_project}_{prefix}_{'_'.join(args.class_name)}_{stamp}"
+        print(f"Test mode: cloning '{source_project}' -> '{args.project_name}' "
+              f"(baseline left untouched)...")
+        clone_project(source_project, args.project_name)
 
     # Project-scoped, timestamped logging (W10) -- now that --project-name is known.
     _restore_logging, _log_path = setup_run_logging(
@@ -2145,7 +2127,13 @@ Examples:
         print("SISA MACHINE UNLEARNING")
         print("="*80)
         print(f"Project: {args.project_name}")
+        if test_mode:
+            print(f"Mode: TEST -- clone of '{source_project}'; the baseline project is NOT modified")
+        else:
+            print("Mode: IN-PLACE -- this project's data and models will be permanently modified")
         print(f"Model: {args.model_name}")
+        if not getattr(config, 'UNLEARNING_RETRAIN_GATE', True):
+            print("Router: retrain DISABLED (ablation) -- results are not exact unlearning")
         if args.class_name:
             if len(args.class_name) == 1:
                 print(f"Target: Forget class '{args.class_name[0]}'")

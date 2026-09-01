@@ -66,6 +66,7 @@ from plots import fit_ensemble_params
 import tempfile, shutil
 from plots import load_shard_class_indices
 from utils.run_logging import setup_run_logging
+from utils.data_io import load_images
 
 
 def _load_project(project_name: str):
@@ -87,7 +88,7 @@ def _load_project(project_name: str):
             shard_metadatas.append(json.load(f))
 
     validation_data = (
-        np.load(os.path.join(sisa_data_dir, "validation_data/x_validation.npy")),
+        load_images(os.path.join(sisa_data_dir, "validation_data/x_validation.npy")),
         np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy")),
     )
     return (sisa_data_dir, num_shards, slices_per_shard, class_names, dataset_mean,
@@ -98,7 +99,7 @@ def _load_slice(sisa_data_dir: str, shard_idx: int, slice_idx: int):
     x_path = os.path.join(sisa_data_dir, f"shards/shard_{shard_idx+1}/slice_{slice_idx}_x.npy")
     if not os.path.exists(x_path):
         return None, None
-    return np.load(x_path), np.load(x_path.replace('_x.npy', '_y.npy'))
+    return load_images(x_path), np.load(x_path.replace('_x.npy', '_y.npy'))
 
 
 def _cumulative_classes(sisa_data_dir: str, shard_idx: int, slice_idx: int, num_slices_seen: dict):

@@ -39,6 +39,7 @@ from sklearn.metrics import classification_report
 import config
 from utils.seeding import set_seed
 from utils.run_logging import setup_run_logging
+from utils.data_io import load_images
 from training.train_model import train_model
 from training.create_model import save_model_pytorch, DEVICE
 
@@ -58,7 +59,7 @@ def load_all_training_data(sisa_data_dir: str, metadata: dict):
             x_path = os.path.join(sisa_data_dir, f"shards/shard_{shard_idx+1}/slice_{slice_idx}_x.npy")
             if not os.path.exists(x_path):
                 continue
-            xs.append(np.load(x_path))
+            xs.append(load_images(x_path))
             ys.append(np.load(x_path.replace('_x.npy', '_y.npy')))
     return np.concatenate(xs), np.concatenate(ys)
 
@@ -91,9 +92,9 @@ def main():
               f"lr: {config.LEARNING_RATE}   label smoothing: {config.LABEL_SMOOTHING}")
 
         x_train, y_train = load_all_training_data(sisa_data_dir, metadata)
-        x_val = np.load(os.path.join(sisa_data_dir, "validation_data/x_validation.npy"))
+        x_val = load_images(os.path.join(sisa_data_dir, "validation_data/x_validation.npy"))
         y_val = np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy"))
-        x_test = np.load(os.path.join(sisa_data_dir, "test_data/x_test.npy"))
+        x_test = load_images(os.path.join(sisa_data_dir, "test_data/x_test.npy"))
         y_test = np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy"))
 
         excluded_idx = None

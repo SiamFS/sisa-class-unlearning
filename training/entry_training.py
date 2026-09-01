@@ -16,6 +16,7 @@ import torchvision.transforms as T
 # Import global configuration
 import config
 from utils.seeding import set_seed
+from utils.data_io import load_images
 
 set_seed(config.SEED)
 
@@ -25,7 +26,6 @@ from training.train_model import (
 )
 from plots import (
     create_training_visualizations,
-    create_confusion_matrix,
     create_shard_confusion_matrix,
     create_gating_routing_barplots,
     create_overall_sisa_confusion_matrix,
@@ -70,7 +70,7 @@ eval_transforms = T.Compose([T.Normalize(DATASET_MEAN, DATASET_STD)])
 def load_slice(shard_idx, slice_idx):
     path = os.path.join(sisa_data_dir, f"shards/shard_{shard_idx+1}/slice_{slice_idx}_x.npy")
     if not os.path.exists(path): return None, None
-    X = np.load(path)
+    X = load_images(path)
     y = np.load(path.replace('_x.npy', '_y.npy'))
     return X, y
 
@@ -147,7 +147,7 @@ def get_true_label_validation_data(shard_idx, cumulative_classes, validation_dat
 
 def evaluate_with_self_routing(shard_models, shard_class_indices, class_names, threshold=None, gating_model=None):
     print("\n" + "="*20 + " Final SISA System Evaluation " + "="*20)
-    x_test = np.load(os.path.join(sisa_data_dir, "test_data/x_test.npy"))
+    x_test = load_images(os.path.join(sisa_data_dir, "test_data/x_test.npy"))
     y_test = np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy"))
 
     for model in shard_models:
@@ -381,7 +381,7 @@ if __name__ == "__main__":
             all_shard_histories.append([])  # Empty history for pre-trained model
             continue
         else:
-            validation_data = (np.load(os.path.join(sisa_data_dir, "validation_data/x_validation.npy")), np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy")))
+            validation_data = (load_images(os.path.join(sisa_data_dir, "validation_data/x_validation.npy")), np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy")))
             for j in range(slices_per_shard[i]):
                 print(f"\n--- Training Slice {j + 1} of Shard {i+1} ---")
                 x_slice, y_slice = load_slice(i, j)
@@ -470,7 +470,7 @@ if __name__ == "__main__":
                         )
                     
                     if current_model is not None:
-                        x_test_full = np.load(os.path.join(sisa_data_dir, "test_data/x_test.npy"))
+                        x_test_full = load_images(os.path.join(sisa_data_dir, "test_data/x_test.npy"))
                         y_test_full = np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy"))
                         create_shard_confusion_matrix(
                             current_model,
@@ -506,7 +506,7 @@ if __name__ == "__main__":
     # Attaches two scalars to gating_model; _run_sisa_batch falls back to plain gate
     # routing if this is skipped or if the blend loses to the gate on validation.
     if gating_model is not None and getattr(config, 'ROUTING_MODE', 'gating') == 'ensemble':
-        x_val_ens = np.load(os.path.join(sisa_data_dir, "validation_data/x_validation.npy"))
+        x_val_ens = load_images(os.path.join(sisa_data_dir, "validation_data/x_validation.npy"))
         y_val_ens = np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy"))
         fit_ensemble_params(
             all_shard_final_models, gating_model, shard_class_indices, class_names,
@@ -521,7 +521,7 @@ if __name__ == "__main__":
     # trade is recorded per-run instead of requiring a separate probe.
     routing_table = routing_comparison(
         all_shard_final_models, shard_class_indices, class_names,
-        x_test=np.load(os.path.join(sisa_data_dir, "test_data/x_test.npy")),
+        x_test=load_images(os.path.join(sisa_data_dir, "test_data/x_test.npy")),
         y_test=np.load(os.path.join(sisa_data_dir, "test_data/y_test.npy")),
         normalize=eval_transforms, gating_model=gating_model,
     )
@@ -537,7 +537,7 @@ if __name__ == "__main__":
 
     # Load test data for final evaluation
     test_data_dir = os.path.join(sisa_data_dir, "test_data")
-    x_test = np.load(os.path.join(test_data_dir, "x_test.npy"))
+    x_test = load_images(os.path.join(test_data_dir, "x_test.npy"))
     y_test = np.load(os.path.join(test_data_dir, "y_test.npy"))
 
     create_overall_sisa_confusion_matrix(

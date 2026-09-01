@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.'))
 
 # Import global configuration
 import config
+from utils.data_io import load_images
 
 from training.create_model import load_model_pytorch, DEVICE
 from plots import _run_sisa_batch  # Use TRUE SISA routing logic
@@ -85,7 +86,7 @@ class SISASearchTool:
             raise FileNotFoundError(f"SISA test data not found at {x_test_path} or {y_test_path}")
         
         # Load the processed test data
-        test_data = np.load(x_test_path)
+        test_data = load_images(x_test_path)
         test_labels = np.load(y_test_path)
         
         print(f"Loaded {len(test_data)} current test samples")

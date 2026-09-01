@@ -81,9 +81,18 @@ def _create_class_sequential_slices(X, y, num_slices, indices, class_names):
             class_data_pointers[class_idx] = end_ptr
 
     # 4. Finalize slices
-    final_slices = [np.vstack(parts) if parts else np.array([]) for parts in slices_temp_X]
-    final_y_slices = [np.concatenate(parts) if parts else np.array([]) for parts in slices_temp_y]
-    final_slice_indices = [np.concatenate(parts) if parts else np.array([]) for parts in slices_temp_indices]
+    # W34: an empty slice used to become `np.array([])` -- shape (0,), dtype float64 --
+    # where every consumer expects the shard's own shape and dtype, e.g. (0, 3, 32, 32)
+    # uint8 for images. Guarded everywhere by `X.size == 0` checks today, but it made an
+    # empty slice unsaveable in the pipeline's own format. Preserve the trailing
+    # dimensions and dtype instead.
+    empty_x = np.empty((0,) + X.shape[1:], dtype=X.dtype)
+    empty_y = np.empty((0,), dtype=y.dtype)
+    empty_idx = np.empty((0,), dtype=np.asarray(indices).dtype)
+
+    final_slices = [np.vstack(parts) if parts else empty_x.copy() for parts in slices_temp_X]
+    final_y_slices = [np.concatenate(parts) if parts else empty_y.copy() for parts in slices_temp_y]
+    final_slice_indices = [np.concatenate(parts) if parts else empty_idx.copy() for parts in slices_temp_indices]
     
     # 5. Calculate final distributions
     class_distributions = []

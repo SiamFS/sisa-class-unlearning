@@ -25,21 +25,20 @@ import numpy as np
 
 import config
 from utils.seeding import set_seed
+from utils.data_io import load_images
+from utils.project_io import clone_project
 from training.create_model import save_model_pytorch, DEVICE
 from training.train_model import train_model
 from training.replay_buffer import add_to_replay_buffer, compute_replay_ratio
 from unlearning.sisa_unlearning import SISAUnlearning
 
 
+# W34: the clone helpers now live in utils/project_io.py, because unlearning test mode
+# (config.UNLEARNING_TEST_MODE) needs them too and importing them from here would be a
+# circular import (this module imports SISAUnlearning). `_copy_project` is kept as the
+# public name because experiments/exactness_eval.py imports it from here.
 def _copy_project(source_project: str, dest_project: str) -> str:
-    src = os.path.join(config.PROJECTS_DIR, source_project)
-    dst = os.path.join(config.PROJECTS_DIR, dest_project)
-    if not os.path.isdir(src):
-        raise FileNotFoundError(f"Source project not found: {src}")
-    if os.path.exists(dst):
-        shutil.rmtree(dst)
-    shutil.copytree(src, dst)
-    return dst
+    return clone_project(source_project, dest_project)
 
 
 def snapshot_class_training_samples(source_project: str, model_name: str, class_name: str):
@@ -107,7 +106,7 @@ def train_shard_from_scratch(scratch_project: str, model_name: str, shard_idx: i
     print(f"   - Scratch shard {shard_idx+1}: training with a fixed {len(head_classes)}-class head from slice 1")
 
     validation_data = (
-        np.load(os.path.join(sisa_data_dir, "validation_data/x_validation.npy")),
+        load_images(os.path.join(sisa_data_dir, "validation_data/x_validation.npy")),
         np.load(os.path.join(sisa_data_dir, "validation_data/y_validation.npy")),
     )
 
@@ -115,7 +114,7 @@ def train_shard_from_scratch(scratch_project: str, model_name: str, shard_idx: i
         x_path = os.path.join(sisa_data_dir, f"shards/shard_{shard_idx+1}/slice_{slice_idx}_x.npy")
         if not os.path.exists(x_path):
             return None, None
-        X = np.load(x_path)
+        X = load_images(x_path)
         if X.size == 0:
             return None, None
         return X, np.load(x_path.replace('_x.npy', '_y.npy'))

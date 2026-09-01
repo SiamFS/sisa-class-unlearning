@@ -47,6 +47,7 @@ import torchvision.transforms as T
 
 import config
 from utils.seeding import set_seed
+from utils.data_io import load_images
 from training.create_model import load_model_pytorch, DEVICE
 from plots import load_shard_class_indices
 
@@ -196,9 +197,9 @@ def main():
         gating_model.eval()
 
     # --- data ---------------------------------------------------------------------
-    x_test = np.load(os.path.join(sisa_dir, "test_data", "x_test.npy"))
+    x_test = load_images(os.path.join(sisa_dir, "test_data", "x_test.npy"))
     y_test = np.load(os.path.join(sisa_dir, "test_data", "y_test.npy"))
-    x_val = np.load(os.path.join(sisa_dir, "validation_data", "x_validation.npy"))
+    x_val = load_images(os.path.join(sisa_dir, "validation_data", "x_validation.npy"))
     y_val = np.load(os.path.join(sisa_dir, "validation_data", "y_validation.npy"))
 
     # Training data per shard, for class prototypes / covariance (ARCANE-style r_i).
@@ -208,7 +209,7 @@ def main():
         for sl in range(num_slices):
             xp = os.path.join(sisa_dir, "shards", f"shard_{si+1}", f"slice_{sl}_x.npy")
             if os.path.exists(xp):
-                xs.append(np.load(xp))
+                xs.append(load_images(xp))
                 ys.append(np.load(xp.replace('_x.npy', '_y.npy')))
         train_x_per_shard.append(np.concatenate(xs))
         train_y_per_shard.append(np.concatenate(ys))

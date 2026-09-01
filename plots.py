@@ -1089,338 +1089,6 @@ Training Summary:
 	return save_path
 
 
-def create_roc_curve(
-	model,
-	x_test,
-	y_test,
-	class_names,
-	shard_idx,
-	slice_idx,
-	save_dir,
-	training_type="training",
-	active_classes=None,
-	device: Optional[torch.device] = None,
-):
-	"""Create ROC curve for the trained model with proper class-probability alignment and specialist filtering."""
-
-	model.eval()
-	all_probs = []
-	all_labels = []
-	device = _resolve_device(device, model)
-
-	with torch.no_grad():
-		for i in range(0, len(x_test), 64):
-			batch_x = torch.from_numpy(x_test[i : i + 64]).float().to(device)
-			batch_y = y_test[i : i + 64]
-
-			outputs = torch.softmax(model(batch_x), dim=1)
-			all_probs.extend(outputs.cpu().numpy())
-			all_labels.extend(batch_y)
-
-	all_probs = np.array(all_probs)
-	all_labels = np.array(all_labels)
-
-	if active_classes is not None:
-		print(f"   Filtering validation data to specialist classes: {active_classes}")
-
-		specialist_mask = np.isin(all_labels, active_classes)
-
-		all_labels = all_labels[specialist_mask]
-		all_probs = all_probs[specialist_mask]
-		all_probs = _apply_temperature_numpy(all_probs, config.SPECIALIST_ROC_TEMPERATURE)
-
-		print(f"   Original samples: {len(y_test)}")
-		print(f"   Filtered samples: {len(all_labels)}")
-		print(f"   Specialist classes in filtered data: {sorted(np.unique(all_labels))}")
-
-		if len(all_labels) == 0:
-			print("   WARNING: No validation samples for specialist classes!")
-			plt.figure(figsize=(12, 10))
-			plt.text(
-				0.5,
-				0.5,
-				f"No validation samples for specialist classes {active_classes}",
-				ha="center",
-				va="center",
-				fontsize=16,
-				bbox=dict(boxstyle="round,pad=0.5", facecolor="lightyellow"),
-			)
-			plt.xlim([0, 1])
-			plt.ylim([0, 1])
-			plt.title(
-				f"ROC Analysis - Shard {shard_idx + 1}, Slice {slice_idx + 1}\n{training_type.title()} Phase (No Specialist Data)",
-				fontsize=14,
-				fontweight="bold",
-			)
-
-			save_path = os.path.join(save_dir, f"{training_type}_shard{shard_idx + 1}_slice{slice_idx + 1}_roc.png")
-			os.makedirs(save_dir, exist_ok=True)
-			plt.savefig(save_path, dpi=300, bbox_inches="tight")
-			plt.close()
-			return save_path, 0.0
-
-	unique_classes = np.unique(all_labels)
-	n_classes_present = len(unique_classes)
-
-	plt.figure(figsize=(12, 10))
-
-	colors = plt.cm.Set3(np.linspace(0, 1, n_classes_present))
-
-	plt.subplot(2, 2, (1, 2))
-
-	valid_aucs = []
-
-	for i, class_idx in enumerate(unique_classes):
-		binary_labels = (all_labels == class_idx).astype(int)
-
-		if class_idx < all_probs.shape[1]:
-			class_probs = all_probs[:, class_idx]
-		else:
-			print(f"   Warning: Class {class_idx} not in model output, skipping ROC")
-			continue
-
-		try:
-			fpr, tpr, _ = roc_curve(binary_labels, class_probs)
-			roc_auc = auc(fpr, tpr)
-			valid_aucs.append(roc_auc)
-
-			color = colors[i] if i < len(colors) else colors[0]
-			class_name = class_names[class_idx] if class_idx < len(class_names) else f"Class {class_idx}"
-			plt.plot(fpr, tpr, color=color, linewidth=2, label=f"{class_name} (AUC = {roc_auc:.3f})")
-		except Exception as exc:
-			print(f"   Error calculating ROC for class {class_idx}: {exc}")
-			continue
-
-	plt.plot([0, 1], [0, 1], "k--", linewidth=1, alpha=0.8)
-
-	plt.xlim([0.0, 1.0])
-	plt.ylim([0.0, 1.05])
-	plt.xlabel("False Positive Rate", fontsize=12)
-	plt.ylabel("True Positive Rate", fontsize=12)
-
-	specialist_suffix = f" (Specialist Classes {active_classes})" if active_classes else ""
-	plt.title(
-		f"ROC Curves - Shard {shard_idx + 1}, Slice {slice_idx + 1}\n{training_type.title()} Phase{specialist_suffix}",
-		fontsize=14,
-		fontweight="bold",
-	)
-	plt.legend(loc="lower right", fontsize=10)
-	plt.grid(True, alpha=0.3)
-
-	mean_auc = np.mean(valid_aucs) if valid_aucs else 0.0
-
-	plt.subplot(2, 2, 3)
-	plt.axis("off")
-	stats_text = f"""
-ROC Analysis Summary:
-• Mean AUC: {mean_auc:.4f}
-• Classes Present: {n_classes_present}
-• Valid AUC Calculations: {len(valid_aucs)}
-• Total Samples: {len(all_labels)}
-• Training Type: {training_type.title()}
-
-AUC Interpretation:
-• 0.9-1.0: Excellent
-• 0.8-0.9: Good
-• 0.7-0.8: Fair
-• 0.6-0.7: Poor
-• 0.5-0.6: Low
-"""
-	plt.text(
-		0.1,
-		0.5,
-		stats_text,
-		fontsize=11,
-		verticalalignment="center",
-		bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.8),
-	)
-
-	plt.subplot(2, 2, 4)
-	if active_classes is not None:
-		active_class_indices = np.array(sorted(active_classes))
-		filtered_probs = all_probs[:, active_class_indices]
-		filtered_probs = _apply_temperature_numpy(filtered_probs, 1.0)
-		predicted_local = np.argmax(filtered_probs, axis=1)
-		predicted_labels = active_class_indices[predicted_local]
-	else:
-		predicted_labels = np.argmax(all_probs, axis=1)
-	cm = confusion_matrix(all_labels, predicted_labels)
-
-	class_labels = [class_names[i] if i < len(class_names) else f"C{i}" for i in unique_classes]
-	sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=class_labels, yticklabels=class_labels)
-	plt.title("Confusion Matrix Preview", fontsize=12, fontweight="bold")
-	plt.ylabel("True Label")
-	plt.xlabel("Predicted Label")
-
-	plt.tight_layout()
-
-	os.makedirs(save_dir, exist_ok=True)
-	save_path = os.path.join(save_dir, f"{training_type}_shard{shard_idx + 1}_slice{slice_idx}_roc.png")
-	plt.savefig(save_path, dpi=300, bbox_inches="tight")
-	plt.close()
-
-	print(f"   - ROC curve saved to: {os.path.basename(save_path)}")
-
-	return save_path, mean_auc
-
-
-def create_confusion_matrix(model, x_test, y_test, class_names, shard_idx, slice_idx, save_dir, training_type='training', active_classes=None):
-    """Create detailed confusion matrix visualization for the trained model.
-    
-    Args:
-        model: The trained model
-        x_test: Test data features
-        y_test: Test data labels
-        class_names: List of class names
-        shard_idx: Shard index
-        slice_idx: Slice index
-        save_dir: Directory to save the confusion matrix
-        training_type: Type of training (e.g., 'training', 'unlearning')
-        active_classes: List of classes this shard was trained on (for specialist filtering)
-    """
-    
-    # Filter validation data to only include specialist classes if specified
-    if active_classes is not None:
-        specialist_mask = np.isin(y_test, active_classes)
-        x_test_filtered = x_test[specialist_mask]
-        y_test_filtered = y_test[specialist_mask]
-        
-        print(f"   - Specialist filtering: {len(y_test)} → {len(y_test_filtered)} samples for classes {active_classes}")
-        
-        if len(y_test_filtered) == 0:
-            print(f"   - Warning: No validation samples found for specialist classes {active_classes}")
-            return None, 0.0
-            
-        x_test = x_test_filtered
-        y_test = y_test_filtered
-    
-    model.eval()
-    all_preds = []
-    all_labels = []
-
-    active_classes_sorted = sorted(active_classes) if active_classes is not None else None
-    active_class_indices_tensor = None
-    if active_classes_sorted is not None:
-        active_class_indices_tensor = torch.tensor(active_classes_sorted, device=DEVICE)
-    
-    with torch.no_grad():
-        for i in range(0, len(x_test), 64):  # Process in batches
-            batch_x = torch.from_numpy(x_test[i:i+64]).float().to(DEVICE)
-            batch_y = y_test[i:i+64]
-
-            logits = model(batch_x)
-            outputs = torch.softmax(logits, dim=1)
-
-            if active_class_indices_tensor is not None:
-                filtered_outputs = outputs[:, active_class_indices_tensor]
-                filtered_outputs = _apply_temperature_tensor(filtered_outputs, config.SPECIALIST_EVAL_TEMPERATURE)
-                predicted_local = torch.argmax(filtered_outputs, dim=1)
-                mapped_predictions = active_class_indices_tensor[predicted_local]
-                all_preds.extend(mapped_predictions.cpu().numpy())
-            else:
-                outputs = _apply_temperature_tensor(outputs, config.SPECIALIST_EVAL_TEMPERATURE)
-                predicted = torch.argmax(outputs, dim=1)
-                all_preds.extend(predicted.cpu().numpy())
-
-            all_labels.extend(batch_y)
-    
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    
-    # Create confusion matrix
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    # Create figure with confusion matrix and detailed metrics
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # Main confusion matrix
-    unique_labels = np.unique(np.concatenate([all_labels, all_preds]))
-    label_names = [class_names[i] if i < len(class_names) else f'Class_{i}' for i in unique_labels]
-    
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1,
-                xticklabels=label_names, yticklabels=label_names)
-    
-    # Update title to show specialist filtering if applied
-    title_suffix = f" (Classes {active_classes})" if active_classes is not None else ""
-    ax1.set_title(f'Confusion Matrix - Shard {shard_idx+1}, Slice {slice_idx+1}\n{training_type.title()} Phase{title_suffix}', 
-                  fontsize=14, fontweight='bold')
-    ax1.set_ylabel('True Label', fontsize=12)
-    ax1.set_xlabel('Predicted Label', fontsize=12)
-    
-    # Normalized confusion matrix (percentages)
-    row_sums = cm.sum(axis=1)
-    cm_normalized = np.zeros_like(cm, dtype=float)
-    for i in range(len(row_sums)):
-        if row_sums[i] > 0:
-            cm_normalized[i] = cm[i] / row_sums[i]
-        else:
-            cm_normalized[i] = 0  # Handle division by zero
-    sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Oranges', ax=ax2,
-                xticklabels=label_names, yticklabels=label_names)
-    ax2.set_title('Normalized Confusion Matrix (%)', fontsize=14, fontweight='bold')
-    ax2.set_ylabel('True Label', fontsize=12)
-    ax2.set_xlabel('Predicted Label', fontsize=12)
-    
-    # Per-class metrics
-    ax3.axis('off')
-    
-    # Calculate per-class metrics
-    precision, recall, f1, support = precision_recall_fscore_support(all_labels, all_preds, average=None, zero_division=0)
-    overall_accuracy = accuracy_score(all_labels, all_preds)
-    
-    metrics_text = f"""
-Classification Metrics:
-
-Overall Accuracy: {overall_accuracy:.4f}
-
-Per-Class Performance:
-"""
-    for i, label in enumerate(unique_labels):
-        if i < len(precision):
-            class_name = label_names[i]
-            metrics_text += f"\n{class_name}:\n"
-            metrics_text += f"  • Precision: {precision[i]:.3f}\n"
-            metrics_text += f"  • Recall:    {recall[i]:.3f}\n"
-            metrics_text += f"  • F1-Score:  {f1[i]:.3f}\n"
-            metrics_text += f"  • Support:   {support[i]}\n"
-    
-    ax3.text(0.05, 0.95, metrics_text, fontsize=10, verticalalignment='top',
-            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgreen", alpha=0.8),
-            family='monospace')
-    ax3.set_title('Detailed Metrics', fontsize=14, fontweight='bold')
-    
-    # Class distribution
-    unique_true, counts_true = np.unique(all_labels, return_counts=True)
-    unique_pred, counts_pred = np.unique(all_preds, return_counts=True)
-    
-    x_pos = np.arange(len(unique_true))
-    width = 0.35
-    
-    ax4.bar(x_pos - width/2, counts_true, width, label='True Distribution', alpha=0.8, color='skyblue')
-    ax4.bar(x_pos + width/2, [counts_pred[list(unique_pred).index(label)] if label in unique_pred else 0 
-                               for label in unique_true], width, label='Predicted Distribution', alpha=0.8, color='lightcoral')
-    
-    ax4.set_xlabel('Classes', fontsize=12)
-    ax4.set_ylabel('Sample Count', fontsize=12)
-    ax4.set_title('Class Distribution Comparison', fontsize=14, fontweight='bold')
-    ax4.set_xticks(x_pos)
-    ax4.set_xticklabels([label_names[i] for i in range(len(unique_true))], rotation=45, ha='right')
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    
-    # Save the plot
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f'{training_type}_shard{shard_idx+1}_slice{slice_idx}_confusion_matrix.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"   - Confusion matrix saved to: {os.path.basename(save_path)}")
-    
-    return save_path, overall_accuracy
-
-
 def create_shard_confusion_matrix(model, x_test, y_test, class_names, shard_idx, save_dir, active_classes, head_classes=None):
     """Generate aggregate confusion matrix for an entire shard across all of its classes.
 
@@ -1612,10 +1280,26 @@ def create_gating_routing_barplots(gating_model, x_data, y_data, class_names, sa
 
 
 def create_overall_sisa_roc_curve(shard_models, shard_class_indices, x_test, y_test, class_names, save_dir, training_type='training', unlearned_classes=None, precomputed=None):
-    """`precomputed`, if given, is (all_preds, all_probs, all_labels) from a prior
+    """Per-class ROC for the SISA system as a whole.
+
+    `precomputed`, if given, is (all_preds, all_probs, all_labels) from a prior
     _run_sisa_batch pass over this exact (shard_models, x_test, y_test) -- skips
     re-running inference (W9: this and create_overall_sisa_confusion_matrix were
-    each independently re-inferring the full test set on every call)."""
+    each independently re-inferring the full test set on every call).
+
+    W34 -- WHAT THIS AUC MEANS. The score for class c is the routed system's output
+    probability for c, which is exactly 0 for every sample the router sent to a shard
+    that does not own c. Measured on the trained CIFAR-10 system, each class column is
+    41-59% exact zeros. So each curve has one large tie block at 0, and an AUC here
+    penalises a ROUTING failure exactly as it penalises a CLASSIFICATION failure.
+
+    That makes this a legitimate END-TO-END SYSTEM metric and NOT a per-class
+    discriminative ROC -- caption it accordingly. Do not use it to claim a class was
+    unlearned: a class with no output column scores 0 everywhere, and roc_curve returns
+    AUC = 0.5000 for any constant score, so the plot cannot distinguish a forgotten
+    class from an absent one. Unlearning evidence lives in the confusion matrix (recall
+    collapse) and in the MIA ROC in experiments/exactness_eval.py.
+    """
 
     print("   Creating overall SISA system ROC curve...")
 
@@ -1658,22 +1342,6 @@ def create_overall_sisa_roc_curve(shard_models, shard_class_indices, x_test, y_t
         filtered_classes = list(range(len(class_names)))
         active_class_names = class_names  # All classes for training
         print(f"   Using all {len(class_names)} classes for training ROC")
-    elif training_type == 'with_deleted_classes':
-        # SPECIAL CASE: Show ALL classes including deleted ones
-        # This demonstrates unlearning effectiveness (deleted classes will have poor AUC)
-        # CRITICAL: Don't filter anything - use FULL class range to match confusion matrix
-        y_true_filtered = all_labels
-        y_probs_filtered = all_probs
-        
-        # Use ALL class indices (0 to len(class_names)-1) regardless of what's in test set
-        # This ensures consistency with confusion matrix which shows all classes
-        filtered_classes = list(range(len(class_names)))
-        active_class_names = class_names  # All classes including deleted
-        
-        print(f"   Using ALL {len(class_names)} classes (INCLUDING deleted) to show unlearning effect")
-        if unlearned_classes:
-            deleted_names = [class_names[i] for i in unlearned_classes if i < len(class_names)]
-            print(f"   Deleted classes (will show poor performance): {deleted_names}")
     else:
         # For unlearning evaluation, exclude deleted classes from ROC computation
         if unlearned_classes is None:
@@ -1718,30 +1386,26 @@ def create_overall_sisa_roc_curve(shard_models, shard_class_indices, x_test, y_t
             fpr_raw, tpr_raw, thresholds = roc_curve(y_true_bin[:, i], y_probs_filtered[:, class_idx])
             roc_auc[class_idx] = auc(fpr_raw, tpr_raw)
             
-            # Interpolate for smoother curves if we have few points
-            if len(fpr_raw) < 50:  # Only smooth if very few points
-                # Use numpy interp for smoother curves
-                fpr_smooth = np.linspace(0, 1, 200)
-                tpr_smooth = np.interp(fpr_smooth, fpr_raw, tpr_raw)
-                
-                fpr[class_idx] = fpr_smooth
-                tpr[class_idx] = tpr_smooth
-            else:
-                fpr[class_idx] = fpr_raw
-                tpr[class_idx] = tpr_raw
+            # W34: plot the ROC as sklearn returns it. This used to resample any curve
+            # with <50 points onto a 200-point linspace "for smoother curves", which
+            # applied to some classes and not others in the SAME figure and drew a
+            # smooth line where the real curve is a step function. AUC was always
+            # computed from the raw points above, so only the rendering was affected.
+            fpr[class_idx] = fpr_raw
+            tpr[class_idx] = tpr_raw
     
     # Create ROC plot
     plt.figure(figsize=(12, 10))
     colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
     
     # Use appropriate class names for legend
-    display_class_names = active_class_names if training_type not in ['training', 'with_deleted_classes'] else class_names
+    display_class_names = active_class_names if training_type != 'training' else class_names
     
     for i, class_idx in enumerate(filtered_classes):
         if class_idx in fpr and class_idx in tpr:
             color = colors[i % len(colors)]
             # For active_classes_only, use the filtered list index
-            if training_type not in ['training', 'with_deleted_classes']:
+            if training_type != 'training':
                 label_name = display_class_names[i]
             else:
                 label_name = class_names[class_idx]
@@ -2267,159 +1931,6 @@ def create_classification_metrics_comparison_chart(training_report, unlearning_r
     return save_path
 
 
-def create_efficiency_metrics_chart(save_dir, training_type='optimization'):
-
-    print("   Creating efficiency metrics comparison chart...")
-    
-    # Performance data from our optimizations
-    metrics = {
-        'TRUE Gating Routing': {
-            'before': 'Process all 3 shards per sample',
-            'after': 'Process only chosen shard',
-            'improvement': '3x faster inference',
-            'value_before': 3.0,
-            'value_after': 1.0,
-            'color': '#2E86AB'
-        },
-        'Class Filtering': {
-            'before': 'O(n) list search',
-            'after': 'O(1) set lookup',
-            'improvement': '1000x faster filtering',
-            'value_before': 1000.0,
-            'value_after': 1.0,
-            'color': '#A23B72'
-        },
-        'Metadata Operations': {
-            'before': 'Repeated file I/O',
-            'after': 'Cached in memory',
-            'improvement': 'Instant access',
-            'value_before': 10.0,
-            'value_after': 0.01,
-            'color': '#F18F01'
-        }
-    }
-    
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # 1. Performance improvement bars (log scale)
-    ax1 = axes[0, 0]
-    optimizations = list(metrics.keys())
-    improvements = [metrics[opt]['value_before'] / metrics[opt]['value_after'] for opt in optimizations]
-    colors = [metrics[opt]['color'] for opt in optimizations]
-    
-    bars = ax1.bar(range(len(optimizations)), improvements, color=colors, alpha=0.8, edgecolor='black', linewidth=1)
-    ax1.set_yscale('log')
-    ax1.set_ylabel('Performance Improvement (x times faster)', fontsize=12)
-    ax1.set_title('SISA Framework Optimization Results', fontsize=14, fontweight='bold')
-    ax1.set_xticks(range(len(optimizations)))
-    ax1.set_xticklabels(optimizations, rotation=45, ha='right')
-    ax1.grid(True, alpha=0.3, axis='y')
-    
-    # Add improvement values on bars
-    for i, (bar, improvement) in enumerate(zip(bars, improvements)):
-        height = bar.get_height()
-        ax1.text(bar.get_x() + bar.get_width()/2., height * 1.1,
-                f'{improvement:.0f}x', ha='center', va='bottom', fontsize=11, fontweight='bold')
-    
-    # 2. Before vs After comparison
-    ax2 = axes[0, 1]
-    x = np.arange(len(optimizations))
-    width = 0.35
-    
-    before_values = [metrics[opt]['value_before'] for opt in optimizations]
-    after_values = [metrics[opt]['value_after'] for opt in optimizations]
-    
-    bars1 = ax2.bar(x - width/2, before_values, width, label='Before Optimization', color='#FF6B6B', alpha=0.7)
-    bars2 = ax2.bar(x + width/2, after_values, width, label='After Optimization', color='#4ECDC4', alpha=0.7)
-    
-    ax2.set_yscale('log')
-    ax2.set_ylabel('Relative Processing Time', fontsize=12)
-    ax2.set_title('Before vs After Optimization', fontsize=14, fontweight='bold')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(optimizations, rotation=45, ha='right')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3, axis='y')
-    
-    # 3. Efficiency description table
-    ax3 = axes[1, 0]
-    ax3.axis('off')
-    
-    table_data = []
-    for opt in optimizations:
-        table_data.append([
-            opt,
-            metrics[opt]['before'],
-            metrics[opt]['after'],
-            metrics[opt]['improvement']
-        ])
-    
-    table = ax3.table(cellText=table_data,
-                     colLabels=['Optimization', 'Before', 'After', 'Result'],
-                     cellLoc='left',
-                     loc='center',
-                     colWidths=[0.2, 0.3, 0.3, 0.2])
-    
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1.2, 1.5)
-    
-    # Style the table
-    for i in range(len(table_data) + 1):
-        for j in range(4):
-            cell = table[(i, j)]
-            if i == 0:  # Header row
-                cell.set_facecolor('#E8E8E8')
-                cell.set_text_props(weight='bold')
-            else:
-                if j == 0:  # First column
-                    cell.set_facecolor(metrics[optimizations[i-1]]['color'])
-                    cell.set_text_props(weight='bold', color='white')
-                else:
-                    cell.set_facecolor('#F8F8F8')
-    
-    ax3.set_title('Optimization Details', fontsize=14, fontweight='bold', pad=20)
-    
-    # 4. System efficiency overview
-    ax4 = axes[1, 1]
-    
-    # Overall system efficiency metrics
-    categories = ['Inference Speed', 'Memory Usage', 'I/O Operations', 'Cache Hits']
-    efficiency_scores = [85, 75, 90, 95]  # Efficiency percentages
-    colors_pie = ['#FF9999', '#66B3FF', '#99FF99', '#FFD700']
-    
-    wedges, texts, autotexts = ax4.pie(efficiency_scores, labels=categories, colors=colors_pie, 
-                                       autopct='%1.1f%%', startangle=90, wedgeprops=dict(alpha=0.8))
-    
-    ax4.set_title('Overall System Efficiency', fontsize=14, fontweight='bold')
-    
-    # Add efficiency legend
-    efficiency_legend = [
-        '85%: TRUE gating routing efficiency',
-        '75%: Memory optimization gains', 
-        '90%: I/O reduction benefits',
-        '95%: Cache hit rate improvement'
-    ]
-    
-    ax4.text(1.3, 0.5, '\n'.join(efficiency_legend), transform=ax4.transAxes,
-             fontsize=9, verticalalignment='center',
-             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
-    
-    plt.suptitle('SISA Framework Performance Optimization Results', fontsize=16, fontweight='bold', y=0.98)
-    plt.tight_layout()
-    
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"efficiency_metrics_comparison_{training_type}.png")
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"   - Efficiency metrics chart saved: {os.path.basename(save_path)}")
-    return save_path
-
-
-# ============================================================================
-# W8: exactness proof harness plots (plan §4.5)
-# ============================================================================
-
 def create_exactness_comparison_chart(param_distance: dict, pred_agreement: float,
                                        output_kl: float, class_name: str, save_dir: str) -> str:
     """Parameter-distance and prediction-agreement bars (unlearned vs scratch)."""
@@ -2557,8 +2068,6 @@ __all__ = [
 	"create_sisa_architecture_visualization",
 	"visualize_sample_images",
 	"create_training_visualizations",
-	"create_roc_curve",
-	"create_confusion_matrix",
 	"create_shard_confusion_matrix",
 	"create_gating_routing_barplots",
 	"create_overall_sisa_roc_curve",
@@ -2568,7 +2077,6 @@ __all__ = [
 	"create_time_comparison_chart",
 	"create_pure_training_time_chart",
 	"create_classification_metrics_comparison_chart",
-	"create_efficiency_metrics_chart",
 	"create_exactness_comparison_chart",
 	"create_mia_roc_chart",
 	"create_exactness_confusion_matrices",

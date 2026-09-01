@@ -29,6 +29,7 @@ sys.path.append('..')
 import config
 from utils.seeding import set_seed
 from utils.run_logging import setup_run_logging
+from utils.data_io import save_images, encoded_dtype
 
 set_seed(config.SEED)
 
@@ -40,6 +41,10 @@ parser = argparse.ArgumentParser(description='SISA Framework Sequential Data Pro
 # W26: both may be 'auto' in config; CLI overrides stay integers.
 parser.add_argument('--num-shards', type=int, default=None, help="Number of shards (default: config, may be 'auto')")
 parser.add_argument('--num-slices', type=int, default=None, help="Slices per shard (default: config, may be 'auto' => one class per slice)")
+parser.add_argument('--force', action='store_true',
+                    help="Rewrite the .npy data even if what is on disk already matches this config "
+                         "(see the idempotency guard in section 3 -- use this after editing the "
+                         "sharding/slicing code itself, which the config fingerprint cannot see).")
 
 args = parser.parse_args()
 
@@ -256,26 +261,95 @@ metadata = {
         } for i in range(num_shards)
     }
 }
+test_data_dir = f'{sisa_data_dir}/test_data'
+validation_data_dir = f'{sisa_data_dir}/validation_data'
+
+# Every array this script writes, in one place, so the idempotency guard below can
+# check them all before anything is written.
+expected_arrays = [
+    (f'{test_data_dir}/x_test.npy', x_test),
+    (f'{test_data_dir}/y_test.npy', y_test),
+    (f'{validation_data_dir}/x_validation.npy', x_val),
+    (f'{validation_data_dir}/y_validation.npy', y_val),
+]
+for shard_idx in range(num_shards):
+    if not y_slices_list[shard_idx]:
+        continue
+    shard_dir = f'{shards_data_dir}/shard_{shard_idx + 1}'
+    for slice_idx in range(len(shard_slices_list[shard_idx])):
+        expected_arrays.append((f'{shard_dir}/slice_{slice_idx}_x.npy', shard_slices_list[shard_idx][slice_idx]))
+        expected_arrays.append((f'{shard_dir}/slice_{slice_idx}_y.npy', y_slices_list[shard_idx][slice_idx]))
+        expected_arrays.append((f'{shard_dir}/slice_{slice_idx}_idx.npy', shard_indices_list[shard_idx][slice_idx]))
+
+
+def _npy_matches(path, arr):
+    """True if `path` already holds an array of exactly this shape and dtype.
+
+    mmap_mode='r' parses the .npy header only -- it never faults in the data pages, so
+    this stays cheap over ~705 MB of arrays. The mapping is closed explicitly rather
+    than left to refcounting: `all(...)` below short-circuits on the first mismatch, so
+    if the guard then decides to rewrite, any path already checked would still be mapped
+    when np.save reopens it -- and on Windows an open mapping means a sharing violation.
+    """
+    if not os.path.exists(path):
+        return False
+    existing = None
+    try:
+        existing = np.load(path, mmap_mode='r')
+        # Compare against the dtype save_images would WRITE, not the in-memory dtype:
+        # image arrays are float32 here and uint8 on disk (W34). This is also what makes
+        # the format migration automatic -- legacy float32 files no longer match, so the
+        # guard falls through to a rewrite exactly once and they come back as uint8.
+        return existing.shape == arr.shape and existing.dtype == encoded_dtype(arr)
+    except (ValueError, OSError):
+        return False  # missing, truncated, or not a readable .npy -- rewrite it
+    finally:
+        if existing is not None:
+            existing._mmap.close()
+
+
+def _fingerprint(meta):
+    """The parts of metadata.json that determine the array CONTENTS. Excludes
+    processing_timestamp, which changes on every run by construction."""
+    return {k: v for k, v in meta.items() if k != 'processing_timestamp'}
+
+
+# Skip the rewrite when what is on disk already matches this config. These arrays are
+# ~705 MB for CIFAR-10 and every invocation rewrote all of them unconditionally, even
+# when nothing about the partition had changed -- which is pure disk wear when you are
+# just re-running training against the same data.
+#
+# The check is a CONFIG fingerprint plus a shape/dtype check, not a content hash: the
+# pipeline is fully deterministic under config.SEED (set_seed at import), so an
+# identical dataset, seed, shard/slice partition, per-shard class assignment and
+# normalization stats reproduce byte-identical arrays. What it deliberately cannot see
+# is an edit to the sharding/slicing code itself -- pass --force after one of those.
+data_is_current = False
+if not args.force and os.path.exists(f'{sisa_data_dir}/metadata.json'):
+    try:
+        with open(f'{sisa_data_dir}/metadata.json') as f:
+            existing_metadata = json.load(f)
+        data_is_current = (_fingerprint(existing_metadata) == _fingerprint(metadata)
+                           and all(_npy_matches(p, a) for p, a in expected_arrays))
+    except (json.JSONDecodeError, OSError):
+        data_is_current = False
+
+total_slices_saved = sum(len(s) for s in shard_slices_list)
+
+# The JSON metadata is ~3 KB and is rewritten UNCONDITIONALLY, even when the arrays are
+# skipped. Unlearning mutates these files in place (SISAUnlearning._update_shard_metadata
+# rewrites class_indices_present), so re-running data processing has to restore the
+# pristine partition description regardless of whether the arrays needed rewriting.
 with open(f'{sisa_data_dir}/metadata.json', 'w') as f:
     json.dump(metadata, f, indent=2)
 
-# Save test and validation data
-test_data_dir = f'{sisa_data_dir}/test_data'
 os.makedirs(test_data_dir, exist_ok=True)
-np.save(f'{test_data_dir}/x_test.npy', x_test)
-np.save(f'{test_data_dir}/y_test.npy', y_test)
-
-validation_data_dir = f'{sisa_data_dir}/validation_data'
 os.makedirs(validation_data_dir, exist_ok=True)
-np.save(f'{validation_data_dir}/x_validation.npy', x_val)
-np.save(f'{validation_data_dir}/y_validation.npy', y_val)
 
-# Save shards and slices
-total_slices_saved = 0
 for shard_idx in range(num_shards):
     shard_dir = f'{shards_data_dir}/shard_{shard_idx + 1}'
     os.makedirs(shard_dir, exist_ok=True)
-    
+
     if not y_slices_list[shard_idx]: continue
 
     all_shard_labels = np.concatenate(y_slices_list[shard_idx])
@@ -299,11 +373,17 @@ for shard_idx in range(num_shards):
     with open(f'{shard_dir}/metadata.json', 'w') as f:
         json.dump(shard_metadata, f, indent=2)
 
-    for slice_idx in range(len(shard_slices_list[shard_idx])):
-            np.save(f'{shard_dir}/slice_{slice_idx}_x.npy', shard_slices_list[shard_idx][slice_idx])
-            np.save(f'{shard_dir}/slice_{slice_idx}_y.npy', y_slices_list[shard_idx][slice_idx])
-            np.save(f'{shard_dir}/slice_{slice_idx}_idx.npy', shard_indices_list[shard_idx][slice_idx])
-            total_slices_saved += 1
+expected_mb = sum(a.size * encoded_dtype(a).itemsize for _, a in expected_arrays) / 1e6
+if data_is_current:
+    print(f"   - Arrays on disk already match this config ({total_slices_saved} slices, "
+          f"{expected_mb:.0f} MB) -- skipping rewrite. Pass --force to rebuild anyway.")
+else:
+    # save_images stores pixels as uint8 (4x smaller than the float32 the pipeline holds
+    # in memory) and passes labels/indices through unchanged. Lossless -- load_images
+    # reconstructs the identical float32 bits. See utils/data_io.py.
+    for path, arr in expected_arrays:
+        save_images(path, arr)
+    print(f"   - Wrote {len(expected_arrays)} arrays ({expected_mb:.0f} MB, {total_slices_saved} slices).")
 
 save_time = time.time() - save_start_time
 

@@ -62,6 +62,12 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
     unchanged. `active_classes` continues to mean "classes visible/evaluated so far" and
     must always be a subset of `head_classes` when both are given.
     """
+    # W34: `device` was accepted and then ignored -- every tensor move in this function
+    # used the module-global DEVICE, so passing a different device silently trained on
+    # the default one anyway. Six call sites pass `device=DEVICE`. Resolved once here
+    # and used throughout, so the parameter now means what its callers assume.
+    device = DEVICE if device is None else device
+
     head_label_map = None
     if head_classes is not None:
         head_label_map = {orig: new for new, orig in enumerate(sorted(head_classes))}
@@ -151,6 +157,12 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
 
     if model is None:
         model = create_sisa_model(num_classes=len(head_classes) if head_classes is not None else None)
+    # W34: the model has to live on the SAME device the batches are moved to. Fixing the
+    # tensor moves alone would leave a freshly created model on the module-global DEVICE
+    # (create_sisa_model's default) while the batches went to `device` -- a dtype/device
+    # mismatch at the first conv. Also re-homes a caller-supplied model, which is how the
+    # incremental slice loop passes the previous slice's model back in.
+    model = model.to(device)
 
     history = {'loss': [], 'accuracy': [], 'val_loss': [], 'val_accuracy': [], 'lr': []}
     
@@ -288,8 +300,8 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
 
             # Per-sample geometric augmentation first (W19), then colour jitter + normalize.
             batch_x = augmenter(batch_x)
-            batch_x = train_transforms(batch_x).to(DEVICE)
-            batch_y = batch_y.to(DEVICE)
+            batch_x = train_transforms(batch_x).to(device)
+            batch_y = batch_y.to(device)
 
             optimizer.zero_grad(set_to_none=True)
             
@@ -309,26 +321,28 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
 
         model.eval()
         val_loss, val_correct, val_total = 0.0, 0, 0
-        
+        val_steps = 0
+
         if len(x_val_t) > 0:
             with torch.no_grad():
                 for i in range(0, len(x_val_t), batch_size):
+                    val_steps += 1
                     batch_x_val = x_val_t[i:i+batch_size]
                     batch_y_val = y_val_t[i:i+batch_size]
 
-                    batch_x_val = val_transforms(batch_x_val).to(DEVICE)
-                    batch_y_val = batch_y_val.to(DEVICE)
+                    batch_x_val = val_transforms(batch_x_val).to(device)
+                    batch_y_val = batch_y_val.to(device)
                     
                     output_full = model(batch_x_val)
                     if head_classes is not None:
                         # Reduced/dynamic head: scatter local head columns back to global
                         # class space so the active_classes column selection below is valid.
                         output_full = _scatter_local_to_global(
-                            output_full, sorted(head_classes), config.get_num_classes(), DEVICE
+                            output_full, sorted(head_classes), config.get_num_classes(), device
                         )
 
                     # Specialist-only validation (filtered to active classes)
-                    active_class_indices = torch.tensor(sorted(active_classes), device=DEVICE)
+                    active_class_indices = torch.tensor(sorted(active_classes), device=device)
                     output_filtered = output_full[:, active_class_indices]
 
                     loss = criterion(output_filtered, batch_y_val)
@@ -337,7 +351,16 @@ def train_model(X, y, model=None, epochs=config.MAX_EPOCHS, batch_size=config.BA
                     val_total += batch_y_val.size(0)
                     val_correct += (predicted_filtered == batch_y_val).sum().item()
 
-        val_epoch_loss = val_loss / (len(x_val_t) / batch_size) if len(x_val_t) > 0 else 0
+        # W34: `val_loss` accumulates one MEAN per batch, so the divisor is the number of
+        # batches actually run -- ceil(n / batch_size) -- not the real-valued n/batch_size
+        # the old code used. That understated the divisor whenever n was not a multiple of
+        # batch_size, inflating reported val_loss by up to 40% on the small early slices
+        # (n=137 -> 3 batches vs a divisor of 2.14). Harmless while
+        # EARLY_STOPPING_MONITOR='val_accuracy' and ReduceLROnPlateau's threshold is
+        # relative (both scale-invariant), but TRAINING_MIN_DELTA_LOSS is an ABSOLUTE
+        # threshold, so switching the monitor to 'val_loss' would have made a reporting
+        # bug into a stopping-decision bug.
+        val_epoch_loss = val_loss / val_steps if val_steps > 0 else 0
         val_epoch_acc = val_correct / val_total if val_total > 0 else 0
         
         history['loss'].append(epoch_loss); history['accuracy'].append(epoch_acc)

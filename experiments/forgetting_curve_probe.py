@@ -36,6 +36,7 @@ import torchvision.transforms as T
 
 import config
 from utils.seeding import set_seed
+from utils.data_io import load_images
 from training.create_model import load_model_pytorch, DEVICE
 
 
@@ -89,7 +90,7 @@ def main():
     class_names = meta['class_names']
     normalize = T.Normalize(meta['normalization_mean'], meta['normalization_std'])
 
-    x_test = np.load(os.path.join(sisa_dir, "test_data", "x_test.npy"))
+    x_test = load_images(os.path.join(sisa_dir, "test_data", "x_test.npy"))
     y_test = np.load(os.path.join(sisa_dir, "test_data", "y_test.npy"))
 
     print("=" * 84)

@@ -93,11 +93,15 @@ def _create_class_isolated_shards(X, y, indices, part_number, class_names):
 
         # Find target shard with advanced balancing
         if class_idx in classes_to_split:
-            # For large classes, use asymmetric splitting strategy
-            print(f"   🔀 Applying asymmetric splitting for '{class_name}' ({class_count} samples)")
-            target_shard_idx = _apply_asymmetric_splitting(
-                class_idx, class_data, shards_content, shard_sizes, part_number, GAMMA
-            )
+            # W34: this used to print "Applying asymmetric splitting", which the helper
+            # has never done -- it assigns the class WHOLE to the emptiest shard. Class
+            # isolation is a SISA invariant (a class must live in exactly one shard, or
+            # deleting it would touch several), so splitting is not merely unimplemented,
+            # it would be wrong. Message now states what actually happens.
+            print(f"   ⚖  Class '{class_name}' exceeds the {BETA:.0%} shard fraction "
+                  f"({class_count} samples); assigning it whole to the emptiest shard "
+                  f"(class isolation forbids splitting it).")
+            target_shard_idx = _assign_large_class_to_emptiest_shard(shard_sizes)
         elif class_to_shard_map is not None:
             # Standard assignment: semantic cluster membership decides the shard
             target_shard_idx = class_to_shard_map[class_idx]
@@ -194,13 +198,12 @@ def _find_balanced_shard(shard_sizes, class_count, max_imbalance_ratio):
     return best_shard
 
 
-def _apply_asymmetric_splitting(class_idx, class_data, shards_content, shard_sizes, part_number, gamma):
-    """Apply asymmetric splitting for large classes to maintain specialization."""
-    # For now, assign to the smallest shard (can be enhanced with actual splitting later)
-    # This maintains class isolation while improving balance
-    target_shard = np.argmin(shard_sizes)
-    
-    # Future enhancement: Could implement 70-30 asymmetric split here
-    # For now, we maintain full class isolation as per SISA principles
-    
-    return target_shard
+def _assign_large_class_to_emptiest_shard(shard_sizes):
+    """Place an over-large class in whichever shard currently holds the least data.
+
+    W34: renamed from `_apply_asymmetric_splitting`, which described an operation it
+    never performed (and which SISA's class-isolation invariant rules out anyway -- a
+    class split across shards would make deleting it a multi-shard retrain). This is
+    the whole of the behaviour: pick the emptiest shard.
+    """
+    return int(np.argmin(shard_sizes))

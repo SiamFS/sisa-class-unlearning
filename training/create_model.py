@@ -101,10 +101,23 @@ class SISAConvNet(nn.Module):
         )
 
     def penultimate(self, x):
-        """Feature vector fed to the final classifier -- the routing representation (W21)."""
+        """Feature vector fed to the final classifier -- the routing representation (W21).
+
+        W34: Dropout layers in the pre-classifier chain are SKIPPED, so this is
+        deterministic regardless of the module's train/eval mode. `fc_layer[:5]` used to
+        be applied wholesale, and position 4 is an `nn.Dropout` in both backbones
+        (FC_LAYER_DROPOUT=0.5 for the ConvNet), so calling routing_cosine() on a module
+        left in train mode returned randomly-zeroed features and a correspondingly random
+        routing decision. Inert today -- routing runs under eval()/no_grad -- but a
+        routing score must not depend on the module's mode.
+        """
         x = self.conv_layer(x)
         x = x.reshape(x.size(0), -1)
-        return self.fc_layer[:5](x)
+        for layer in self.fc_layer[:5]:
+            if isinstance(layer, nn.Dropout):
+                continue
+            x = layer(x)
+        return x
 
     def routing_cosine(self, x):
         """Cosine similarity of each sample to every class vector, in [-1, 1].
@@ -222,7 +235,8 @@ class SISAResNet(nn.Module):
     positions a residual net does not need with `Identity`. That is what lets every
     existing contract keep working unchanged:
 
-      * `fc_layer[:5]` is an identity chain, so `penultimate()` returns the GAP output;
+      * `fc_layer[:5]` holds only Identity and Dropout, and `penultimate()` skips the
+        Dropout, so it returns the GAP output unchanged;
       * `fc_layer.5.weight` exists, so W6's `_resize_model_head` and the loader's
         class-count inference need no special case;
       * `Identity` holds no parameters, so the ABSENCE of `fc_layer.1.weight` (the
@@ -285,10 +299,23 @@ class SISAResNet(nn.Module):
         )
 
     def penultimate(self, x):
-        """Feature vector fed to the final classifier -- the routing representation (W21)."""
+        """Feature vector fed to the final classifier -- the routing representation (W21).
+
+        W34: Dropout layers in the pre-classifier chain are SKIPPED, so this is
+        deterministic regardless of the module's train/eval mode. `fc_layer[:5]` used to
+        be applied wholesale, and position 4 is an `nn.Dropout` in both backbones
+        (FC_LAYER_DROPOUT=0.5 for the ConvNet), so calling routing_cosine() on a module
+        left in train mode returned randomly-zeroed features and a correspondingly random
+        routing decision. Inert today -- routing runs under eval()/no_grad -- but a
+        routing score must not depend on the module's mode.
+        """
         x = self.conv_layer(x)
         x = x.reshape(x.size(0), -1)
-        return self.fc_layer[:5](x)
+        for layer in self.fc_layer[:5]:
+            if isinstance(layer, nn.Dropout):
+                continue
+            x = layer(x)
+        return x
 
     def routing_cosine(self, x):
         """Cosine similarity of each sample to every class vector, in [-1, 1]. Same
